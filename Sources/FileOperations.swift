@@ -33,43 +33,67 @@ enum FileOperations {
         return items
     }
 
-    /// New untitled items (Finder-style): `未命名文件夹`, then `未命名文件夹 2`, `3`… (no `1`).
+    /// New item names: prefer `未命名` / `未命名文件夹`; on conflict use
+    /// `… 副本`, then `… 副本 2`, `… 副本 3`… (no bare `2`/`3` suffix).
     static func uniqueURL(in directory: URL, baseName: String, extensionName: String?) -> URL {
         uniqueUntitledURL(in: directory, baseName: baseName, extensionName: extensionName)
     }
 
     static func uniqueUntitledURL(in directory: URL, baseName: String, extensionName: String?) -> URL {
+        uniqueCopyStyleName(in: directory, preferredBase: baseName, extensionName: extensionName, allowPreferred: true)
+    }
+
+    /// Shared `副本` / `副本 N` allocator used by New and paste.
+    private static func uniqueCopyStyleName(
+        in directory: URL,
+        preferredBase: String,
+        extensionName: String?,
+        allowPreferred: Bool,
+        treatingAsAvailable ignoredPath: String? = nil
+    ) -> URL {
         let fm = FileManager.default
+        func isAvailable(_ url: URL) -> Bool {
+            let path = url.standardizedFileURL.path
+            if let ignoredPath, path == ignoredPath { return true }
+            return !fm.fileExists(atPath: path)
+        }
         func candidate(_ base: String) -> URL {
             directory.appendingPathComponent(composedFileName(base: base, extensionName: extensionName))
         }
-        let first = candidate(baseName)
-        if !fm.fileExists(atPath: first.path) {
-            return first
+
+        if allowPreferred {
+            let preferred = candidate(preferredBase)
+            if isAvailable(preferred) {
+                return preferred
+            }
+        }
+
+        let firstCopy = candidate("\(preferredBase) 副本")
+        if isAvailable(firstCopy) {
+            return firstCopy
         }
         var index = 2
         while true {
-            let url = candidate("\(baseName) \(index)")
-            if !fm.fileExists(atPath: url.path) {
+            let url = candidate("\(preferredBase) 副本 \(index)")
+            if isAvailable(url) {
                 return url
             }
             index += 1
         }
     }
 
-    /// Paste/copy name conflicts (user: `副本`, no `的`):
-    /// On conflict, append ` 副本` to the **full** name — do not bump an existing `副本 N` counter.
-    /// - `foo` → `foo 副本` → `foo 副本 2` → …
-    /// - `foo 副本 3` → `foo 副本 3 副本` → `foo 副本 3 副本 2` → …
+    /// Paste/copy conflicts — macOS Duplicate/Paste style (`副本`, no `的`):
+    /// - `foo` → `foo 副本` → `foo 副本 2` → `foo 副本 3` → …
+    /// - pasting `foo 副本` → `foo 副本 2`
+    /// - pasting `foo 副本 3` → `foo 副本 4`
     static func uniqueCopyURL(in directory: URL, source: URL, isMoving: Bool) -> URL {
         let fm = FileManager.default
         let sourceName = source.lastPathComponent
-        let ignoredPath = source.standardizedFileURL.path
+        let ignoredPath = isMoving ? source.standardizedFileURL.path : nil
 
         func isAvailable(_ url: URL) -> Bool {
             let path = url.standardizedFileURL.path
-            // Only a move can "reuse" its own path; a copy must treat it as taken.
-            if isMoving, path == ignoredPath { return true }
+            if let ignoredPath, path == ignoredPath { return true }
             return !fm.fileExists(atPath: path)
         }
 
@@ -90,23 +114,56 @@ enum FileOperations {
             return splitNameAndExtension(sourceName)
         }()
 
-        // Always append onto the full stem (e.g. "… 副本 3" → "… 副本 3 副本").
-        let firstCopy = directory.appendingPathComponent(
-            composedFileName(base: "\(stem) 副本", extensionName: ext)
-        )
-        if isAvailable(firstCopy) {
-            return firstCopy
+        let (root, startNumber) = copyRenamePlan(forStem: stem)
+
+        if startNumber == nil {
+            return uniqueCopyStyleName(
+                in: directory,
+                preferredBase: root,
+                extensionName: ext,
+                allowPreferred: false,
+                treatingAsAvailable: ignoredPath
+            )
         }
-        var index = 2
+
+        var index = startNumber!
         while true {
             let url = directory.appendingPathComponent(
-                composedFileName(base: "\(stem) 副本 \(index)", extensionName: ext)
+                composedFileName(base: "\(root) 副本 \(index)", extensionName: ext)
             )
             if isAvailable(url) {
                 return url
             }
             index += 1
         }
+    }
+
+    /// Parse stem into root + first copy index to try.
+    private static func copyRenamePlan(forStem stem: String) -> (root: String, startNumber: Int?) {
+        let patterns: [(String, Bool)] = [
+            (#"^(.*) 副本 (\d+)$"#, true),
+            (#"^(.*) 副本$"#, false),
+            (#"^(.*) 的副本 (\d+)$"#, true),
+            (#"^(.*) 的副本$"#, false)
+        ]
+        for (pattern, hasNumber) in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let match = regex.firstMatch(in: stem, range: NSRange(stem.startIndex..., in: stem)),
+                  match.numberOfRanges >= 2,
+                  let rootRange = Range(match.range(at: 1), in: stem) else {
+                continue
+            }
+            let root = String(stem[rootRange])
+            guard !root.isEmpty else { continue }
+            if hasNumber,
+               match.numberOfRanges >= 3,
+               let numRange = Range(match.range(at: 2), in: stem),
+               let value = Int(stem[numRange]) {
+                return (root, value + 1)
+            }
+            return (root, 2)
+        }
+        return (stem, nil)
     }
 
     private static func composedFileName(base: String, extensionName: String?) -> String {

@@ -925,12 +925,14 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     private func commitRename(_ item: FileItem, to newName: String) {
         do {
             let dest = try FileOperations.rename(item.url, to: newName)
+            // Select after reload finishes — selecting the new URL before reload finds nothing and clears selection.
+            pendingSelectURLs = [dest.standardizedFileURL]
+            suppressDirectoryWatchUntil = Date().addingTimeInterval(1.0)
             reloadContents()
-            contentController.select(urls: [dest])
         } catch {
             showError(error)
+            pendingSelectURLs = [item.url.standardizedFileURL]
             reloadContents()
-            contentController.select(urls: [item.url])
         }
     }
 
@@ -954,6 +956,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         } catch {
             NSSound.beep()
         }
+    }
+
+    @objc func openSelectedItems(_ sender: Any?) {
+        let items = contentController.selectedItems
+        guard !items.isEmpty else { return }
+        items.forEach { openItem($0) }
     }
 
     @objc func moveToTrash(_ sender: Any?) {

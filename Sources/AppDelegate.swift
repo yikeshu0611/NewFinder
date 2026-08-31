@@ -665,6 +665,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         fileMenu.addItem(withTitle: "新建标签页", action: #selector(BrowserWindowController.newTab(_:)), keyEquivalent: "t")
         fileMenu.addItem(withTitle: "新建文件夹", action: #selector(BrowserWindowController.newFolder(_:)), keyEquivalent: "N")
         fileMenu.addItem(NSMenuItem.separator())
+        fileMenu.addItem(withTitle: "打开", action: #selector(BrowserWindowController.openSelectedItems(_:)), keyEquivalent: "o")
+        let trashItem = fileMenu.addItem(
+            withTitle: "移到废纸篓",
+            action: #selector(BrowserWindowController.moveToTrash(_:)),
+            keyEquivalent: String(UnicodeScalar(NSBackspaceCharacter)!)
+        )
+        trashItem.keyEquivalentModifierMask = [.command]
+        fileMenu.addItem(NSMenuItem.separator())
         fileMenu.addItem(withTitle: "关闭", action: #selector(BrowserWindowController.closeActiveTabOrWindow(_:)), keyEquivalent: "w")
 
         let editMenuItem = NSMenuItem()

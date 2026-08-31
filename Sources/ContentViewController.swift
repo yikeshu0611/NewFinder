@@ -100,12 +100,13 @@ final class ContentViewController: NSViewController {
         menu.addItem(NSMenuItem.separator())
         menu.addItem(withTitle: "重命名", action: #selector(contextRename), keyEquivalent: "")
         menu.addItem(withTitle: "移到废纸篓", action: #selector(contextTrash), keyEquivalent: "")
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(withTitle: "在 NewFinder 中显示", action: #selector(contextReveal), keyEquivalent: "")
         listView.menu = menu
 
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            self?.handleKey(event) ?? event
+            // Must not use `self?.handleKey(event) ?? event`: when handleKey returns nil
+            // (consume), optional chaining yields nil and `?? event` redispatches — causing a beep.
+            guard let self else { return event }
+            return self.handleKey(event)
         }
     }
 
@@ -359,12 +360,14 @@ final class ContentViewController: NSViewController {
                 onCommitRename?(item, newName)
             } else {
                 field.stringValue = original
+                // Keep the same file selected after confirming an unchanged name.
+                select(urls: [item.url])
             }
+        } else if let item, let original {
+            field.stringValue = original
+            select(urls: [item.url])
         } else if let original {
             field.stringValue = original
-        }
-
-        if view.window?.firstResponder === field || view.window?.firstResponder is NSText {
             view.window?.makeFirstResponder(listView)
         }
     }
@@ -385,17 +388,22 @@ final class ContentViewController: NSViewController {
             return event
         }
 
-        if event.keyCode == 36 || event.keyCode == 76 {
-            if let item = selectedItems.first {
-                onOpen?(item)
-                return nil
-            }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+
+        // Return / keypad Enter → open
+        if event.keyCode == 36 || event.keyCode == 76, flags.isEmpty {
+            guard let item = selectedItems.first else { return event }
+            onOpen?(item)
+            return nil
         }
-        if event.keyCode == 51 {
+        // Delete / Forward Delete, or ⌘⌫ (Finder) → trash
+        if event.keyCode == 51 || event.keyCode == 117 {
+            let allow = flags.isEmpty || flags == .command
+            guard allow, !selectedItems.isEmpty else { return event }
             NotificationCenter.default.post(name: .contentRequestTrash, object: self)
             return nil
         }
-        if event.keyCode == 113 {
+        if event.keyCode == 113, flags.isEmpty {
             if let item = selectedItems.first {
                 onRenameRequest?(item)
                 return nil
@@ -416,10 +424,6 @@ final class ContentViewController: NSViewController {
 
     @objc private func contextTrash() {
         NotificationCenter.default.post(name: .contentRequestTrash, object: self)
-    }
-
-    @objc private func contextReveal() {
-        FileOperations.revealInFinder(selectedItems.map(\.url))
     }
 
     @objc private func contextGetInfo() {
