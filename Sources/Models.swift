@@ -121,24 +121,57 @@ final class AppSettings {
         set { defaults.set(newValue, forKey: Keys.launchAtLogin) }
     }
 
-    static let defaultNewItemTypes = ["dir", "txt", "ppt", "xlsx", "docx", "R", "py"]
+    /// Always pinned at the top of the New menu; not shown in Settings.
+    static let fixedNewItemTypes = ["dir", "txt", "docx", "pptx", "xlsx"]
 
-    var newItemTypes: [String] {
+    /// Default extras (stored alphabetically as `py`, `R`).
+    static let defaultCustomNewItemTypes = ["R", "py"]
+
+    /// Custom types only (editable in Settings), A–Z, case preserved.
+    var customNewItemTypes: [String] {
         get {
-            let raw = defaults.stringArray(forKey: Keys.newItemTypes)
-            if let raw {
-                let lowered = raw.map { $0.lowercased() }
-                // Migrate previous factory defaults, or restore proper case for current defaults.
-                if lowered == ["dir", "txt", "md", "swift", "xlsx", "docx"]
-                    || (lowered == Self.defaultNewItemTypes.map { $0.lowercased() }
-                        && raw != Self.defaultNewItemTypes) {
-                    defaults.set(Self.defaultNewItemTypes, forKey: Keys.newItemTypes)
-                    return Self.defaultNewItemTypes
-                }
+            if defaults.object(forKey: Keys.newItemTypes) == nil {
+                let seeded = normalizedCustomTypes(Self.defaultCustomNewItemTypes)
+                defaults.set(seeded, forKey: Keys.newItemTypes)
+                return seeded
             }
-            return normalizedTypes(raw ?? Self.defaultNewItemTypes)
+            let raw = defaults.stringArray(forKey: Keys.newItemTypes) ?? []
+            let custom = normalizedCustomTypes(raw)
+            // One-time cleanup: drop fixed types that used to live in this key.
+            if raw.contains(where: { Self.isFixedNewItemType($0) }) {
+                defaults.set(custom, forKey: Keys.newItemTypes)
+            }
+            return custom
         }
-        set { defaults.set(normalizedTypes(newValue), forKey: Keys.newItemTypes) }
+        set { defaults.set(normalizedCustomTypes(newValue), forKey: Keys.newItemTypes) }
+    }
+
+    /// Full New-menu list: fixed types first, then custom types A–Z.
+    var newItemTypes: [String] {
+        Self.fixedNewItemTypes + customNewItemTypes
+    }
+
+    static func isFixedNewItemType(_ type: String) -> Bool {
+        let key = type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if key == "ppt" { return true } // treat legacy ppt as the fixed pptx slot
+        return fixedNewItemTypes.map { $0.lowercased() }.contains(key)
+    }
+
+    private func normalizedCustomTypes(_ raw: [String]) -> [String] {
+        var result: [String] = []
+        var seen = Set<String>()
+        for item in raw {
+            let trimmed = item.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            guard !Self.isFixedNewItemType(trimmed) else { continue }
+            let key = trimmed.lowercased()
+            guard !seen.contains(key) else { continue }
+            seen.insert(key)
+            result.append(trimmed)
+            if result.count >= 40 { break }
+        }
+        result.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        return result
     }
 
     var bookmarks: [Bookmark] {
@@ -167,24 +200,6 @@ final class AppSettings {
             return defaults.bool(forKey: Keys.languageChinese)
         }
         set { defaults.set(newValue, forKey: Keys.languageChinese) }
-    }
-
-    private func normalizedTypes(_ raw: [String]) -> [String] {
-        var result: [String] = []
-        var seen = Set<String>()
-        for item in raw {
-            // Preserve case exactly (e.g. R vs r); only trim whitespace.
-            let trimmed = item.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            guard !seen.contains(trimmed) else { continue }
-            seen.insert(trimmed)
-            result.append(trimmed)
-            if result.count >= 40 { break }
-        }
-        if result.isEmpty {
-            return Self.defaultNewItemTypes
-        }
-        return result
     }
 }
 

@@ -8,7 +8,7 @@
 
 在 [Releases](https://github.com/yikeshu0611/NewFinder/releases) 下载最新 `NewFinder-x.x.x.dmg`，拖入「应用程序」即可。
 
-**当前版本：1.1.2**
+**当前版本：1.1.3**
 
 ## 主要功能
 
@@ -21,7 +21,7 @@
 
 ### 文件操作
 - 打开、重命名（F2）、拷贝 / 剪切 / 粘贴、移到废纸篓
-- **快捷新建**：可自定义多种类型（dir、txt、ppt、xlsx、docx、R、py 等，**大小写保留**）
+- **快捷新建**：固定项（文件夹 / txt / docx / pptx / xlsx）置顶；其余类型在设置中配置并按字母序排列
 - xlsx / docx / pptx 为有效 Office 空白模板
 - 新建后自动选中并进入重命名
 - **粘贴重名**：在完整名称后加 `副本` / `副本 2`…（例如 `xxx 副本 3` → `xxx 副本 3 副本`）；新建未命名项用 `2`、`3`… 递增
@@ -41,8 +41,8 @@
 
 ### 设置
 - 登录时启动、是否拦截 Finder
-- **自定义新建类型**（可添加多项，最多 40 个）
-- **检查更新**：从 GitHub Releases 检测并下载最新 DMG
+- **额外新建类型**：仅编辑固定项以外的扩展名
+- **检查更新**：按钮旁显示当前版本号，从 GitHub Releases 检测并下载 DMG
 - 书签与收藏夹顺序持久化
 
 ## 构建
@@ -52,7 +52,7 @@
 open build/NewFinder.app
 ```
 
-产物：`dist/NewFinder-1.1.2.dmg`
+产物：`dist/NewFinder-1.1.3.dmg`
 
 ## 快捷键
 

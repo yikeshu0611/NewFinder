@@ -17,7 +17,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     private init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 500),
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 420),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -69,45 +69,31 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         )
         stack.addArrangedSubview(launchAtLoginCheckbox)
 
-        let redirectHint = NSTextField(wrappingLabelWithString: """
-        NewFinder 在菜单栏显示图标（不占用 Dock）。\
-        会尽量接管：打开文件夹、在 Finder 中显示。\
-        即使退出 NewFinder，后台监视仍会在点击 Dock Finder 时自动拉起。\
-        首次需在「隐私与安全性 → 自动化」允许控制 Finder。
-        """)
-        redirectHint.textColor = .secondaryLabelColor
-        redirectHint.font = .systemFont(ofSize: 11)
-        redirectHint.preferredMaxLayoutWidth = 440
-        stack.addArrangedSubview(redirectHint)
-
-        let updateTitle = NSTextField(labelWithString: "更新")
-        updateTitle.font = .boldSystemFont(ofSize: 13)
-        stack.addArrangedSubview(updateTitle)
-
-        versionLabel = NSTextField(labelWithString: "当前版本：—")
-        versionLabel.font = .systemFont(ofSize: 12)
-        stack.addArrangedSubview(versionLabel)
-
-        updateStatusLabel = NSTextField(wrappingLabelWithString: "从 GitHub 检查 NewFinder 新版本。")
-        updateStatusLabel.textColor = .secondaryLabelColor
-        updateStatusLabel.font = .systemFont(ofSize: 11)
-        updateStatusLabel.preferredMaxLayoutWidth = 440
-        stack.addArrangedSubview(updateStatusLabel)
-
         let updateRow = NSStackView()
         updateRow.orientation = .horizontal
         updateRow.spacing = 8
         updateRow.alignment = .centerY
         checkUpdateButton = NSButton(title: "检查更新", target: self, action: #selector(checkForUpdates))
         checkUpdateButton.bezelStyle = .rounded
+        versionLabel = NSTextField(labelWithString: UpdateChecker.currentVersion)
+        versionLabel.font = .systemFont(ofSize: 12)
+        versionLabel.textColor = .secondaryLabelColor
         downloadUpdateButton = NSButton(title: "下载更新", target: self, action: #selector(downloadUpdate))
         downloadUpdateButton.bezelStyle = .rounded
         downloadUpdateButton.isHidden = true
         updateRow.addArrangedSubview(checkUpdateButton)
+        updateRow.addArrangedSubview(versionLabel)
         updateRow.addArrangedSubview(downloadUpdateButton)
         stack.addArrangedSubview(updateRow)
 
-        let newTitle = NSTextField(labelWithString: "快捷新建类型（dir = 文件夹；大小写按原样保留）")
+        updateStatusLabel = NSTextField(wrappingLabelWithString: "")
+        updateStatusLabel.textColor = .secondaryLabelColor
+        updateStatusLabel.font = .systemFont(ofSize: 11)
+        updateStatusLabel.preferredMaxLayoutWidth = 440
+        updateStatusLabel.isHidden = true
+        stack.addArrangedSubview(updateStatusLabel)
+
+        let newTitle = NSTextField(labelWithString: "额外新建类型")
         newTitle.font = .boldSystemFont(ofSize: 13)
         stack.addArrangedSubview(newTitle)
 
@@ -116,63 +102,53 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         typeRowsStack.alignment = .leading
         typeRowsStack.spacing = 6
         typeRowsStack.translatesAutoresizingMaskIntoConstraints = false
-
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.autohidesScrollers = true
-        scroll.borderType = .bezelBorder
-        scroll.drawsBackground = false
-        scroll.documentView = typeRowsStack
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.heightAnchor.constraint(equalToConstant: 160).isActive = true
-        scroll.widthAnchor.constraint(equalToConstant: 440).isActive = true
-        stack.addArrangedSubview(scroll)
+        typeRowsStack.setHuggingPriority(.defaultHigh, for: .vertical)
+        stack.addArrangedSubview(typeRowsStack)
 
         let addButton = NSButton(title: "添加类型", target: self, action: #selector(addTypeRow))
         addButton.bezelStyle = .rounded
         stack.addArrangedSubview(addButton)
 
-        let hint = NSTextField(wrappingLabelWithString: "例如：dir、txt、ppt、xlsx、docx、R、py。工具栏 ★ 可编辑收藏；⌘L 编辑路径。显示隐藏文件请用菜单「显示」。")
-        hint.textColor = .secondaryLabelColor
-        hint.font = .systemFont(ofSize: 11)
-        hint.preferredMaxLayoutWidth = 440
-        stack.addArrangedSubview(hint)
-
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
             stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-            typeRowsStack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
+            typeRowsStack.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
     }
 
     private func reloadValues() {
         redirectFinderCheckbox.state = settings.redirectFinderClicks ? .on : .off
         launchAtLoginCheckbox.state = settings.launchAtLogin ? .on : .off
-        versionLabel.stringValue = "当前版本：\(UpdateChecker.currentVersion)"
-        rebuildTypeRows(with: settings.newItemTypes)
+        versionLabel.stringValue = UpdateChecker.currentVersion
+        rebuildTypeRows(with: settings.customNewItemTypes)
+    }
+
+    private func setUpdateStatus(_ text: String) {
+        updateStatusLabel.stringValue = text
+        updateStatusLabel.isHidden = text.isEmpty
     }
 
     @objc private func checkForUpdates() {
         checkUpdateButton.isEnabled = false
         downloadUpdateButton.isHidden = true
         pendingRelease = nil
-        updateStatusLabel.stringValue = "正在检查更新…"
+        setUpdateStatus("正在检查更新…")
 
         UpdateChecker.fetchLatest { [weak self] result in
             guard let self else { return }
             self.checkUpdateButton.isEnabled = true
             switch result {
             case .failure:
-                self.updateStatusLabel.stringValue = "检查失败，请确认网络连接后重试。"
+                self.setUpdateStatus("检查失败，请确认网络连接后重试。")
             case .success(let release):
                 let current = UpdateChecker.currentVersion
                 if UpdateChecker.isVersion(release.version, newerThan: current) {
                     self.pendingRelease = release
-                    self.updateStatusLabel.stringValue = "发现新版本 \(release.version)（当前 \(current)）。"
+                    self.setUpdateStatus("发现新版本 \(release.version)。")
                     self.downloadUpdateButton.isHidden = false
                 } else {
-                    self.updateStatusLabel.stringValue = "已是最新版本（\(current)）。"
+                    self.setUpdateStatus("已是最新版本。")
                 }
             }
         }
@@ -182,7 +158,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         guard let release = pendingRelease else { return }
         checkUpdateButton.isEnabled = false
         downloadUpdateButton.isEnabled = false
-        updateStatusLabel.stringValue = "正在下载 \(release.version)…"
+        setUpdateStatus("正在下载 \(release.version)…")
 
         UpdateChecker.download(release) { [weak self] result in
             guard let self else { return }
@@ -190,10 +166,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             self.downloadUpdateButton.isEnabled = true
             switch result {
             case .failure:
-                self.updateStatusLabel.stringValue = "下载失败，请稍后重试或在 GitHub Releases 手动下载。"
+                self.setUpdateStatus("下载失败，请稍后重试或在 GitHub Releases 手动下载。")
             case .success(let dmgURL):
                 NSWorkspace.shared.open(dmgURL)
-                self.updateStatusLabel.stringValue = "已下载并打开安装包，请将 NewFinder 拖入「应用程序」完成更新。"
+                self.setUpdateStatus("已打开安装包，请拖入「应用程序」完成更新。")
                 let alert = NSAlert()
                 alert.messageText = "更新包已下载"
                 alert.informativeText = """
@@ -209,11 +185,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private func rebuildTypeRows(with types: [String]) {
         typeRowsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         typeFields.removeAll()
-        let list = types.isEmpty ? AppSettings.defaultNewItemTypes : types
-        for value in list {
+        for value in types {
             appendTypeRow(value: value, focus: false)
         }
-        layoutTypeRows()
     }
 
     private func appendTypeRow(value: String, focus: Bool) {
@@ -225,7 +199,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         let field = NSTextField()
         field.font = .systemFont(ofSize: 12)
         field.stringValue = value
-        field.placeholderString = "扩展名或 dir"
+        field.placeholderString = "扩展名，如 R、py"
         field.delegate = self
         field.target = self
         field.action = #selector(typesChanged)
@@ -247,18 +221,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         }
     }
 
-    private func layoutTypeRows() {
-        typeRowsStack.layoutSubtreeIfNeeded()
-        let width = typeRowsStack.enclosingScrollView?.contentView.bounds.width
-            ?? typeRowsStack.fittingSize.width
-        let height = max(typeRowsStack.fittingSize.height, 1)
-        typeRowsStack.setFrameSize(NSSize(width: max(width, 400), height: height))
-    }
-
     @objc private func addTypeRow() {
         guard typeFields.count < 40 else { return }
         appendTypeRow(value: "", focus: true)
-        layoutTypeRows()
         typesChanged()
     }
 
@@ -269,10 +234,6 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             typeFields.remove(at: idx)
         }
         row.removeFromSuperview()
-        if typeFields.isEmpty {
-            appendTypeRow(value: "dir", focus: false)
-        }
-        layoutTypeRows()
         typesChanged()
     }
 
@@ -289,7 +250,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     }
 
     @objc private func typesChanged() {
-        settings.newItemTypes = typeFields.map(\.stringValue)
+        settings.customNewItemTypes = typeFields.map(\.stringValue)
         notifyChange()
     }
 

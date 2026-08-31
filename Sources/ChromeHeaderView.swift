@@ -240,6 +240,8 @@ final class ChromeHeaderView: NSView {
                 toolTip: isDir ? "新建文件夹" : "新建 .\(type) 文件（按住 Option 并打开）"
             )
         }
+        let fixedCount = AppSettings.fixedNewItemTypes.count
+        button.separatorBeforeIndex = types.count > fixedCount ? fixedCount : nil
         return button
     }
 
@@ -688,6 +690,8 @@ final class NewMenuButton: NSButton {
     }
 
     var items: [Item] = []
+    /// Insert a menu separator before this item index (e.g. after fixed New types).
+    var separatorBeforeIndex: Int?
     weak var actionTarget: AnyObject?
 
     override func mouseDown(with event: NSEvent) {
@@ -712,7 +716,10 @@ final class NewMenuButton: NSButton {
             ceil((items.map { ($0.title as NSString).size(withAttributes: [.font: itemFont]).width }.max() ?? 0) + 24)
         )
 
-        for item in items {
+        for (index, item) in items.enumerated() {
+            if let sep = separatorBeforeIndex, index == sep, sep > 0, sep < items.count {
+                menu.addItem(.separator())
+            }
             let menuItem = NSMenuItem(title: item.title, action: nil, keyEquivalent: "")
             let row = BookmarkMenuRowView(
                 title: item.title,
