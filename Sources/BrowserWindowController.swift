@@ -968,6 +968,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     @objc func selectAllItems(_ sender: Any?) {
+        if contentController.selectAllInRenameFieldIfNeeded() {
+            return
+        }
+        if isEditingPath, let editor = pathField.currentEditor() {
+            editor.selectAll(nil)
+            return
+        }
         contentController.selectAll()
     }
 

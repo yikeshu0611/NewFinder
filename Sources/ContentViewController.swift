@@ -273,6 +273,14 @@ final class ContentViewController: NSViewController {
         onSelectionChange?(selectedItems)
     }
 
+    /// When renaming inline, ⌘A should select the whole name, not every file.
+    @discardableResult
+    func selectAllInRenameFieldIfNeeded() -> Bool {
+        guard renamingField != nil, let editor = renamingField?.currentEditor() else { return false }
+        editor.selectAll(nil)
+        return true
+    }
+
     func beginInlineRename(_ item: FileItem) {
         guard let row = items.firstIndex(where: { $0.url.standardizedFileURL == item.url.standardizedFileURL }) else {
             return

@@ -8,7 +8,7 @@
 
 在 [Releases](https://github.com/yikeshu0611/NewFinder/releases) 下载最新 `NewFinder-x.x.x.dmg`，拖入「应用程序」即可。
 
-**当前版本：1.1.1**
+**当前版本：1.1.2**
 
 ## 主要功能
 
@@ -24,6 +24,8 @@
 - **快捷新建**：可自定义多种类型（dir、txt、ppt、xlsx、docx、R、py 等，**大小写保留**）
 - xlsx / docx / pptx 为有效 Office 空白模板
 - 新建后自动选中并进入重命名
+- **粘贴重名**：在完整名称后加 `副本` / `副本 2`…（例如 `xxx 副本 3` → `xxx 副本 3 副本`）；新建未命名项用 `2`、`3`… 递增
+- 重命名时 **⌘A** 全选文件名（不会全选列表）
 
 ### 收藏夹
 - 路径栏星标收藏当前目录
@@ -50,7 +52,7 @@
 open build/NewFinder.app
 ```
 
-产物：`dist/NewFinder-1.1.1.dmg`
+产物：`dist/NewFinder-1.1.2.dmg`
 
 ## 快捷键
 

@@ -33,30 +33,103 @@ enum FileOperations {
         return items
     }
 
+    /// New untitled items (Finder-style): `未命名文件夹`, then `未命名文件夹 2`, `3`… (no `1`).
     static func uniqueURL(in directory: URL, baseName: String, extensionName: String?) -> URL {
+        uniqueUntitledURL(in: directory, baseName: baseName, extensionName: extensionName)
+    }
+
+    static func uniqueUntitledURL(in directory: URL, baseName: String, extensionName: String?) -> URL {
         let fm = FileManager.default
-        var index = 0
+        func candidate(_ base: String) -> URL {
+            directory.appendingPathComponent(composedFileName(base: base, extensionName: extensionName))
+        }
+        let first = candidate(baseName)
+        if !fm.fileExists(atPath: first.path) {
+            return first
+        }
+        var index = 2
         while true {
-            let name: String
-            if let ext = extensionName, !ext.isEmpty {
-                let suffix = index == 0 ? "" : " \(index)"
-                name = "\(baseName)\(suffix).\(ext)"
-            } else {
-                let suffix = index == 0 ? "" : " \(index)"
-                name = "\(baseName)\(suffix)"
-            }
-            let candidate = directory.appendingPathComponent(name)
-            if !fm.fileExists(atPath: candidate.path) {
-                return candidate
+            let url = candidate("\(baseName) \(index)")
+            if !fm.fileExists(atPath: url.path) {
+                return url
             }
             index += 1
         }
     }
 
+    /// Paste/copy name conflicts (user: `副本`, no `的`):
+    /// On conflict, append ` 副本` to the **full** name — do not bump an existing `副本 N` counter.
+    /// - `foo` → `foo 副本` → `foo 副本 2` → …
+    /// - `foo 副本 3` → `foo 副本 3 副本` → `foo 副本 3 副本 2` → …
+    static func uniqueCopyURL(in directory: URL, source: URL, isMoving: Bool) -> URL {
+        let fm = FileManager.default
+        let sourceName = source.lastPathComponent
+        let ignoredPath = source.standardizedFileURL.path
+
+        func isAvailable(_ url: URL) -> Bool {
+            let path = url.standardizedFileURL.path
+            // Only a move can "reuse" its own path; a copy must treat it as taken.
+            if isMoving, path == ignoredPath { return true }
+            return !fm.fileExists(atPath: path)
+        }
+
+        let original = directory.appendingPathComponent(sourceName)
+        if isAvailable(original) {
+            return original
+        }
+
+        var isDir: ObjCBool = false
+        let sourceIsDirectory = fm.fileExists(atPath: source.path, isDirectory: &isDir) && isDir.boolValue
+        let sourceIsPackage = (try? source.resourceValues(forKeys: [.isPackageKey]))?.isPackage == true
+        let keepFullName = sourceIsDirectory || sourceIsPackage
+
+        let (stem, ext): (String, String?) = {
+            if keepFullName {
+                return (sourceName, nil)
+            }
+            return splitNameAndExtension(sourceName)
+        }()
+
+        // Always append onto the full stem (e.g. "… 副本 3" → "… 副本 3 副本").
+        let firstCopy = directory.appendingPathComponent(
+            composedFileName(base: "\(stem) 副本", extensionName: ext)
+        )
+        if isAvailable(firstCopy) {
+            return firstCopy
+        }
+        var index = 2
+        while true {
+            let url = directory.appendingPathComponent(
+                composedFileName(base: "\(stem) 副本 \(index)", extensionName: ext)
+            )
+            if isAvailable(url) {
+                return url
+            }
+            index += 1
+        }
+    }
+
+    private static func composedFileName(base: String, extensionName: String?) -> String {
+        if let ext = extensionName, !ext.isEmpty {
+            return "\(base).\(ext)"
+        }
+        return base
+    }
+
+    /// Split `Report.pdf` → (`Report`, `pdf`).
+    private static func splitNameAndExtension(_ fileName: String) -> (String, String?) {
+        let ns = fileName as NSString
+        let ext = ns.pathExtension
+        if ext.isEmpty {
+            return (fileName, nil)
+        }
+        return (ns.deletingPathExtension, ext)
+    }
+
     static func createNewItem(in directory: URL, extensionName: String?) throws -> URL {
         if let ext = extensionName {
             // Keep extension spelling/case exactly as configured (e.g. .R, .py).
-            let url = uniqueURL(in: directory, baseName: "未命名", extensionName: ext)
+            let url = uniqueUntitledURL(in: directory, baseName: "未命名", extensionName: ext)
             if let binary = defaultBinaryContents(for: ext) {
                 try binary.write(to: url, options: .atomic)
             } else {
@@ -72,7 +145,7 @@ enum FileOperations {
             NSWorkspace.shared.noteFileSystemChanged(url.path)
             return url
         } else {
-            let url = uniqueURL(in: directory, baseName: "未命名文件夹", extensionName: nil)
+            let url = uniqueUntitledURL(in: directory, baseName: "未命名文件夹", extensionName: nil)
             try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
             NSWorkspace.shared.noteFileSystemChanged(url.path)
             return url
@@ -154,12 +227,12 @@ enum FileOperations {
 
         var results: [URL] = []
         for source in urls {
-            let dest = uniqueURL(
-                in: directory,
-                baseName: source.deletingPathExtension().lastPathComponent,
-                extensionName: source.pathExtension.isEmpty ? nil : source.pathExtension
-            )
+            let dest = uniqueCopyURL(in: directory, source: source, isMoving: cutting)
             if cutting {
+                if source.standardizedFileURL == dest.standardizedFileURL {
+                    results.append(source)
+                    continue
+                }
                 try FileManager.default.moveItem(at: source, to: dest)
             } else {
                 try FileManager.default.copyItem(at: source, to: dest)
