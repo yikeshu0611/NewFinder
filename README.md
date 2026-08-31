@@ -1,12 +1,12 @@
 # NewFinder
 
-独立的 macOS 文件管理器（菜单栏常驻），界面类似 Chrome 标签页 + Finder 路径栏，可接管系统 Finder 的「打开文件夹 / 在 Finder 中显示」。
+独立的 macOS 文件管理器（菜单栏常驻），Chrome 式多标签 + Finder 路径栏，可接管系统 Finder 的「打开文件夹 / 在 Finder 中显示」。
 
-> 本仓库：**[FinderPathBar](https://github.com/yikeshu0611/FinderPathBar)** · 应用名：**NewFinder** · macOS 13+（Apple Silicon / Intel）
+面向 **macOS 13+**（Apple Silicon / Intel）。
 
 ## 下载
 
-在 [Releases](https://github.com/yikeshu0611/FinderPathBar/releases) 下载最新 `NewFinder-x.x.x.dmg`，拖入「应用程序」即可。
+在 [Releases](https://github.com/yikeshu0611/NewFinder/releases) 下载最新 `NewFinder-x.x.x.dmg`，拖入「应用程序」即可。
 
 **当前版本：1.1.1**
 
@@ -15,7 +15,7 @@
 ### 界面与导航
 - **Chrome 式标签页**：多标签浏览、关闭、三击标签分离为新窗口
 - **路径栏**：面包屑分段导航（点击 `>` 展开子目录菜单）、⌘L 编辑路径并补全
-- **访问历史**：路径栏下拉，快速回到最近访问目录
+- **访问历史**：路径栏左侧下拉，快速回到最近访问目录
 - **复制路径**：路径栏按钮或 **⌘⇧C**
 - **列表视图**：异步加载大文件夹、图标缓存、列排序
 

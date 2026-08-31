@@ -1,7 +1,7 @@
 import Foundation
 
 enum UpdateChecker {
-    static let repository = "yikeshu0611/FinderPathBar"
+    static let repository = "yikeshu0611/NewFinder"
 
     struct ReleaseInfo {
         let version: String
