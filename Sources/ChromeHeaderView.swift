@@ -255,6 +255,9 @@ final class ChromeHeaderView: NSView {
         toolRow.addArrangedSubview(iconButton("chevron.up", tip: "上层文件夹", action: #selector(BrowserWindowController.goEnclosingFolder(_:)), target: target))
         toolRow.addArrangedSubview(separator())
         toolRow.addArrangedSubview(makeNewMenuButton(types: types ?? AppSettings.shared.newItemTypes, target: target))
+        for type in AppSettings.shared.toolbarNewItemTypes {
+            toolRow.addArrangedSubview(makeToolbarNewTypeButton(type: type, target: target))
+        }
         bookmarkFolderStack.orientation = .horizontal
         bookmarkFolderStack.spacing = 4
         bookmarkFolderStack.alignment = .centerY
@@ -320,13 +323,40 @@ final class ChromeHeaderView: NSView {
         button.items = types.enumerated().map { index, type in
             let isDir = type.lowercased() == "dir"
             return NewMenuButton.Item(
-                title: isDir ? "文件夹" : type,
+                title: AppSettings.displayName(forNewItemType: type),
                 tag: index,
                 toolTip: isDir ? "新建文件夹" : "新建 .\(type) 文件（按住 Option 并打开）"
             )
         }
-        let fixedCount = AppSettings.fixedNewItemTypes.count
-        button.separatorBeforeIndex = types.count > fixedCount ? fixedCount : nil
+        let fixedCount = AppSettings.shared.enabledFixedNewItemTypes.count
+        button.separatorBeforeIndex = (fixedCount > 0 && types.count > fixedCount) ? fixedCount : nil
+        return button
+    }
+
+    private func makeToolbarNewTypeButton(type: String, target: AnyObject) -> NSButton {
+        let button = ToolbarNewTypeButton()
+        button.itemType = type
+        let title = AppSettings.displayName(forNewItemType: type)
+        button.bezelStyle = .inline
+        button.isBordered = false
+        button.font = .systemFont(ofSize: 13)
+        button.title = title
+        button.attributedTitle = NSAttributedString(
+            string: title,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 13),
+                .foregroundColor: NSColor(calibratedWhite: 0.32, alpha: 1)
+            ]
+        )
+        let isDir = type.lowercased() == "dir"
+        button.toolTip = isDir ? "新建文件夹" : "新建 .\(type) 文件（按住 Option 并打开）"
+        button.focusRingType = .none
+        button.contentTintColor = NSColor(calibratedWhite: 0.32, alpha: 1)
+        button.setContentHuggingPriority(.required, for: .horizontal)
+        button.setContentCompressionResistancePriority(.required, for: .horizontal)
+        button.setButtonType(.momentaryPushIn)
+        button.target = target
+        button.action = #selector(BrowserWindowController.toolbarNewItemClicked(_:))
         return button
     }
 
@@ -858,6 +888,11 @@ final class NewMenuButton: NSButton {
         // Same anchor as bookmark-folder menus.
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: bounds.height + 4), in: self)
     }
+}
+
+/// Toolbar shortcut for a Settings「展示在工具栏」custom New type.
+final class ToolbarNewTypeButton: NSButton {
+    var itemType: String = ""
 }
 
 /// Toolbar gear: pops the former menu-bar chrome (显示 / 窗口 / 缩放 / 更新 / 设置).

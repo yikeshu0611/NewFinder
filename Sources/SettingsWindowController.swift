@@ -5,8 +5,12 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     static let didChangeNotification = Notification.Name("NewFinder.settingsChanged")
 
     private let settings = AppSettings.shared
-    private var typeFields: [NSTextField] = []
+    private var rowTypeKeys: [String] = []
+    private var rowIsFixed: [Bool] = []
+    private var rowNameFields: [NSTextField?] = []
+    private var rowToolbarChecks: [NSButton] = []
     private var typeRowsStack: NSStackView!
+    private var addTypeButton: NSButton!
     private var redirectFinderCheckbox: NSButton!
     private var launchAtLoginCheckbox: NSButton!
     private var versionLabel: NSTextField!
@@ -17,7 +21,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     private init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 420),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 520),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -101,13 +105,19 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         updateStatusLabel = NSTextField(wrappingLabelWithString: "")
         updateStatusLabel.textColor = .secondaryLabelColor
         updateStatusLabel.font = .systemFont(ofSize: 11)
-        updateStatusLabel.preferredMaxLayoutWidth = 440
+        updateStatusLabel.preferredMaxLayoutWidth = 520
         updateStatusLabel.isHidden = true
         stack.addArrangedSubview(updateStatusLabel)
 
-        let newTitle = NSTextField(labelWithString: "额外新建类型")
+        let newTitle = NSTextField(labelWithString: "新建类型")
         newTitle.font = .boldSystemFont(ofSize: 13)
         stack.addArrangedSubview(newTitle)
+
+        let newHint = NSTextField(wrappingLabelWithString: "文件夹 / txt / docx / pptx / xlsx 名称不可改。勾选「展示在工具栏」后会出现在 New 右侧；删除后可用「添加类型」恢复。")
+        newHint.font = .systemFont(ofSize: 11)
+        newHint.textColor = .secondaryLabelColor
+        newHint.preferredMaxLayoutWidth = 520
+        stack.addArrangedSubview(newHint)
 
         typeRowsStack = NSStackView()
         typeRowsStack.orientation = .vertical
@@ -117,9 +127,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         typeRowsStack.setHuggingPriority(.defaultHigh, for: .vertical)
         stack.addArrangedSubview(typeRowsStack)
 
-        let addButton = NSButton(title: "添加类型", target: self, action: #selector(addTypeRow))
-        addButton.bezelStyle = .rounded
-        stack.addArrangedSubview(addButton)
+        addTypeButton = NSButton(title: "添加类型", target: self, action: #selector(addTypeClicked(_:)))
+        addTypeButton.bezelStyle = .rounded
+        stack.addArrangedSubview(addTypeButton)
 
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
@@ -133,7 +143,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         redirectFinderCheckbox.state = settings.redirectFinderClicks ? .on : .off
         launchAtLoginCheckbox.state = settings.launchAtLogin ? .on : .off
         versionLabel.stringValue = UpdateChecker.currentVersion
-        rebuildTypeRows(with: settings.customNewItemTypes)
+        rebuildTypeRows()
     }
 
     private func setUpdateStatus(_ text: String) {
@@ -194,57 +204,153 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         }
     }
 
-    private func rebuildTypeRows(with types: [String]) {
+    private func rebuildTypeRows() {
         typeRowsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        typeFields.removeAll()
-        for value in types {
-            appendTypeRow(value: value, focus: false)
+        rowTypeKeys.removeAll()
+        rowIsFixed.removeAll()
+        rowNameFields.removeAll()
+        rowToolbarChecks.removeAll()
+
+        for type in settings.enabledFixedNewItemTypes {
+            appendTypeRow(
+                typeKey: type,
+                displayName: AppSettings.displayName(forNewItemType: type),
+                isFixed: true,
+                showInToolbar: settings.isToolbarNewItemType(type),
+                focus: false
+            )
+        }
+        for type in settings.customNewItemTypes {
+            appendTypeRow(
+                typeKey: type,
+                displayName: type,
+                isFixed: false,
+                showInToolbar: settings.isToolbarNewItemType(type),
+                focus: false
+            )
         }
     }
 
-    private func appendTypeRow(value: String, focus: Bool) {
+    private func appendTypeRow(
+        typeKey: String,
+        displayName: String,
+        isFixed: Bool,
+        showInToolbar: Bool,
+        focus: Bool
+    ) {
         let row = NSStackView()
         row.orientation = .horizontal
         row.spacing = 8
         row.alignment = .centerY
 
-        let field = NSTextField()
+        let field = NSTextField(string: displayName)
         field.font = .systemFont(ofSize: 12)
-        field.stringValue = value
         field.placeholderString = "扩展名，如 R、py"
-        field.delegate = self
-        field.target = self
-        field.action = #selector(typesChanged)
-        field.widthAnchor.constraint(equalToConstant: 120).isActive = true
-        typeFields.append(field)
+        field.isEditable = !isFixed
+        field.isSelectable = !isFixed
+        field.isBordered = !isFixed
+        field.isBezeled = !isFixed
+        field.drawsBackground = !isFixed
+        if isFixed {
+            field.textColor = .labelColor
+            field.backgroundColor = .clear
+            field.focusRingType = .none
+        } else {
+            field.delegate = self
+            field.target = self
+            field.action = #selector(typesChanged)
+        }
+        field.widthAnchor.constraint(equalToConstant: 100).isActive = true
+
+        let toolbarCheck = NSButton(
+            checkboxWithTitle: "展示在工具栏",
+            target: self,
+            action: #selector(typesChanged)
+        )
+        toolbarCheck.state = showInToolbar ? .on : .off
 
         let remove = NSButton(title: "删除", target: self, action: #selector(removeTypeRow(_:)))
         remove.bezelStyle = .rounded
         remove.setButtonType(.momentaryPushIn)
 
         row.addArrangedSubview(field)
+        row.addArrangedSubview(toolbarCheck)
         row.addArrangedSubview(remove)
         typeRowsStack.addArrangedSubview(row)
 
-        if focus {
+        rowTypeKeys.append(typeKey)
+        rowIsFixed.append(isFixed)
+        rowNameFields.append(isFixed ? nil : field)
+        rowToolbarChecks.append(toolbarCheck)
+
+        if focus, !isFixed {
             DispatchQueue.main.async {
                 self.window?.makeFirstResponder(field)
             }
         }
     }
 
-    @objc private func addTypeRow() {
-        guard typeFields.count < 40 else { return }
-        appendTypeRow(value: "", focus: true)
+    @objc private func addTypeClicked(_ sender: NSButton) {
+        let missingFixed = AppSettings.fixedNewItemTypes.filter { candidate in
+            !settings.enabledFixedNewItemTypes.contains { $0.lowercased() == candidate.lowercased() }
+        }
+
+        if missingFixed.isEmpty {
+            addCustomTypeRow()
+            return
+        }
+
+        let menu = NSMenu()
+        for type in missingFixed {
+            let title = "恢复「\(AppSettings.displayName(forNewItemType: type))」"
+            let item = NSMenuItem(title: title, action: #selector(restoreFixedType(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = type
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        let custom = NSMenuItem(title: "自定义扩展名", action: #selector(addCustomTypeRow), keyEquivalent: "")
+        custom.target = self
+        menu.addItem(custom)
+        let point = NSPoint(x: 0, y: sender.bounds.height + 2)
+        menu.popUp(positioning: nil, at: point, in: sender)
+    }
+
+    @objc private func restoreFixedType(_ sender: NSMenuItem) {
+        guard let type = sender.representedObject as? String,
+              AppSettings.canonicalFixedType(type) != nil else { return }
+        var enabled = settings.enabledFixedNewItemTypes
+        if !enabled.contains(where: { $0.lowercased() == type.lowercased() }) {
+            enabled.append(type)
+        }
+        // Keep canonical order.
+        settings.enabledFixedNewItemTypes = enabled
+        rebuildTypeRows()
+        notifyChange()
+    }
+
+    @objc private func addCustomTypeRow() {
+        let customCount = rowIsFixed.filter { !$0 }.count
+        guard customCount < 40 else { return }
+        appendTypeRow(
+            typeKey: "",
+            displayName: "",
+            isFixed: false,
+            showInToolbar: false,
+            focus: true
+        )
         typesChanged()
     }
 
     @objc private func removeTypeRow(_ sender: NSButton) {
-        guard let row = sender.superview as? NSStackView else { return }
-        if let field = row.arrangedSubviews.first as? NSTextField,
-           let idx = typeFields.firstIndex(of: field) {
-            typeFields.remove(at: idx)
-        }
+        guard let row = sender.superview as? NSStackView,
+              let index = typeRowsStack.arrangedSubviews.firstIndex(of: row),
+              rowTypeKeys.indices.contains(index) else { return }
+
+        rowTypeKeys.remove(at: index)
+        rowIsFixed.remove(at: index)
+        rowNameFields.remove(at: index)
+        rowToolbarChecks.remove(at: index)
         row.removeFromSuperview()
         typesChanged()
     }
@@ -262,7 +368,38 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     }
 
     @objc private func typesChanged() {
-        settings.customNewItemTypes = typeFields.map(\.stringValue)
+        var enabledFixed: [String] = []
+        var custom: [String] = []
+        var toolbarKeys = Set<String>()
+
+        for index in rowTypeKeys.indices {
+            let isFixed = rowIsFixed[index]
+            let checkOn = rowToolbarChecks.indices.contains(index) && rowToolbarChecks[index].state == .on
+
+            if isFixed {
+                let key = rowTypeKeys[index]
+                enabledFixed.append(key)
+                if checkOn {
+                    toolbarKeys.insert(key.lowercased())
+                }
+            } else {
+                let typed = rowNameFields[index]?.stringValue ?? rowTypeKeys[index]
+                custom.append(typed)
+                let trimmed = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+                if checkOn, !trimmed.isEmpty, AppSettings.canonicalFixedType(trimmed) == nil {
+                    toolbarKeys.insert(trimmed.lowercased())
+                }
+            }
+        }
+
+        settings.enabledFixedNewItemTypes = enabledFixed
+        settings.customNewItemTypes = custom
+        settings.toolbarNewItemTypeKeys = toolbarKeys
+
+        // Keep rowTypeKeys for custom rows in sync with typed text (before normalize/sort).
+        for index in rowTypeKeys.indices where !rowIsFixed[index] {
+            rowTypeKeys[index] = rowNameFields[index]?.stringValue ?? ""
+        }
         notifyChange()
     }
 

@@ -123,6 +123,8 @@ final class AppSettings {
     private enum Keys {
         static let showHidden = "showHidden"
         static let newItemTypes = "newItemTypes"
+        static let enabledFixedNewItemTypes = "enabledFixedNewItemTypes"
+        static let toolbarNewItemTypes = "toolbarNewItemTypes"
         static let bookmarks = "bookmarks"
         static let bookmarkFolderOrder = "bookmarkFolderOrder"
         static let languageChinese = "languageChinese"
@@ -163,11 +165,44 @@ final class AppSettings {
         set { defaults.set(newValue, forKey: Keys.launchAtLogin) }
     }
 
-    /// Always pinned at the top of the New menu; not shown in Settings.
+    /// Built-in New types (canonical keys). Display name for `dir` is「文件夹」.
     static let fixedNewItemTypes = ["dir", "txt", "docx", "pptx", "xlsx"]
 
     /// Default extras (stored alphabetically as `py`, `R`).
     static let defaultCustomNewItemTypes = ["R", "py"]
+
+    static func displayName(forNewItemType type: String) -> String {
+        let key = type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if key == "dir" { return "文件夹" }
+        return type.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Map user input / aliases to a fixed canonical type, if any.
+    static func canonicalFixedType(_ type: String) -> String? {
+        let key = type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if key.isEmpty { return nil }
+        if key == "dir" || key == "folder" || key == "文件夹" { return "dir" }
+        if key == "ppt" { return "pptx" }
+        return fixedNewItemTypes.first { $0.lowercased() == key }
+    }
+
+    /// Fixed types currently shown in New / Settings (default: all), in fixed order.
+    var enabledFixedNewItemTypes: [String] {
+        get {
+            if defaults.object(forKey: Keys.enabledFixedNewItemTypes) == nil {
+                return Self.fixedNewItemTypes
+            }
+            let raw = defaults.stringArray(forKey: Keys.enabledFixedNewItemTypes) ?? []
+            let enabled = Set(raw.map { $0.lowercased() })
+            return Self.fixedNewItemTypes.filter { enabled.contains($0.lowercased()) }
+        }
+        set {
+            let enabled = Set(newValue.map { $0.lowercased() })
+            let ordered = Self.fixedNewItemTypes.filter { enabled.contains($0.lowercased()) }
+            defaults.set(ordered, forKey: Keys.enabledFixedNewItemTypes)
+            pruneToolbarNewItemTypes(allowed: ordered + customNewItemTypes)
+        }
+    }
 
     /// Custom types only (editable in Settings), A–Z, case preserved.
     var customNewItemTypes: [String] {
@@ -185,18 +220,55 @@ final class AppSettings {
             }
             return custom
         }
-        set { defaults.set(normalizedCustomTypes(newValue), forKey: Keys.newItemTypes) }
+        set {
+            let normalized = normalizedCustomTypes(newValue)
+            defaults.set(normalized, forKey: Keys.newItemTypes)
+            pruneToolbarNewItemTypes(allowed: enabledFixedNewItemTypes + normalized)
+        }
     }
 
-    /// Full New-menu list: fixed types first, then custom types A–Z.
+    /// Lowercased type keys that also appear as toolbar buttons (right of New).
+    var toolbarNewItemTypeKeys: Set<String> {
+        get {
+            Set((defaults.stringArray(forKey: Keys.toolbarNewItemTypes) ?? []).map { $0.lowercased() })
+        }
+        set {
+            pruneToolbarNewItemTypes(
+                allowed: enabledFixedNewItemTypes + customNewItemTypes,
+                preferred: newValue
+            )
+        }
+    }
+
+    /// Types marked「展示在工具栏」, New-menu order (fixed first, then custom A–Z).
+    var toolbarNewItemTypes: [String] {
+        let keys = toolbarNewItemTypeKeys
+        return newItemTypes.filter { keys.contains($0.lowercased()) }
+    }
+
+    func isToolbarNewItemType(_ type: String) -> Bool {
+        let key = type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !key.isEmpty else { return false }
+        return toolbarNewItemTypeKeys.contains(key)
+    }
+
+    /// Full New-menu list: enabled fixed types first, then custom types A–Z.
     var newItemTypes: [String] {
-        Self.fixedNewItemTypes + customNewItemTypes
+        enabledFixedNewItemTypes + customNewItemTypes
     }
 
     static func isFixedNewItemType(_ type: String) -> Bool {
-        let key = type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if key == "ppt" { return true } // treat legacy ppt as the fixed pptx slot
-        return fixedNewItemTypes.map { $0.lowercased() }.contains(key)
+        canonicalFixedType(type) != nil
+    }
+
+    private func pruneToolbarNewItemTypes(allowed: [String], preferred: Set<String>? = nil) {
+        let allowedKeys = Set(allowed.map { $0.lowercased() })
+        let source = preferred ?? toolbarNewItemTypeKeys
+        let filtered = source
+            .map { $0.lowercased() }
+            .filter { allowedKeys.contains($0) }
+            .sorted()
+        defaults.set(filtered, forKey: Keys.toolbarNewItemTypes)
     }
 
     private func normalizedCustomTypes(_ raw: [String]) -> [String] {

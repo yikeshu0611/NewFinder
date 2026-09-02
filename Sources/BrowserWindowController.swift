@@ -1130,6 +1130,24 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         createNewItem(extensionName: ext, openAfterCreate: openAfterCreate)
     }
 
+    @objc func toolbarNewItemClicked(_ sender: NSButton) {
+        let type: String
+        if let button = sender as? ToolbarNewTypeButton {
+            type = button.itemType
+        } else {
+            type = sender.title
+        }
+        let trimmed = type.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        let canonical = AppSettings.canonicalFixedType(trimmed) ?? trimmed
+        let ext: String? = canonical.lowercased() == "dir" ? nil : canonical
+        let openAfterCreate = NSEvent.modifierFlags.contains(.option)
+        createNewItem(extensionName: ext, openAfterCreate: openAfterCreate)
+    }
+
     private func createNewItem(extensionName: String?, openAfterCreate: Bool) {
         let targetDir = contentController.createTargetDirectory(fallback: currentDirectory)
         let createdInsideOutline =

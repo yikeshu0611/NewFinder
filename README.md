@@ -8,7 +8,7 @@
 
 在 [Releases](https://github.com/yikeshu0611/NewFinder/releases) 下载最新 `NewFinder-x.x.x.dmg`，拖入「应用程序」即可。
 
-**当前版本：1.1.5**
+**当前版本：1.1.6**
 
 ## 主要功能
 
@@ -25,7 +25,7 @@
 - 剪切项灰色显示；改名/拷贝/剪切/粘贴/删除成功后工具栏绿色 ✓ 反馈
 - **压缩 / 解压**：右键 `压缩…`、`解压…`、`打开压缩包`（内建；支持 ZIP / TAR.GZ，解压另含 rar/7z 等若已安装 unar）
 - 双击压缩包在 NewFinder 标签页中浏览内容
-- **快捷新建**：固定项（文件夹 / txt / docx / pptx / xlsx）置顶；其余类型在设置中配置并按字母序排列
+- **快捷新建**：固定项（文件夹 / txt / docx / pptx / xlsx）与自定义类型均可在设置中管理；可勾选「展示在工具栏」、可删除（固定项名称不可改，删除后可恢复）
 - xlsx / docx / pptx 为有效 Office 空白模板
 - 新建后自动选中并进入重命名
 - **重名处理**（新建 / 粘贴）：`未命名` → `未命名 副本` → `未命名 副本 2`…；粘贴 `foo 副本 3` → `foo 副本 4`
@@ -56,7 +56,7 @@
 open build/NewFinder.app
 ```
 
-产物：`dist/NewFinder-1.1.5.dmg`
+产物：`dist/NewFinder-1.1.6.dmg`
 
 ## 快捷键
 
