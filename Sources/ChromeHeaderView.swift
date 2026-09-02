@@ -4,13 +4,29 @@ final class BrowserTab {
     let id = UUID()
     var directory: URL
     let history = NavigationHistory()
+    /// When set, this tab browses inside an archive instead of the filesystem.
+    var archiveURL: URL?
+    /// Path inside the archive ("" = root). Use `/` separators, no leading slash.
+    var archiveInternalPath: String = ""
+
+    var isArchiveTab: Bool { archiveURL != nil }
 
     init(directory: URL) {
         self.directory = directory.standardizedFileURL
         history.navigate(to: self.directory)
     }
 
+    init(archive: URL) {
+        self.archiveURL = archive.standardizedFileURL
+        self.directory = archive.deletingLastPathComponent().standardizedFileURL
+        self.archiveInternalPath = ""
+        history.navigate(to: archive.standardizedFileURL)
+    }
+
     var title: String {
+        if let archiveURL {
+            return archiveURL.lastPathComponent
+        }
         if directory.path == "/" { return "Macintosh HD" }
         let name = directory.lastPathComponent
         return name.isEmpty ? directory.path : name
@@ -41,6 +57,42 @@ final class ChromeHeaderView: NSView {
     private weak var showHiddenButton: NSButton?
     private let bookmarkFolderStack = NSStackView()
     private weak var actionTarget: AnyObject?
+    private var fileActionButtons: [FileActionKind: NSButton] = [:]
+    private var fileActionFlashTokens: [FileActionKind: Int] = [:]
+
+    enum FileActionKind: Hashable {
+        case rename, copy, cut, paste, trash
+
+        var symbol: String {
+            switch self {
+            case .rename: return "pencil"
+            case .copy: return "doc.on.doc"
+            case .cut: return "scissors"
+            case .paste: return "clipboard"
+            case .trash: return "trash"
+            }
+        }
+
+        var tip: String {
+            switch self {
+            case .rename: return "重命名 (F2)"
+            case .copy: return "拷贝"
+            case .cut: return "剪切"
+            case .paste: return "粘贴"
+            case .trash: return "移到废纸篓"
+            }
+        }
+
+        var doneTip: String {
+            switch self {
+            case .rename: return "已重命名"
+            case .copy: return "已拷贝"
+            case .cut: return "已剪切"
+            case .paste: return "已粘贴"
+            case .trash: return "已移到废纸篓"
+            }
+        }
+    }
 
     private(set) var tabs: [BrowserTab] = []
     private(set) var activeTabID: UUID?
@@ -98,6 +150,28 @@ final class ChromeHeaderView: NSView {
         button.image?.isTemplate = true
         button.contentTintColor = showHidden ? .controlAccentColor : .labelColor
         button.toolTip = showHidden ? "隐藏隐藏项 (⌘.)" : "显示隐藏项 (⌘.)"
+    }
+
+    /// Brief green checkmark on a toolbar file-action button (same as path-bar copy feedback).
+    func flashFileActionSuccess(_ kind: FileActionKind) {
+        guard let button = fileActionButtons[kind] else { return }
+        let token = (fileActionFlashTokens[kind] ?? 0) + 1
+        fileActionFlashTokens[kind] = token
+        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+        button.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: kind.doneTip)?
+            .withSymbolConfiguration(config)
+        button.image?.isTemplate = true
+        button.contentTintColor = .systemGreen
+        button.toolTip = kind.doneTip
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self, weak button] in
+            guard let self, let button, self.fileActionFlashTokens[kind] == token else { return }
+            button.image = NSImage(systemSymbolName: kind.symbol, accessibilityDescription: kind.tip)?
+                .withSymbolConfiguration(config)
+            button.image?.isTemplate = true
+            button.contentTintColor = .labelColor
+            button.toolTip = kind.tip
+        }
     }
 
     var searchFieldView: NSSearchField { searchField }
@@ -193,11 +267,22 @@ final class ChromeHeaderView: NSView {
         fileActionsRow.spacing = 2
         fileActionsRow.alignment = .centerY
         fileActionsRow.translatesAutoresizingMaskIntoConstraints = false
-        fileActionsRow.addArrangedSubview(iconButton("pencil", tip: "重命名 (F2)", action: #selector(BrowserWindowController.rename(_:)), target: target))
-        fileActionsRow.addArrangedSubview(iconButton("doc.on.doc", tip: "拷贝", action: #selector(BrowserWindowController.copy(_:)), target: target))
-        fileActionsRow.addArrangedSubview(iconButton("scissors", tip: "剪切", action: #selector(BrowserWindowController.cut(_:)), target: target))
-        fileActionsRow.addArrangedSubview(iconButton("clipboard", tip: "粘贴", action: #selector(BrowserWindowController.paste(_:)), target: target))
-        fileActionsRow.addArrangedSubview(iconButton("trash", tip: "移到废纸篓", action: #selector(BrowserWindowController.moveToTrash(_:)), target: target))
+        fileActionButtons.removeAll()
+        fileActionsRow.addArrangedSubview(
+            fileActionButton(.rename, action: #selector(BrowserWindowController.rename(_:)), target: target)
+        )
+        fileActionsRow.addArrangedSubview(
+            fileActionButton(.copy, action: #selector(BrowserWindowController.copy(_:)), target: target)
+        )
+        fileActionsRow.addArrangedSubview(
+            fileActionButton(.cut, action: #selector(BrowserWindowController.cut(_:)), target: target)
+        )
+        fileActionsRow.addArrangedSubview(
+            fileActionButton(.paste, action: #selector(BrowserWindowController.paste(_:)), target: target)
+        )
+        fileActionsRow.addArrangedSubview(
+            fileActionButton(.trash, action: #selector(BrowserWindowController.moveToTrash(_:)), target: target)
+        )
         let hiddenBtn = iconButton("eye.slash", tip: "显示隐藏项 (⌘.)", action: #selector(BrowserWindowController.toggleHiddenFiles(_:)), target: target)
         showHiddenButton = hiddenBtn
         syncShowHiddenFilesButton(AppSettings.shared.showHiddenFiles)
@@ -208,7 +293,7 @@ final class ChromeHeaderView: NSView {
         searchField.target = target
         searchField.action = #selector(BrowserWindowController.searchChanged(_:))
         toolRow.addArrangedSubview(searchField)
-        toolRow.addArrangedSubview(iconButton("gearshape", tip: "设置", action: #selector(BrowserWindowController.openSettings(_:)), target: target))
+        toolRow.addArrangedSubview(makeAppChromeMenuButton())
     }
 
     var bookmarkFoldersContainer: NSStackView { bookmarkFolderStack }
@@ -242,6 +327,32 @@ final class ChromeHeaderView: NSView {
         }
         let fixedCount = AppSettings.fixedNewItemTypes.count
         button.separatorBeforeIndex = types.count > fixedCount ? fixedCount : nil
+        return button
+    }
+
+    private func makeAppChromeMenuButton() -> NSButton {
+        let button = AppChromeMenuButton()
+        button.bezelStyle = .inline
+        button.isBordered = false
+        button.controlSize = .small
+        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+        button.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "菜单")?
+            .withSymbolConfiguration(config)
+        button.image?.isTemplate = true
+        button.contentTintColor = .labelColor
+        button.toolTip = "菜单（显示 / 窗口 / 缩放 / 更新 / 设置）"
+        button.focusRingType = .none
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.setContentHuggingPriority(.required, for: .horizontal)
+        button.setContentCompressionResistancePriority(.required, for: .horizontal)
+        button.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        return button
+    }
+
+    private func fileActionButton(_ kind: FileActionKind, action: Selector, target: AnyObject) -> NSButton {
+        let button = iconButton(kind.symbol, tip: kind.tip, action: action, target: target)
+        fileActionButtons[kind] = button
         return button
     }
 
@@ -745,6 +856,29 @@ final class NewMenuButton: NSButton {
         }
 
         // Same anchor as bookmark-folder menus.
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: bounds.height + 4), in: self)
+    }
+}
+
+/// Toolbar gear: pops the former menu-bar chrome (显示 / 窗口 / 缩放 / 更新 / 设置).
+final class AppChromeMenuButton: NSButton {
+    private var menuHelpers: [AnyObject] = []
+
+    override func mouseDown(with event: NSEvent) {
+        // Defer until mouseUp so the same event doesn't select a menu item.
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard bounds.insetBy(dx: -2, dy: -2).contains(point) else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.showMenu()
+        }
+    }
+
+    private func showMenu() {
+        let menu = NSMenu()
+        menuHelpers = AppDelegate.shared.populateChromeMenu(menu)
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: bounds.height + 4), in: self)
     }
 }

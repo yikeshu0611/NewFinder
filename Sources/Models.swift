@@ -10,8 +10,11 @@ struct FileItem: Hashable {
     let fileSize: Int64?
     let modificationDate: Date?
     let creationDate: Date?
+    /// Non-nil when this row is inside an opened archive tab.
+    let archiveEntryPath: String?
 
     var displayName: String { name }
+    var isArchiveEntry: Bool { archiveEntryPath != nil }
 
     /// Keys prefetched by `FileOperations.listDirectory` (kept lean for large folders).
     static let listingKeys: [URLResourceKey] = [
@@ -37,7 +40,8 @@ struct FileItem: Hashable {
             isHidden: values?.isHidden == true || name.hasPrefix("."),
             fileSize: (isDirectory && !isPackage) ? nil : Int64(values?.fileSize ?? 0),
             modificationDate: values?.contentModificationDate,
-            creationDate: nil
+            creationDate: nil,
+            archiveEntryPath: nil
         )
     }
 
@@ -66,7 +70,34 @@ struct FileItem: Hashable {
             isHidden: values?.isHidden == true || url.lastPathComponent.hasPrefix("."),
             fileSize: isDirectory ? nil : Int64(values?.fileSize ?? 0),
             modificationDate: values?.contentModificationDate,
-            creationDate: values?.creationDate
+            creationDate: values?.creationDate,
+            archiveEntryPath: nil
+        )
+    }
+
+    static func archiveEntry(
+        archive: URL,
+        entryPath: String,
+        name: String,
+        isDirectory: Bool,
+        size: Int64?
+    ) -> FileItem {
+        // Synthetic URL for selection identity only.
+        var components = URLComponents()
+        components.scheme = "nf-archive"
+        components.host = archive.path.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed)
+        components.path = "/" + entryPath
+        let url = components.url ?? archive.appendingPathComponent(entryPath)
+        return FileItem(
+            url: url,
+            name: name,
+            isDirectory: isDirectory,
+            isPackage: false,
+            isHidden: name.hasPrefix("."),
+            fileSize: isDirectory ? nil : size,
+            modificationDate: nil,
+            creationDate: nil,
+            archiveEntryPath: entryPath
         )
     }
 }
@@ -97,6 +128,17 @@ final class AppSettings {
         static let languageChinese = "languageChinese"
         static let redirectFinder = "redirectFinderClicks"
         static let launchAtLogin = "launchAtLogin"
+        static let openWithDefaultHistory = "openWithDefaultHistory"
+        static let uiZoomPercent = "uiZoomPercent"
+    }
+
+    /// Content zoom 30%…500%. Default 100. Adjusted via menu-bar slider.
+    var uiZoomPercent: Int {
+        get {
+            let value = defaults.object(forKey: Keys.uiZoomPercent) as? Int ?? 100
+            return min(500, max(30, value))
+        }
+        set { defaults.set(min(500, max(30, newValue)), forKey: Keys.uiZoomPercent) }
     }
 
     var showHiddenFiles: Bool {
@@ -200,6 +242,19 @@ final class AppSettings {
             return defaults.bool(forKey: Keys.languageChinese)
         }
         set { defaults.set(newValue, forKey: Keys.languageChinese) }
+    }
+
+    /// Bundle IDs (or paths) the user has set as default via「打开方式」checkbox. Newest first.
+    var openWithDefaultHistory: [String] {
+        get { defaults.stringArray(forKey: Keys.openWithDefaultHistory) ?? [] }
+        set { defaults.set(Array(newValue.prefix(30)), forKey: Keys.openWithDefaultHistory) }
+    }
+
+    func rememberOpenWithDefaultApp(bundleID: String, path: String) {
+        let key = bundleID.isEmpty ? path : bundleID
+        var list = openWithDefaultHistory.filter { $0 != key }
+        list.insert(key, at: 0)
+        openWithDefaultHistory = list
     }
 }
 

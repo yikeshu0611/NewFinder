@@ -1,10 +1,12 @@
 import AppKit
 
-/// Menu-bar (status item) entry for NewFinder when running without a Dock icon.
-final class StatusBarController: NSObject {
+/// Menu-bar (status item) entry when NewFinder stays out of the Dock / system menu bar.
+final class StatusBarController: NSObject, NSMenuDelegate {
     static let shared = StatusBarController()
 
     private var statusItem: NSStatusItem?
+    private weak var zoomMenuItem: NSMenuItem?
+    private var helpers: [AnyObject] = []
 
     func install() {
         guard statusItem == nil else { return }
@@ -17,39 +19,24 @@ final class StatusBarController: NSObject {
         }
 
         let menu = NSMenu()
-        menu.addItem(withTitle: "显示 NewFinder", action: #selector(showNewFinder), keyEquivalent: "")
-        menu.addItem(withTitle: "新建窗口", action: #selector(newWindow), keyEquivalent: "n")
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(withTitle: "设置…", action: #selector(showSettings), keyEquivalent: ",")
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(withTitle: "退出 NewFinder", action: #selector(quit), keyEquivalent: "q")
-        for entry in menu.items {
-            entry.target = self
-        }
+        menu.delegate = self
         item.menu = menu
         statusItem = item
+        rebuildMenu(menu)
     }
 
-    @objc private func showNewFinder() {
-        let desktop = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop")
-        if let front = AppDelegate.shared.keyBrowserForStatusBar() {
-            front.window?.makeKeyAndOrderFront(nil)
-        } else {
-            AppDelegate.shared.openNewWindow(at: desktop)
-        }
-        NSApp.activate(ignoringOtherApps: true)
+    func refreshZoomTitle(_ percent: Int? = nil) {
+        let value = percent ?? AppSettings.shared.uiZoomPercent
+        zoomMenuItem?.title = "缩放（\(value)%）"
     }
 
-    @objc private func newWindow() {
-        AppDelegate.shared.newWindow(nil)
-        NSApp.activate(ignoringOtherApps: true)
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        rebuildMenu(menu)
     }
 
-    @objc private func showSettings() {
-        AppDelegate.shared.showPreferences(nil)
-    }
-
-    @objc private func quit() {
-        NSApp.terminate(nil)
+    private func rebuildMenu(_ menu: NSMenu) {
+        helpers = AppDelegate.shared.populateChromeMenu(menu, includeQuit: true)
+        // Keep a weak handle to the zoom title for live updates while the menu is open.
+        zoomMenuItem = menu.items.first { $0.title.hasPrefix("缩放") }
     }
 }

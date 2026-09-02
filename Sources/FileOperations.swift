@@ -244,6 +244,75 @@ enum FileOperations {
         }
     }
 
+    /// Grant owner write permission and clear Finder/user immutable flags.
+    /// Directories are processed recursively.
+    static func makeWritable(_ urls: [URL]) throws {
+        var failures: [String] = []
+        for url in urls {
+            do {
+                try makeWritableRecursively(url)
+            } catch {
+                failures.append("\(url.lastPathComponent)：\(error.localizedDescription)")
+            }
+        }
+        if !failures.isEmpty {
+            throw NSError(
+                domain: "NewFinder",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: failures.joined(separator: "\n")]
+            )
+        }
+    }
+
+    static func isEffectivelyReadOnly(_ url: URL) -> Bool {
+        if !FileManager.default.isWritableFile(atPath: url.path) { return true }
+        if let values = try? url.resourceValues(forKeys: [.isUserImmutableKey]),
+           values.isUserImmutable == true {
+            return true
+        }
+        return false
+    }
+
+    private static func makeWritableRecursively(_ url: URL) throws {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir) else { return }
+
+        // Clear Finder "Locked" / user immutable bit.
+        var mutableURL = url
+        var values = URLResourceValues()
+        values.isUserImmutable = false
+        try? mutableURL.setResourceValues(values)
+
+        // Clear uchg/schg flags when present (ignore failure if not set).
+        let chflags = Process()
+        chflags.executableURL = URL(fileURLWithPath: "/usr/bin/chflags")
+        chflags.arguments = ["nouchg,noschg", url.path]
+        chflags.standardOutput = FileHandle.nullDevice
+        chflags.standardError = FileHandle.nullDevice
+        try? chflags.run()
+        chflags.waitUntilExit()
+
+        let attrs = try fm.attributesOfItem(atPath: url.path)
+        var perms = attrs[.posixPermissions] as? Int ?? (isDir.boolValue ? 0o755 : 0o644)
+        perms |= 0o200 // owner write
+        if isDir.boolValue {
+            perms |= 0o100 // owner execute (needed to enter directory)
+        }
+        try fm.setAttributes([.posixPermissions: perms], ofItemAtPath: url.path)
+
+        if isDir.boolValue {
+            let children = try fm.contentsOfDirectory(
+                at: url,
+                includingPropertiesForKeys: nil,
+                options: []
+            )
+            for child in children {
+                try makeWritableRecursively(child)
+            }
+        }
+    }
+
     static func copyURLs(_ urls: [URL]) {
         let pb = NSPasteboard.general
         pb.clearContents()
@@ -266,6 +335,22 @@ enum FileOperations {
         return pb.string(forType: pasteboardType) == "cut" || pb.data(forType: pasteboardType) != nil
     }
 
+    /// URLs currently marked for move on the general pasteboard (Windows-style gray preview).
+    static func cutURLsOnPasteboard() -> Set<URL> {
+        guard isCutOnPasteboard() else { return [] }
+        let pb = NSPasteboard.general
+        guard let urls = pb.readObjects(forClasses: [NSURL.self], options: [
+            .urlReadingFileURLsOnly: true
+        ]) as? [URL], !urls.isEmpty else {
+            return []
+        }
+        return Set(urls.map { $0.standardizedFileURL })
+    }
+
+    static func isURLCut(_ url: URL) -> Bool {
+        cutURLsOnPasteboard().contains(url.standardizedFileURL)
+    }
+
     static func paste(into directory: URL) throws -> [URL] {
         let pb = NSPasteboard.general
         guard let urls = pb.readObjects(forClasses: [NSURL.self], options: [
@@ -282,23 +367,27 @@ enum FileOperations {
             return pb.string(forType: pasteboardType) == "cut"
         }()
 
-        var results: [URL] = []
-        for source in urls {
-            let dest = uniqueCopyURL(in: directory, source: source, isMoving: cutting)
-            if cutting {
-                if source.standardizedFileURL == dest.standardizedFileURL {
-                    results.append(source)
-                    continue
-                }
-                try FileManager.default.moveItem(at: source, to: dest)
-            } else {
-                try FileManager.default.copyItem(at: source, to: dest)
-            }
-            results.append(dest)
-        }
-
+        let results = try transferItems(urls, toDirectory: directory, copying: !cutting)
         if cutting {
             pb.clearContents()
+        }
+        return results
+    }
+
+    /// Move or copy file URLs into `directory` (resolves name conflicts).
+    static func transferItems(_ urls: [URL], toDirectory directory: URL, copying: Bool) throws -> [URL] {
+        var results: [URL] = []
+        for source in urls {
+            let dest = uniqueCopyURL(in: directory, source: source, isMoving: !copying)
+            if copying {
+                try FileManager.default.copyItem(at: source, to: dest)
+            } else if source.standardizedFileURL == dest.standardizedFileURL {
+                results.append(source)
+                continue
+            } else {
+                try FileManager.default.moveItem(at: source, to: dest)
+            }
+            results.append(dest)
         }
         return results
     }

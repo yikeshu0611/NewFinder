@@ -39,6 +39,18 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         AppDelegate.shared.registerAsDefaultFolderViewer()
+        // Menu-bar click can race with browser ordering; re-assert Settings on top.
+        DispatchQueue.main.async { [weak self] in
+            self?.window?.makeKeyAndOrderFront(nil)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            self?.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    var isVisible: Bool {
+        window?.isVisible == true
     }
 
     private func configure() {

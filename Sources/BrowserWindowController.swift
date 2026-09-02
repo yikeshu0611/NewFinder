@@ -67,6 +67,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.minSize = NSSize(width: 720, height: 420)
+        // Follow the user when Chrome / Finder reveal a file on another Space.
+        window.collectionBehavior.insert(.moveToActiveSpace)
         window.center()
         super.init(window: window)
         window.delegate = self
@@ -79,6 +81,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             self,
             selector: #selector(handleContentTrash),
             name: .contentRequestTrash,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(settingsChanged),
+            name: SettingsWindowController.didChangeNotification,
             object: nil
         )
         navigate(to: activeTab.directory, recordHistory: false)
@@ -207,8 +215,30 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         contentController.onRenameRequest = { [weak self] item in
             self?.contentController.beginInlineRename(item)
         }
+        contentController.onCutRequest = { [weak self] in
+            self?.cut(nil)
+        }
+        contentController.onCopyRequest = { [weak self] in
+            self?.copy(nil)
+        }
+        contentController.onPasteRequest = { [weak self] in
+            self?.paste(nil)
+        }
         contentController.onCommitRename = { [weak self] item, newName in
             self?.commitRename(item, to: newName)
+        }
+        contentController.onDirectoryNeedsReload = { [weak self] in
+            self?.reloadAfterMutation()
+        }
+        contentController.onOpenArchives = { [weak self] urls in
+            self?.openArchivesInTabs(urls)
+        }
+        contentController.directoryForDrop = { [weak self] in
+            self?.currentDirectory
+                ?? FileManager.default.homeDirectoryForCurrentUser
+        }
+        contentController.onPerformFileDrop = { [weak self] urls, destination, copying in
+            self?.handleFileDrop(urls: urls, destination: destination, copying: copying)
         }
         contentController.view.translatesAutoresizingMaskIntoConstraints = false
 
@@ -280,6 +310,20 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         ])
 
         updatePathChrome()
+        applyContentZoom(settings.uiZoomPercent)
+        NotificationCenter.default.addObserver(
+            forName: .uiZoomDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.applyContentZoom(self.settings.uiZoomPercent)
+        }
+    }
+
+    private func applyContentZoom(_ percent: Int) {
+        let clamped = min(500, max(30, percent))
+        contentController.applyZoomFactor(CGFloat(clamped) / 100)
     }
 
     // MARK: - Tabs
@@ -352,7 +396,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         guard let tab = tabs.first(where: { $0.id == id }) else { return }
         activeTabID = id
         refreshTabBar()
-        navigate(to: tab.directory, recordHistory: false)
+        if tab.isArchiveTab {
+            stopWatching()
+            window?.title = tab.archiveInternalPath.isEmpty
+                ? tab.title
+                : "\(tab.title) — \(tab.archiveInternalPath)"
+            updatePathChrome()
+            reloadContents()
+        } else {
+            navigate(to: tab.directory, recordHistory: false)
+        }
     }
 
     private func closeTab(_ id: UUID) {
@@ -364,10 +417,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         tabs.remove(at: index)
         if wasActive {
             let next = tabs[min(index, tabs.count - 1)]
-            activeTabID = next.id
-            navigate(to: next.directory, recordHistory: false)
+            selectTab(next.id)
+        } else {
+            refreshTabBar()
         }
-        refreshTabBar()
     }
 
     private func detachTabToNewWindow(_ id: UUID, screenPoint: NSPoint) {
@@ -469,15 +522,46 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         }
     }
 
-    private func reloadContents() {
+    private func reloadContents(preservingOutline: Bool = false) {
         pendingReloadWorkItem?.cancel()
         pendingReloadWorkItem = nil
 
         contentLoadGeneration += 1
         let generation = contentLoadGeneration
-        let directory = currentDirectory
         let showHidden = settings.showHiddenFiles
         statusLabel.stringValue = "正在加载…"
+
+        if let archive = activeTab.archiveURL {
+            let internalPath = activeTab.archiveInternalPath
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let items: [FileItem]
+                do {
+                    items = try ArchiveSupport.browseChildren(archive: archive, internalPath: internalPath)
+                        .filter { showHidden || !$0.isHidden }
+                } catch {
+                    DispatchQueue.main.async {
+                        guard let self, generation == self.contentLoadGeneration else { return }
+                        self.contentController.setItems([], alreadySortedByName: true)
+                        self.statusLabel.stringValue = "无法读取压缩包：\(error.localizedDescription)"
+                    }
+                    return
+                }
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    guard generation == self.contentLoadGeneration else { return }
+                    self.contentController.setItems(items, alreadySortedByName: true)
+                    self.updateStatus(selection: self.contentController.selectedItems)
+                }
+            }
+            return
+        }
+
+        let directory = currentDirectory
+        let keepOutline = preservingOutline
+        let pendingSelect = pendingSelectURLs
+        let pendingRename = pendingRenameURL
+        pendingSelectURLs = []
+        pendingRenameURL = nil
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let items = FileOperations.listDirectory(directory, showHidden: showHidden)
@@ -485,26 +569,41 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
                 guard let self else { return }
                 guard generation == self.contentLoadGeneration else { return }
                 guard self.currentDirectory.standardizedFileURL == directory.standardizedFileURL else { return }
-                self.contentController.setItems(items, alreadySortedByName: true)
-                // Read pending HERE (not before async) so reveal-after-navigate still works.
-                if !self.pendingSelectURLs.isEmpty {
-                    self.contentController.select(urls: self.pendingSelectURLs)
-                    self.pendingSelectURLs = []
-                }
-                self.updateStatus(selection: self.contentController.selectedItems)
-                if let renameURL = self.pendingRenameURL {
-                    self.pendingRenameURL = nil
-                    if let item = self.contentController.items.first(where: {
-                        $0.url.standardizedFileURL == renameURL.standardizedFileURL
-                    }) {
-                        // Next runloop so the table cell exists for inline editing.
+                if keepOutline {
+                    self.contentController.replaceRootListing(
+                        items,
+                        preservingOutline: true,
+                        alreadySortedByName: true,
+                        select: pendingSelect,
+                        beginRename: pendingRename
+                    )
+                } else {
+                    self.contentController.setItems(items, alreadySortedByName: true)
+                    if !pendingSelect.isEmpty {
+                        self.contentController.select(urls: pendingSelect)
+                    }
+                    if let renameURL = pendingRename,
+                       let item = self.contentController.items.first(where: {
+                           $0.url.standardizedFileURL == renameURL.standardizedFileURL
+                       }) {
                         DispatchQueue.main.async {
                             self.contentController.beginInlineRename(item)
                         }
                     }
                 }
+                self.updateStatus(selection: self.contentController.selectedItems)
             }
         }
+    }
+
+    /// Mutations that should keep outline expansion (rename / trash / paste / New in root).
+    private func reloadAfterMutation(select: [URL] = [], beginRename: URL? = nil) {
+        pendingSelectURLs = select
+        pendingRenameURL = beginRename
+        suppressDirectoryWatchUntil = Date().addingTimeInterval(1.2)
+        pendingReloadWorkItem?.cancel()
+        pendingReloadWorkItem = nil
+        reloadContents(preservingOutline: true)
     }
 
     private func scheduleReloadContents() {
@@ -513,13 +612,51 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         }
         pendingReloadWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            self?.reloadContents()
+            self?.reloadContents(preservingOutline: true)
         }
         pendingReloadWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
     }
 
     private func updatePathChrome() {
+        if let archive = activeTab.archiveURL {
+            let internalPath = activeTab.archiveInternalPath
+            pathField.stringValue = internalPath.isEmpty
+                ? archive.path
+                : archive.path + " :: " + internalPath
+            breadcrumbStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+
+            let rootBtn = BreadcrumbButton(
+                title: "📦 " + archive.lastPathComponent,
+                target: self,
+                action: #selector(archiveRootClicked)
+            )
+            breadcrumbStack.addArrangedSubview(rootBtn)
+
+            if !internalPath.isEmpty {
+                let parts = internalPath.split(separator: "/").map(String.init)
+                var built = ""
+                for part in parts {
+                    let chevron = BreadcrumbChevronButton()
+                    breadcrumbStack.addArrangedSubview(chevron)
+                    built = built.isEmpty ? part : built + "/" + part
+                    let button = BreadcrumbButton(
+                        title: part,
+                        target: self,
+                        action: #selector(archiveBreadcrumbClicked(_:))
+                    )
+                    button.identifier = NSUserInterfaceItemIdentifier(built)
+                    breadcrumbStack.addArrangedSubview(button)
+                }
+            }
+
+            pathBookmarkButton.isHidden = true
+            breadcrumbStack.isHidden = isEditingPath
+            pathField.isHidden = !isEditingPath
+            return
+        }
+
+        pathBookmarkButton.isHidden = false
         pathField.stringValue = currentDirectory.path
         breadcrumbStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
 
@@ -555,6 +692,22 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         breadcrumbStack.isHidden = isEditingPath
         pathField.isHidden = !isEditingPath
         refreshBookmarkUI()
+    }
+
+    @objc private func archiveRootClicked() {
+        guard activeTab.isArchiveTab else { return }
+        activeTab.archiveInternalPath = ""
+        reloadContents()
+        updatePathChrome()
+        window?.title = activeTab.title
+    }
+
+    @objc private func archiveBreadcrumbClicked(_ sender: NSButton) {
+        guard activeTab.isArchiveTab else { return }
+        activeTab.archiveInternalPath = sender.identifier?.rawValue ?? ""
+        reloadContents()
+        updatePathChrome()
+        window?.title = "\(activeTab.title) — \(activeTab.archiveInternalPath)"
     }
 
     private func refreshBookmarkUI() {
@@ -770,10 +923,79 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     private func openItem(_ item: FileItem) {
+        if activeTab.isArchiveTab {
+            openArchiveItem(item, in: activeTab)
+            return
+        }
+        if !item.isDirectory, ArchiveSupport.looksLikeArchive(item.url) {
+            openArchiveInTab(item.url)
+            return
+        }
         if item.isDirectory {
             navigate(to: item.url)
         } else {
             NSWorkspace.shared.open(item.url)
+        }
+    }
+
+    func openArchivesInTabs(_ urls: [URL]) {
+        for url in urls {
+            openArchiveInTab(url)
+        }
+    }
+
+    func openArchiveInTab(_ url: URL) {
+        let standardized = url.standardizedFileURL
+        if let existing = tabs.first(where: { $0.archiveURL?.standardizedFileURL == standardized }) {
+            selectTab(existing.id)
+            return
+        }
+        let tab = BrowserTab(archive: standardized)
+        if let index = tabs.firstIndex(where: { $0.id == activeTabID }) {
+            tabs.insert(tab, at: index + 1)
+        } else {
+            tabs.append(tab)
+        }
+        selectTab(tab.id)
+    }
+
+    private func openArchiveItem(_ item: FileItem, in tab: BrowserTab) {
+        guard let archive = tab.archiveURL, let entry = item.archiveEntryPath else { return }
+        if item.isDirectory {
+            tab.archiveInternalPath = entry
+            reloadContents()
+            updatePathChrome()
+            refreshTabBar()
+            window?.title = "\(archive.lastPathComponent) — \(entry)"
+        } else {
+            // Extract single file to temp and open.
+            let temp = FileManager.default.temporaryDirectory
+                .appendingPathComponent("NewFinder-ArchiveOpen-\(UUID().uuidString)", isDirectory: true)
+            try? FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+            let options = ArchiveExtractOptions(
+                directory: temp,
+                folderName: "",
+                password: "",
+                deleteSource: false
+            )
+            ArchiveSupport.extract(urls: [archive], options: options) { result in
+                switch result {
+                case .success:
+                    let target = temp.appendingPathComponent(entry)
+                    if FileManager.default.fileExists(atPath: target.path) {
+                        NSWorkspace.shared.open(target)
+                    } else {
+                        // Some archives flatten oddly; try basename.
+                        let fallback = temp.appendingPathComponent(item.name)
+                        NSWorkspace.shared.open(fallback)
+                    }
+                case .failure(let error):
+                    let alert = NSAlert()
+                    alert.messageText = "无法打开压缩包内文件"
+                    alert.informativeText = error.localizedDescription
+                    alert.runModal()
+                }
+            }
         }
     }
 
@@ -834,6 +1056,25 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     @objc func goEnclosingFolder(_ sender: Any?) {
+        if activeTab.isArchiveTab {
+            let path = activeTab.archiveInternalPath
+            if path.isEmpty {
+                // Leave archive: go to containing folder and select the archive.
+                if let archive = activeTab.archiveURL {
+                    pendingSelectURLs = [archive]
+                    navigate(to: archive.deletingLastPathComponent())
+                }
+            } else {
+                let parent = (path as NSString).deletingLastPathComponent
+                activeTab.archiveInternalPath = parent == "." ? "" : parent
+                reloadContents()
+                updatePathChrome()
+                window?.title = activeTab.archiveInternalPath.isEmpty
+                    ? activeTab.title
+                    : "\(activeTab.title) — \(activeTab.archiveInternalPath)"
+            }
+            return
+        }
         let parent = currentDirectory.deletingLastPathComponent()
         guard parent.path != currentDirectory.path else { return }
         let left = currentDirectory
@@ -873,7 +1114,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     @objc func toggleHiddenFiles(_ sender: Any?) {
         settings.showHiddenFiles.toggle()
         chromeHeader.syncShowHiddenFilesButton(settings.showHiddenFiles)
-        reloadContents()
+        reloadContents(preservingOutline: true)
     }
 
     @objc func newFolder(_ sender: Any?) {
@@ -890,24 +1131,29 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     private func createNewItem(extensionName: String?, openAfterCreate: Bool) {
+        let targetDir = contentController.createTargetDirectory(fallback: currentDirectory)
+        let createdInsideOutline =
+            targetDir.standardizedFileURL != currentDirectory.standardizedFileURL
         do {
-            let url = try FileOperations.createNewItem(in: currentDirectory, extensionName: extensionName)
-            pendingSelectURLs = [url]
-            // Creating a file triggers directory watch; suppress so reload doesn't kill rename.
+            let url = try FileOperations.createNewItem(in: targetDir, extensionName: extensionName)
             suppressDirectoryWatchUntil = Date().addingTimeInterval(1.2)
             pendingReloadWorkItem?.cancel()
             pendingReloadWorkItem = nil
             if openAfterCreate {
-                pendingRenameURL = nil
-                reloadContents()
                 if extensionName == nil {
                     navigate(to: url)
                 } else {
                     NSWorkspace.shared.open(url)
+                    if createdInsideOutline {
+                        contentController.refreshAfterCreate(at: url, parent: targetDir, beginRename: false)
+                    } else {
+                        reloadAfterMutation(select: [url])
+                    }
                 }
+            } else if createdInsideOutline {
+                contentController.refreshAfterCreate(at: url, parent: targetDir, beginRename: true)
             } else {
-                pendingRenameURL = url.standardizedFileURL
-                reloadContents()
+                reloadAfterMutation(select: [url], beginRename: url)
             }
         } catch {
             showError(error)
@@ -920,19 +1166,22 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             return
         }
         contentController.beginInlineRename(item)
+        chromeHeader.flashFileActionSuccess(.rename)
     }
 
     private func commitRename(_ item: FileItem, to newName: String) {
+        let wasExpanded = item.isDirectory && contentController.isExpanded(item.url)
         do {
             let dest = try FileOperations.rename(item.url, to: newName)
-            // Select after reload finishes — selecting the new URL before reload finds nothing and clears selection.
-            pendingSelectURLs = [dest.standardizedFileURL]
-            suppressDirectoryWatchUntil = Date().addingTimeInterval(1.0)
-            reloadContents()
+            contentController.noteRemovedURLs([item.url])
+            if wasExpanded {
+                contentController.markExpanded(dest)
+            }
+            reloadAfterMutation(select: [dest.standardizedFileURL])
+            chromeHeader.flashFileActionSuccess(.rename)
         } catch {
             showError(error)
-            pendingSelectURLs = [item.url.standardizedFileURL]
-            reloadContents()
+            reloadAfterMutation(select: [item.url.standardizedFileURL])
         }
     }
 
@@ -940,19 +1189,28 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         let urls = contentController.selectedItems.map(\.url)
         guard !urls.isEmpty else { NSSound.beep(); return }
         FileOperations.copyURLs(urls)
+        contentController.refreshCutAppearance()
+        chromeHeader.flashFileActionSuccess(.copy)
     }
 
     @objc func cut(_ sender: Any?) {
         let urls = contentController.selectedItems.map(\.url)
         guard !urls.isEmpty else { NSSound.beep(); return }
         FileOperations.cutURLs(urls)
+        contentController.refreshCutAppearance()
+        chromeHeader.flashFileActionSuccess(.cut)
     }
 
     @objc func paste(_ sender: Any?) {
+        let targetDir = contentController.createTargetDirectory(fallback: currentDirectory)
         do {
-            let urls = try FileOperations.paste(into: currentDirectory)
-            reloadContents()
-            contentController.select(urls: urls)
+            let urls = try FileOperations.paste(into: targetDir)
+            if targetDir.standardizedFileURL != currentDirectory.standardizedFileURL {
+                contentController.markExpanded(targetDir)
+            }
+            reloadAfterMutation(select: urls)
+            contentController.refreshCutAppearance()
+            chromeHeader.flashFileActionSuccess(.paste)
         } catch {
             NSSound.beep()
         }
@@ -969,7 +1227,32 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         guard !urls.isEmpty else { NSSound.beep(); return }
         do {
             try FileOperations.moveToTrash(urls)
-            reloadContents()
+            contentController.noteRemovedURLs(urls)
+            reloadAfterMutation()
+            chromeHeader.flashFileActionSuccess(.trash)
+        } catch {
+            showError(error)
+        }
+    }
+
+    private func handleFileDrop(urls: [URL], destination: URL, copying: Bool) {
+        let sources = urls
+            .map(\.standardizedFileURL)
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+        guard !sources.isEmpty else { return }
+        do {
+            let results = try FileOperations.transferItems(
+                sources,
+                toDirectory: destination.standardizedFileURL,
+                copying: copying
+            )
+            if !copying {
+                contentController.noteRemovedURLs(sources)
+            }
+            if destination.standardizedFileURL != currentDirectory.standardizedFileURL {
+                contentController.markExpanded(destination)
+            }
+            reloadAfterMutation(select: results)
         } catch {
             showError(error)
         }
@@ -1300,13 +1583,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     @objc func openSettings(_ sender: Any?) {
-        SettingsWindowController.shared.show()
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(settingsChanged),
-            name: SettingsWindowController.didChangeNotification,
-            object: nil
-        )
+        AppDelegate.shared.showPreferences(nil)
     }
 
     @objc private func settingsChanged() {

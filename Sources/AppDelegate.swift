@@ -11,16 +11,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowControllers: [BrowserWindowController] = []
     private var isRedirectingFinder = false
     private var lastFinderRedirectAt: Date?
+    /// Ignore Finder activation storms right after we steal focus (policy / close-window churn).
+    private var suppressFinderRedirectUntil: Date?
     private var finderWindowPollTimer: Timer?
     private var pendingRedirectWorkItem: DispatchWorkItem?
     private var didWarnFinderAutomation = false
+    /// Last chrome-menu zoom title item (gear / status bar), for live % updates.
+    private weak var chromeZoomMenuItem: NSMenuItem?
 
     static var shared: AppDelegate {
         NSApp.delegate as! AppDelegate
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Keep accessory policy so NewFinder stays out of the Dock.
+        // Always accessory: no Dock icon, no app name in the system menu bar.
         NSApp.setActivationPolicy(.accessory)
 
         // Agent-style apps can spawn many instances; keep a single UI process.
@@ -44,12 +48,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
                 guard let self else { return }
                 self.showFrontBrowserOrOpenDesktop()
-                NSApp.activate(ignoringOtherApps: true)
+                self.bringUIToFront()
             }
         } else {
             // `open` may also call applicationShouldHandleReopen — only create one window.
             showFrontBrowserOrOpenDesktop()
-            NSApp.activate(ignoringOtherApps: true)
+            bringUIToFront()
         }
     }
 
@@ -93,14 +97,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func handleExternalShowUI(_ notification: Notification) {
         showFrontBrowserOrOpenDesktop()
-        NSApp.activate(ignoringOtherApps: true)
+        bringUIToFront()
     }
 
     @objc private func handleExternalStealFinder(_ notification: Notification) {
         scheduleFinderRedirect(settle: 0)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
             self?.showFrontBrowserOrOpenDesktop()
-            NSApp.activate(ignoringOtherApps: true)
+            self?.bringUIToFront()
         }
     }
 
@@ -172,7 +176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         // Accessory apps sometimes report `flag == false` even with a visible window.
         showFrontBrowserOrOpenDesktop()
-        NSApp.activate(ignoringOtherApps: true)
+        bringUIToFront()
         return true
     }
 
@@ -217,7 +221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             reveal(files)
         }
 
-        NSApp.activate(ignoringOtherApps: true)
+        bringUIToFront()
     }
 
     /// Show items inside NewFinder (replaces system Finder reveal).
@@ -226,7 +230,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let values = try? first.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
         if values?.isDirectory == true, values?.isPackage != true, urls.count == 1 {
             openDirectory(first)
-            NSApp.activate(ignoringOtherApps: true)
+            bringUIToFront()
             return
         }
 
@@ -241,7 +245,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let browser = openNewWindow(at: parent)
             browser.selectAfterNavigate(select)
         }
-        NSApp.activate(ignoringOtherApps: true)
+        bringUIToFront()
     }
 
     @objc func newWindow(_ sender: Any?) {
@@ -251,6 +255,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func showPreferences(_ sender: Any?) {
+        suppressFinderRedirectUntil = Date().addingTimeInterval(1.0)
+        NSApp.unhide(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        // Do not call bringUIToFront() — it re-orders browser windows above Settings.
         SettingsWindowController.shared.show()
     }
 
@@ -324,6 +332,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Used by the menu-bar status item.
     func keyBrowserForStatusBar() -> BrowserWindowController? {
         keyBrowser()
+    }
+
+    func browserWindowsForStatusBar() -> [BrowserWindowController] {
+        windowControllers
+    }
+
+    func applyZoomFromStatusBar(_ percent: Int) {
+        applyZoomFromMenu(percent)
+    }
+
+    func checkForUpdatesFromStatusBar() {
+        checkForUpdatesFromMenu(nil)
     }
 
     // MARK: - Default folder handler
@@ -406,6 +426,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard AppSettings.shared.redirectFinderClicks else { return }
         guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
               app.bundleIdentifier == "com.apple.finder" else { return }
+        if let until = suppressFinderRedirectUntil, Date() < until { return }
         // Tiny settle so selection exists; keep short to avoid visible lag.
         scheduleFinderRedirect(settle: 0.04)
     }
@@ -438,6 +459,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func pollFinderWindowsIfNeeded() {
         guard AppSettings.shared.redirectFinderClicks else { return }
         guard !isRedirectingFinder else { return }
+        if let until = suppressFinderRedirectUntil, Date() < until { return }
         // CGWindowList is much faster than AppleScript for detection.
         guard finderLooksLikeItHasBrowserWindows() else { return }
         scheduleFinderRedirect(settle: 0)
@@ -479,7 +501,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func redirectFinderActivationToNewFinder() {
         guard AppSettings.shared.redirectFinderClicks else { return }
         guard !isRedirectingFinder else { return }
-        if let last = lastFinderRedirectAt, Date().timeIntervalSince(last) < 0.18 {
+        if let until = suppressFinderRedirectUntil, Date() < until { return }
+        if let last = lastFinderRedirectAt, Date().timeIntervalSince(last) < 0.8 {
             return
         }
 
@@ -488,6 +511,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         isRedirectingFinder = true
         lastFinderRedirectAt = Date()
+        // Closing Finder / activating NF can re-fire Finder notifications — pause briefly.
+        suppressFinderRedirectUntil = Date().addingTimeInterval(1.2)
 
         // Switch focus first so the Finder flash is as short as possible.
         forceActivateNewFinder()
@@ -505,6 +530,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.closeFinderWindowsViaAppleScript()
                     self.applyFinderContext(again)
                     self.forceActivateNewFinder()
+                    self.suppressFinderRedirectUntil = Date().addingTimeInterval(1.2)
                 } else if self.finderLooksLikeItHasBrowserWindows() || self.finderHasOpenWindows() {
                     self.noteFinderAutomationFailureIfNeeded()
                 }
@@ -533,11 +559,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func forceActivateNewFinder() {
+        bringUIToFront()
+    }
+
+    /// Bring NewFinder windows forward without switching to `.regular` (keeps Dock / menu bar clear).
+    func bringUIToFront() {
+        suppressFinderRedirectUntil = Date().addingTimeInterval(1.5)
+        if NSApp.activationPolicy() != .accessory {
+            NSApp.setActivationPolicy(.accessory)
+        }
+
+        for controller in windowControllers {
+            guard let window = controller.window else { continue }
+            if window.isMiniaturized {
+                window.deminiaturize(nil)
+            }
+            window.collectionBehavior.insert(.moveToActiveSpace)
+            window.orderFrontRegardless()
+            window.makeKeyAndOrderFront(nil)
+        }
+
+        NSApp.unhide(nil)
         NSApp.activate(ignoringOtherApps: true)
-        let bid = Bundle.main.bundleIdentifier ?? "com.zhangjing.NewFinder"
-        NSRunningApplication.runningApplications(withBundleIdentifier: bid)
-            .first?
-            .activate(options: [.activateIgnoringOtherApps])
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+
+        // One short retry — Chrome/Finder may reclaim focus for a beat.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+            guard let self else { return }
+            self.keyBrowser()?.window?.orderFrontRegardless()
+            self.keyBrowser()?.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     private func noteFinderAutomationFailureIfNeeded() {
@@ -643,109 +695,397 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func buildMainMenu() -> NSMenu {
+        // Accessory apps do not own the system menu bar. Keep only hidden items for shortcuts.
         let mainMenu = NSMenu()
 
-        let appMenuItem = NSMenuItem()
-        mainMenu.addItem(appMenuItem)
-        let appMenu = NSMenu()
-        appMenuItem.submenu = appMenu
-        appMenu.addItem(withTitle: "关于 NewFinder", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
-        appMenu.addItem(NSMenuItem.separator())
-        appMenu.addItem(withTitle: "设置…", action: #selector(showPreferences(_:)), keyEquivalent: ",")
-        appMenu.addItem(NSMenuItem.separator())
-        appMenu.addItem(withTitle: "隐藏 NewFinder", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
-        appMenu.addItem(withTitle: "退出 NewFinder", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-
-        let fileMenuItem = NSMenuItem()
-        mainMenu.addItem(fileMenuItem)
-        let fileMenu = NSMenu(title: "文件")
-        fileMenuItem.submenu = fileMenu
-        fileMenu.addItem(withTitle: "新建窗口", action: #selector(newWindow(_:)), keyEquivalent: "n")
-        fileMenu.items.last?.toolTip = "在当前窗口新建标签页（无窗口时才新建窗口）"
-        fileMenu.addItem(withTitle: "新建标签页", action: #selector(BrowserWindowController.newTab(_:)), keyEquivalent: "t")
-        fileMenu.addItem(withTitle: "新建文件夹", action: #selector(BrowserWindowController.newFolder(_:)), keyEquivalent: "N")
-        fileMenu.addItem(NSMenuItem.separator())
-        fileMenu.addItem(withTitle: "打开", action: #selector(BrowserWindowController.openSelectedItems(_:)), keyEquivalent: "o")
-        let trashItem = fileMenu.addItem(
-            withTitle: "移到废纸篓",
-            action: #selector(BrowserWindowController.moveToTrash(_:)),
-            keyEquivalent: String(UnicodeScalar(NSBackspaceCharacter)!)
+        let shortcutsMenuItem = NSMenuItem()
+        shortcutsMenuItem.isHidden = true
+        mainMenu.addItem(shortcutsMenuItem)
+        let shortcutsMenu = NSMenu(title: "快捷键")
+        shortcutsMenuItem.submenu = shortcutsMenu
+        shortcutsMenu.addItem(withTitle: "剪切", action: #selector(BrowserWindowController.cut(_:)), keyEquivalent: "x")
+        shortcutsMenu.addItem(withTitle: "拷贝", action: #selector(BrowserWindowController.copy(_:)), keyEquivalent: "c")
+        shortcutsMenu.addItem(withTitle: "粘贴", action: #selector(BrowserWindowController.paste(_:)), keyEquivalent: "v")
+        let renameItem = shortcutsMenu.addItem(
+            withTitle: "重命名",
+            action: #selector(BrowserWindowController.rename(_:)),
+            keyEquivalent: String(UnicodeScalar(NSF2FunctionKey)!)
         )
-        trashItem.keyEquivalentModifierMask = [.command]
-        fileMenu.addItem(NSMenuItem.separator())
-        fileMenu.addItem(withTitle: "关闭", action: #selector(BrowserWindowController.closeActiveTabOrWindow(_:)), keyEquivalent: "w")
+        renameItem.keyEquivalentModifierMask = []
+        let prefs = shortcutsMenu.addItem(
+            withTitle: "设置",
+            action: #selector(showPreferences(_:)),
+            keyEquivalent: ","
+        )
+        prefs.target = self
+        shortcutsMenu.addItem(withTitle: "退出 NewFinder", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 
-        let editMenuItem = NSMenuItem()
-        mainMenu.addItem(editMenuItem)
-        let editMenu = NSMenu(title: "编辑")
-        editMenuItem.submenu = editMenu
-        editMenu.addItem(withTitle: "剪切", action: #selector(BrowserWindowController.cut(_:)), keyEquivalent: "x")
-        editMenu.addItem(withTitle: "拷贝", action: #selector(BrowserWindowController.copy(_:)), keyEquivalent: "c")
-        let copyPathItem = editMenu.addItem(withTitle: "复制路径", action: #selector(BrowserWindowController.copyPath(_:)), keyEquivalent: "C")
-        copyPathItem.keyEquivalentModifierMask = [.command, .shift]
-        editMenu.addItem(withTitle: "粘贴", action: #selector(BrowserWindowController.paste(_:)), keyEquivalent: "v")
-        editMenu.addItem(withTitle: "全选", action: #selector(BrowserWindowController.selectAllItems(_:)), keyEquivalent: "a")
-        editMenu.addItem(NSMenuItem.separator())
-        editMenu.addItem(withTitle: "重命名", action: #selector(BrowserWindowController.rename(_:)), keyEquivalent: String(UnicodeScalar(NSF2FunctionKey)!))
-        editMenu.items.last?.keyEquivalentModifierMask = []
+        NSApp.windowsMenu = nil
+        return mainMenu
+    }
 
-        let viewMenuItem = NSMenuItem()
-        mainMenu.addItem(viewMenuItem)
-        let viewMenu = NSMenu(title: "显示")
-        viewMenuItem.submenu = viewMenu
-        viewMenu.addItem(withTitle: "显示路径栏", action: #selector(BrowserWindowController.togglePathBar(_:)), keyEquivalent: "p")
-        viewMenu.addItem(withTitle: "显示隐藏文件", action: #selector(BrowserWindowController.toggleHiddenFiles(_:)), keyEquivalent: ".")
+    /// Shared chrome menu for the toolbar gear and status-item (显示 / 窗口 / 缩放 / 更新 / 设置).
+    @discardableResult
+    func populateChromeMenu(_ menu: NSMenu, includeQuit: Bool = false) -> [AnyObject] {
+        var helpers: [AnyObject] = []
+        menu.removeAllItems()
 
-        let goMenuItem = NSMenuItem()
-        mainMenu.addItem(goMenuItem)
-        let goMenu = NSMenu(title: "前往")
-        goMenuItem.submenu = goMenu
-        goMenu.addItem(withTitle: "后退", action: #selector(BrowserWindowController.goBack(_:)), keyEquivalent: "[")
-        goMenu.addItem(withTitle: "前进", action: #selector(BrowserWindowController.goForward(_:)), keyEquivalent: "]")
-        let upItem = goMenu.addItem(withTitle: "上层文件夹", action: #selector(BrowserWindowController.goEnclosingFolder(_:)), keyEquivalent: "↑")
-        upItem.keyEquivalentModifierMask = [.command]
-        goMenu.addItem(NSMenuItem.separator())
-        goMenu.addItem(withTitle: "前往文件夹…", action: #selector(BrowserWindowController.focusPathBar(_:)), keyEquivalent: "l")
-        goMenu.addItem(withTitle: "电脑", action: #selector(BrowserWindowController.goComputer(_:)), keyEquivalent: "C")
-        goMenu.addItem(withTitle: "个人", action: #selector(BrowserWindowController.goHome(_:)), keyEquivalent: "H")
-        goMenu.addItem(withTitle: "桌面", action: #selector(BrowserWindowController.goDesktop(_:)), keyEquivalent: "D")
-        goMenu.addItem(withTitle: "文稿", action: #selector(BrowserWindowController.goDocuments(_:)), keyEquivalent: "O")
-        goMenu.addItem(withTitle: "下载", action: #selector(BrowserWindowController.goDownloads(_:)), keyEquivalent: "L")
-        goMenu.addItem(NSMenuItem.separator())
-        let bookmarksItem = goMenu.addItem(withTitle: "收藏", action: nil, keyEquivalent: "")
-        bookmarksItem.submenu = NSMenu(title: "收藏")
-        NotificationCenter.default.addObserver(
-            forName: NSMenu.didBeginTrackingNotification,
-            object: bookmarksItem.submenu,
-            queue: .main
-        ) { _ in
-            guard let menu = bookmarksItem.submenu else { return }
-            menu.removeAllItems()
-            let bookmarks = AppSettings.shared.bookmarks
-            if bookmarks.isEmpty {
-                let empty = menu.addItem(withTitle: "暂无收藏", action: nil, keyEquivalent: "")
-                empty.isEnabled = false
-                return
-            }
-            for bookmark in bookmarks {
-                let item = menu.addItem(
-                    withTitle: bookmark.name,
-                    action: #selector(BrowserWindowController.openBookmarkMenuItem(_:)),
-                    keyEquivalent: ""
-                )
-                item.representedObject = bookmark.path
-                item.toolTip = bookmark.path
-            }
+        let show = menu.addItem(
+            withTitle: "显示 NewFinder",
+            action: #selector(showNewFinderFromMenu(_:)),
+            keyEquivalent: ""
+        )
+        show.target = self
+
+        let windowItem = NSMenuItem(title: "窗口", action: nil, keyEquivalent: "")
+        let windowMenu = NSMenu(title: "窗口")
+        let windowHelper = WindowListMenuHelper { [weak self] in
+            self?.windowControllers ?? []
+        }
+        windowMenu.delegate = windowHelper
+        helpers.append(windowHelper)
+        windowItem.submenu = windowMenu
+        menu.addItem(windowItem)
+
+        let percent = AppSettings.shared.uiZoomPercent
+        let zoomItem = NSMenuItem(title: "缩放（\(percent)%）", action: nil, keyEquivalent: "")
+        let zoomMenu = NSMenu(title: "缩放")
+        let sliderView = ZoomSliderMenuView(percent: percent) { [weak self, weak zoomItem] value in
+            self?.applyZoomFromMenu(value)
+            zoomItem?.title = "缩放（\(value)%）"
+        }
+        let sliderItem = NSMenuItem()
+        sliderItem.view = sliderView
+        zoomMenu.addItem(sliderItem)
+        zoomMenu.delegate = sliderView
+        zoomItem.submenu = zoomMenu
+        chromeZoomMenuItem = zoomItem
+        helpers.append(sliderView)
+        menu.addItem(zoomItem)
+
+        let version = UpdateChecker.currentVersion
+        let update = menu.addItem(
+            withTitle: "更新（\(version)）",
+            action: #selector(checkForUpdatesFromMenu(_:)),
+            keyEquivalent: ""
+        )
+        update.target = self
+
+        let settings = menu.addItem(
+            withTitle: "设置",
+            action: #selector(showPreferences(_:)),
+            keyEquivalent: ","
+        )
+        settings.target = self
+
+        if includeQuit {
+            menu.addItem(NSMenuItem.separator())
+            menu.addItem(withTitle: "退出 NewFinder", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         }
 
-        let windowMenuItem = NSMenuItem()
-        mainMenu.addItem(windowMenuItem)
-        let windowMenu = NSMenu(title: "窗口")
-        windowMenuItem.submenu = windowMenu
-        windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
-        windowMenu.addItem(withTitle: "缩放", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
-        NSApp.windowsMenu = windowMenu
+        return helpers
+    }
 
-        return mainMenu
+    private func applyZoomFromMenu(_ percent: Int) {
+        let clamped = min(500, max(30, percent))
+        AppSettings.shared.uiZoomPercent = clamped
+        chromeZoomMenuItem?.title = "缩放（\(clamped)%）"
+        StatusBarController.shared.refreshZoomTitle(clamped)
+        NotificationCenter.default.post(name: .uiZoomDidChange, object: nil)
+    }
+
+    @objc func showNewFinderFromMenu(_ sender: Any?) {
+        showFrontBrowserOrOpenDesktop()
+        bringUIToFront()
+    }
+
+    @objc func focusBrowserWindowFromMenu(_ sender: NSMenuItem) {
+        guard let controller = sender.representedObject as? BrowserWindowController else { return }
+        controller.window?.makeKeyAndOrderFront(nil)
+        bringUIToFront()
+    }
+
+    @objc private func checkForUpdatesFromMenu(_ sender: Any?) {
+        UpdateChecker.fetchLatest { [weak self] result in
+            guard self != nil else { return }
+            switch result {
+            case .failure(let error):
+                let alert = NSAlert()
+                alert.messageText = "检查更新失败"
+                alert.informativeText = error.localizedDescription
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "好")
+                alert.runModal()
+            case .success(let release):
+                let current = UpdateChecker.currentVersion
+                if UpdateChecker.isVersion(release.version, newerThan: current) {
+                    let alert = NSAlert()
+                    alert.messageText = "发现新版本 \(release.version)"
+                    alert.informativeText = release.releaseNotes.isEmpty
+                        ? "当前版本 \(current)。是否下载更新包？"
+                        : release.releaseNotes
+                    alert.addButton(withTitle: "下载更新")
+                    alert.addButton(withTitle: "取消")
+                    if alert.runModal() == .alertFirstButtonReturn {
+                        self?.downloadUpdateFromMenu(release)
+                    }
+                } else {
+                    let alert = NSAlert()
+                    alert.messageText = "已是最新版本"
+                    alert.informativeText = "当前版本 \(current)"
+                    alert.addButton(withTitle: "好")
+                    alert.runModal()
+                }
+            }
+        }
+    }
+
+    private func downloadUpdateFromMenu(_ release: UpdateChecker.ReleaseInfo) {
+        UpdateChecker.download(release) { result in
+            switch result {
+            case .failure(let error):
+                let alert = NSAlert()
+                alert.messageText = "下载失败"
+                alert.informativeText = error.localizedDescription
+                alert.addButton(withTitle: "好")
+                alert.runModal()
+            case .success(let dmgURL):
+                NSWorkspace.shared.open(dmgURL)
+                let alert = NSAlert()
+                alert.messageText = "更新包已下载"
+                alert.informativeText = """
+                已打开 \(dmgURL.lastPathComponent)。
+                将 NewFinder 拖入「应用程序」文件夹覆盖旧版本，然后重新打开即可。
+                """
+                alert.addButton(withTitle: "好")
+                alert.runModal()
+            }
+        }
+    }
+}
+
+final class WindowListMenuHelper: NSObject, NSMenuDelegate {
+    private let controllers: () -> [BrowserWindowController]
+
+    init(controllers: @escaping () -> [BrowserWindowController]) {
+        self.controllers = controllers
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let list = controllers()
+        if list.isEmpty {
+            let empty = menu.addItem(withTitle: "无打开的窗口", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            return
+        }
+        let keyWindow = NSApp.keyWindow
+        for controller in list {
+            let title = controller.window?.title.isEmpty == false
+                ? (controller.window?.title ?? "窗口")
+                : "窗口"
+            let item = NSMenuItem(
+                title: title,
+                action: #selector(AppDelegate.focusBrowserWindowFromMenu(_:)),
+                keyEquivalent: ""
+            )
+            item.target = AppDelegate.shared
+            item.representedObject = controller
+            item.state = (controller.window === keyWindow) ? .on : .off
+            menu.addItem(item)
+        }
+    }
+}
+
+/// Zoom control under the menu-bar「缩放」item: editable % + slider + preset buttons.
+final class ZoomSliderMenuView: NSView, NSMenuDelegate, NSTextFieldDelegate {
+    private let field = ClickToFocusTextField()
+    private let slider = NSSlider()
+    private let onChange: (Int) -> Void
+    private var presetButtons: [NSButton] = []
+
+    init(percent: Int, onChange: @escaping (Int) -> Void) {
+        self.onChange = onChange
+        super.init(frame: NSRect(x: 0, y: 0, width: 280, height: 78))
+
+        field.stringValue = "\(percent)%"
+        field.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        field.alignment = .center
+        field.isEditable = true
+        field.isBordered = true
+        field.isBezeled = true
+        field.bezelStyle = .roundedBezel
+        field.refusesFirstResponder = true
+        field.focusRingType = .default
+        field.delegate = self
+        field.target = self
+        field.action = #selector(fieldAction(_:))
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.toolTip = "滚轮调节；点击后可输入，回车确认"
+        field.onScrollStep = { [weak self] step in
+            guard let self else { return }
+            self.clearFieldFocus()
+            let current = Int(self.slider.doubleValue.rounded())
+            self.applyPercent(current + step, notify: true)
+        }
+
+
+        slider.minValue = 30
+        slider.maxValue = 500
+        slider.doubleValue = Double(percent)
+        slider.isContinuous = true
+        slider.target = self
+        slider.action = #selector(sliderChanged(_:))
+        slider.translatesAutoresizingMaskIntoConstraints = false
+
+        let presets = NSStackView()
+        presets.orientation = .horizontal
+        presets.spacing = 6
+        presets.distribution = .fillEqually
+        presets.translatesAutoresizingMaskIntoConstraints = false
+
+        for value in [50, 100, 150, 200] {
+            let button = NSButton(title: "\(value)%", target: self, action: #selector(presetClicked(_:)))
+            button.bezelStyle = .rounded
+            button.font = .systemFont(ofSize: 11)
+            button.tag = value
+            button.setButtonType(.momentaryPushIn)
+            presets.addArrangedSubview(button)
+            presetButtons.append(button)
+        }
+
+        addSubview(field)
+        addSubview(slider)
+        addSubview(presets)
+
+        NSLayoutConstraint.activate([
+            field.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            field.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+            field.widthAnchor.constraint(equalToConstant: 56),
+            field.heightAnchor.constraint(equalToConstant: 22),
+
+            slider.leadingAnchor.constraint(equalTo: field.trailingAnchor, constant: 8),
+            slider.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            slider.centerYAnchor.constraint(equalTo: field.centerYAnchor),
+
+            presets.topAnchor.constraint(equalTo: field.bottomAnchor, constant: 10),
+            presets.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            presets.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            presets.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
+            presets.heightAnchor.constraint(equalToConstant: 24)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        clearFieldFocus()
+        applyPercent(AppSettings.shared.uiZoomPercent, notify: false)
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        clearFieldFocus()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        clearFieldFocus()
+    }
+
+    private func clearFieldFocus() {
+        field.refusesFirstResponder = true
+        if field.currentEditor() != nil {
+            window?.makeFirstResponder(nil)
+        }
+        // Drop any lingering selection highlight.
+        if let editor = field.currentEditor() as? NSTextView {
+            editor.setSelectedRange(NSRange(location: 0, length: 0))
+        }
+    }
+
+    @objc private func sliderChanged(_ sender: NSSlider) {
+        clearFieldFocus()
+        applyPercent(snap(Int(sender.doubleValue.rounded())), notify: true)
+    }
+
+    @objc private func fieldAction(_ sender: NSTextField) {
+        commitField()
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard obj.object as AnyObject? === field else { return }
+        commitField()
+        field.refusesFirstResponder = true
+    }
+
+    @objc private func presetClicked(_ sender: NSButton) {
+        clearFieldFocus()
+        applyPercent(sender.tag, notify: true)
+    }
+
+    private func commitField() {
+        let raw = field.stringValue
+            .replacingOccurrences(of: "%", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value = Int(raw) else {
+            applyPercent(AppSettings.shared.uiZoomPercent, notify: false)
+            return
+        }
+        applyPercent(snap(value), notify: true)
+    }
+
+    private func snap(_ value: Int) -> Int {
+        min(500, max(30, value))
+    }
+
+    private func applyPercent(_ percent: Int, notify: Bool) {
+        let clamped = snap(percent)
+        slider.doubleValue = Double(clamped)
+        field.stringValue = "\(clamped)%"
+        if notify {
+            onChange(clamped)
+        }
+    }
+}
+
+/// Text field that only takes focus after an explicit click (menus otherwise auto-select it).
+private final class ClickToFocusTextField: NSTextField {
+    /// +1 / −1 per mouse-wheel notch (or trackpad line).
+    var onScrollStep: ((Int) -> Void)?
+    private var preciseScrollAccumulator: CGFloat = 0
+
+    override func mouseDown(with event: NSEvent) {
+        refusesFirstResponder = false
+        window?.makeFirstResponder(self)
+        super.mouseDown(with: event)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let onScrollStep else {
+            super.scrollWheel(with: event)
+            return
+        }
+
+        let dy = event.scrollingDeltaY
+        guard dy != 0 else { return }
+
+        if event.hasPreciseScrollingDeltas {
+            // Trackpad: accumulate ~one line before stepping, so it doesn't fly.
+            preciseScrollAccumulator += dy
+            let line: CGFloat = 4
+            while preciseScrollAccumulator >= line {
+                onScrollStep(1)
+                preciseScrollAccumulator -= line
+            }
+            while preciseScrollAccumulator <= -line {
+                onScrollStep(-1)
+                preciseScrollAccumulator += line
+            }
+        } else {
+            // Mouse wheel: one event ≈ one notch → ±1.
+            onScrollStep(dy > 0 ? 1 : -1)
+        }
     }
 }
