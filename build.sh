@@ -41,6 +41,7 @@ SOURCES=(
   "$ROOT_DIR/Sources/ArchiveSupport.swift"
   "$ROOT_DIR/Sources/ArchiveDialogs.swift"
   "$ROOT_DIR/Sources/OpenWithSupport.swift"
+  "$ROOT_DIR/Sources/SideBySideManager.swift"
   "$ROOT_DIR/Sources/OfficeDocumentStubs.swift"
   "$ROOT_DIR/Sources/BrowserWindowController.swift"
   "$ROOT_DIR/Sources/ChromeHeaderView.swift"

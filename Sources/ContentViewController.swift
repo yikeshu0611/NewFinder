@@ -9,6 +9,7 @@ final class ContentViewController: NSViewController {
     var onPasteRequest: (() -> Void)?
     var onRenameRequest: ((FileItem) -> Void)?
     var onCommitRename: ((FileItem, String) -> Void)?
+    var onGoEnclosingFolder: (() -> Void)?
     /// Called after compress/extract so the browser can reload the folder.
     var onDirectoryNeedsReload: (() -> Void)?
     /// Open one or more archives in Chrome-style tabs.
@@ -768,6 +769,17 @@ final class ContentViewController: NSViewController {
                 return nil
             default:
                 break
+            }
+        }
+
+        // ⌘↑ → enclosing folder (Finder)
+        if flags == .command {
+            let isUp = event.specialKey == .upArrow
+                || event.keyCode == 126
+                || event.charactersIgnoringModifiers?.utf16.first == UInt16(NSUpArrowFunctionKey)
+            if isUp {
+                onGoEnclosingFolder?()
+                return nil
             }
         }
 

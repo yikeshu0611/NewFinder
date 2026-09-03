@@ -17,6 +17,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     private var contentController: ContentViewController!
     private var pathBarContainer: NSView!
     private var pathField: NSTextField!
+    private var breadcrumbClip: BreadcrumbClipView!
     private var breadcrumbStack: NSStackView!
     private var historyMenuButton: NSButton!
     private var copyPathButton: NSButton!
@@ -66,7 +67,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         )
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
-        window.minSize = NSSize(width: 720, height: 420)
+        window.minSize = .zero
         // Follow the user when Chrome / Finder reveal a file on another Space.
         window.collectionBehavior.insert(.moveToActiveSpace)
         window.center()
@@ -113,6 +114,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
 
         chromeHeader = ChromeHeaderView()
         chromeHeader.translatesAutoresizingMaskIntoConstraints = false
+        chromeHeader.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         chromeHeader.bind(target: self)
         chromeHeader.onSelectTab = { [weak self] id in self?.selectTab(id) }
         chromeHeader.onCloseTab = { [weak self] id in self?.closeTab(id) }
@@ -128,8 +130,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             case .others: self?.closeTabs(relativeTo: id, scope: .others)
             }
         }
-        chromeHeader.onDetachTab = { [weak self] id, screenPoint in
-            self?.detachTabToNewWindow(id, screenPoint: screenPoint)
+        chromeHeader.onDetachTab = { [weak self] id, screenPoint, sideBySide in
+            self?.detachTabToNewWindow(id, screenPoint: screenPoint, sideBySide: sideBySide)
         }
         searchField = chromeHeader.searchFieldView
 
@@ -187,7 +189,17 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         breadcrumbStack.spacing = 2
         breadcrumbStack.alignment = .centerY
         breadcrumbStack.translatesAutoresizingMaskIntoConstraints = false
-        breadcrumbStack.setHuggingPriority(.defaultLow, for: .horizontal)
+        breadcrumbStack.setHuggingPriority(.defaultHigh, for: .horizontal)
+        breadcrumbStack.setContentCompressionResistancePriority(.fittingSizeCompression, for: .horizontal)
+
+        let breadcrumbClip = BreadcrumbClipView()
+        breadcrumbClip.translatesAutoresizingMaskIntoConstraints = false
+        breadcrumbClip.wantsLayer = true
+        breadcrumbClip.clipsToBounds = true
+        breadcrumbClip.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        breadcrumbClip.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        breadcrumbClip.embed(breadcrumbStack)
+        self.breadcrumbClip = breadcrumbClip
 
         pathField = NSTextField()
         pathField.placeholderString = "输入路径后回车前往，Esc 取消"
@@ -198,12 +210,14 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         pathField.delegate = self
         pathField.isHidden = true
         pathField.translatesAutoresizingMaskIntoConstraints = false
+        pathField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         pathBarContainer.addSubview(copyPathButton)
         pathBarContainer.addSubview(historyMenuButton)
-        pathBarContainer.addSubview(breadcrumbStack)
+        pathBarContainer.addSubview(breadcrumbClip)
         pathBarContainer.addSubview(pathField)
         pathBarContainer.addSubview(pathBookmarkButton)
+        pathBarContainer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         contentController = ContentViewController()
         contentController.onOpen = { [weak self] item in
@@ -223,6 +237,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         }
         contentController.onPasteRequest = { [weak self] in
             self?.paste(nil)
+        }
+        contentController.onGoEnclosingFolder = { [weak self] in
+            self?.goEnclosingFolder(nil)
         }
         contentController.onCommitRename = { [weak self] item, newName in
             self?.commitRename(item, to: newName)
@@ -281,9 +298,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             historyMenuButton.widthAnchor.constraint(equalToConstant: 18),
             historyMenuButton.heightAnchor.constraint(equalToConstant: 18),
 
-            breadcrumbStack.leadingAnchor.constraint(equalTo: historyMenuButton.trailingAnchor, constant: 4),
-            breadcrumbStack.trailingAnchor.constraint(lessThanOrEqualTo: pathBookmarkButton.leadingAnchor, constant: -8),
-            breadcrumbStack.centerYAnchor.constraint(equalTo: pathBarContainer.centerYAnchor),
+            breadcrumbClip.leadingAnchor.constraint(equalTo: historyMenuButton.trailingAnchor, constant: 4),
+            breadcrumbClip.trailingAnchor.constraint(equalTo: pathBookmarkButton.leadingAnchor, constant: -8),
+            breadcrumbClip.topAnchor.constraint(equalTo: pathBarContainer.topAnchor),
+            breadcrumbClip.bottomAnchor.constraint(equalTo: pathBarContainer.bottomAnchor),
 
             pathField.leadingAnchor.constraint(equalTo: historyMenuButton.trailingAnchor, constant: 4),
             pathField.trailingAnchor.constraint(equalTo: pathBookmarkButton.leadingAnchor, constant: -8),
@@ -423,10 +441,22 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         }
     }
 
-    private func detachTabToNewWindow(_ id: UUID, screenPoint: NSPoint) {
+    private func detachTabToNewWindow(_ id: UUID, screenPoint: NSPoint, sideBySide: Bool) {
         guard let tab = extractTab(id) else { return }
         let shouldCloseSource = tabs.isEmpty
-        AppDelegate.shared.openNewWindow(with: tab, screenPoint: screenPoint)
+        if sideBySide {
+            let added = AppDelegate.shared.openNewWindowSideBySide(from: self, with: tab)
+            if !added {
+                // Group full — put tab back.
+                tabs.append(tab)
+                activeTabID = tab.id
+                navigate(to: tab.directory, recordHistory: false)
+                refreshTabBar()
+                return
+            }
+        } else {
+            AppDelegate.shared.openNewWindow(with: tab, screenPoint: screenPoint, matching: window?.frame)
+        }
         if shouldCloseSource {
             window?.close()
         }
@@ -651,8 +681,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             }
 
             pathBookmarkButton.isHidden = true
-            breadcrumbStack.isHidden = isEditingPath
+            breadcrumbClip.isHidden = isEditingPath
             pathField.isHidden = !isEditingPath
+            breadcrumbClip.refreshLayout()
             return
         }
 
@@ -689,8 +720,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             }
         }
 
-        breadcrumbStack.isHidden = isEditingPath
+        breadcrumbClip.isHidden = isEditingPath
         pathField.isHidden = !isEditingPath
+        breadcrumbClip.refreshLayout()
         refreshBookmarkUI()
     }
 
@@ -1631,7 +1663,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         }
         isEditingPath = true
         pathField.stringValue = currentDirectory.path
-        breadcrumbStack.isHidden = true
+        breadcrumbClip.isHidden = true
         pathField.isHidden = false
         window?.makeFirstResponder(pathField)
         installPathEditClickMonitor()
@@ -1660,7 +1692,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         }
         isEditingPath = false
         pathField.isHidden = true
-        breadcrumbStack.isHidden = false
+        breadcrumbClip.isHidden = false
         updatePathChrome()
         if window?.firstResponder === pathField || window?.firstResponder is NSText {
             window?.makeFirstResponder(contentController.view)
@@ -1845,11 +1877,71 @@ final class ClickablePathBarView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
+/// Clips long breadcrumbs so they cannot force the window wider.
+/// When overflowing, keeps the trailing (current folder) visible.
+final class BreadcrumbClipView: NSView {
+    private weak var stack: NSStackView?
+
+    func embed(_ stack: NSStackView) {
+        self.stack?.removeFromSuperview()
+        self.stack = stack
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        // Frame-based layout in layout(); avoid Auto Layout fighting the clip.
+        stack.translatesAutoresizingMaskIntoConstraints = true
+        stack.autoresizingMask = []
+    }
+
+    func refreshLayout() {
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+    }
+
+    override func layout() {
+        super.layout()
+        guard let stack else { return }
+        // Detached from Auto Layout width — measure natural size of arranged crumbs.
+        let fitting = stack.fittingSize
+        var size = fitting
+        if size.width < 1 {
+            size.width = stack.intrinsicContentSize.width
+        }
+        if size.height < 1 {
+            size.height = max(20, bounds.height)
+        }
+        let x: CGFloat
+        if size.width <= bounds.width {
+            x = 0
+        } else {
+            // Overflow: pin to trailing edge so the leaf folder stays visible.
+            x = bounds.width - size.width
+        }
+        let y = (bounds.height - size.height) / 2
+        stack.frame = NSRect(x: x, y: y, width: size.width, height: size.height)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let hit = super.hitTest(point)
+        // Empty clip area → fall through to path bar for edit-on-click.
+        return hit === self ? nil : hit
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: 28)
+    }
+}
+
 /// Stack that lets empty-area clicks fall through to the path bar.
 final class PassThroughStackView: NSStackView {
     override func hitTest(_ point: NSPoint) -> NSView? {
         let hit = super.hitTest(point)
         return hit === self ? nil : hit
+    }
+
+    override var intrinsicContentSize: NSSize {
+        // Natural width for clip positioning; height follows content.
+        let size = super.intrinsicContentSize
+        return size
     }
 }
 
@@ -1993,6 +2085,8 @@ final class BreadcrumbButton: NSButton {
         sendAction(on: [.leftMouseUp])
         wantsLayer = true
         layer?.cornerRadius = 4
+        setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        setContentHuggingPriority(.required, for: .horizontal)
     }
 
     override var intrinsicContentSize: NSSize {

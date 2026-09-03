@@ -10,6 +10,26 @@
 
 **当前版本：1.1.6**
 
+### 若提示 “Apple could not verify…” / “无法打开 NewFinder”
+
+当前 Release 使用本地签名，**未经 Apple 公证**，macOS（尤其 Sonoma / Sequoia）常会拦截。弹窗里往往只有「完成」和「移到废纸篓」，**没有「打开」按钮**——这是正常的。
+
+请按下面做（二选一）：
+
+1. **系统设置（推荐）**
+   - 先点弹窗里的「完成」（不要点「移到废纸篓」）
+   - 打开 **系统设置 → 隐私与安全性**
+   - 往下找到 “已阻止使用 NewFinder…” 一类提示，点 **仍要打开**
+   - 再确认一次即可
+
+2. **终端（本机信任后可直接开）**
+   ```bash
+   xattr -cr /Applications/NewFinder.app
+   open /Applications/NewFinder.app
+   ```
+
+彻底消除该提示需要 **Apple Developer 账号** 做 Developer ID 签名 + 公证（Notarization）。若你后续有账号，可以再加公证流程。
+
 ## 主要功能
 
 ### 界面与导航

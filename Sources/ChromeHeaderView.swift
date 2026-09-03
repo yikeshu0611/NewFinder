@@ -48,12 +48,14 @@ final class ChromeHeaderView: NSView {
     var onNewTab: (() -> Void)?
     var onNewTabRelative: ((UUID, TabInsertSide) -> Void)?
     var onCloseTabsRelative: ((UUID, TabCloseScope) -> Void)?
-    var onDetachTab: ((UUID, NSPoint) -> Void)?
+    var onDetachTab: ((UUID, NSPoint, Bool) -> Void)?
 
     private let tabRow = NSView()
     private let tabStrip = TabStripView()
+    private let toolClip = NSView()
     private let toolRow = NSStackView()
     private var searchField: NSSearchField!
+    private var searchWidthConstraint: NSLayoutConstraint?
     private weak var showHiddenButton: NSButton?
     private let bookmarkFolderStack = NSStackView()
     private weak var actionTarget: AnyObject?
@@ -120,7 +122,7 @@ final class ChromeHeaderView: NSView {
         layer?.backgroundColor = (dark
             ? NSColor(calibratedWhite: 0.18, alpha: 1)
             : NSColor(calibratedWhite: 0.82, alpha: 1)).cgColor
-        toolRow.layer?.backgroundColor = (dark
+        toolClip.layer?.backgroundColor = (dark
             ? NSColor(calibratedWhite: 0.22, alpha: 1)
             : NSColor(calibratedWhite: 0.94, alpha: 1)).cgColor
         tabRow.layer?.backgroundColor = (dark
@@ -184,7 +186,9 @@ final class ChromeHeaderView: NSView {
         tabStrip.onSelectTab = { [weak self] id in self?.onSelectTab?(id) }
         tabStrip.onCloseTab = { [weak self] id in self?.onCloseTab?(id) }
         tabStrip.onNewTab = { [weak self] in self?.onNewTab?() }
-        tabStrip.onDetachTab = { [weak self] id, screenPoint in self?.onDetachTab?(id, screenPoint) }
+        tabStrip.onDetachTab = { [weak self] id, screenPoint, sideBySide in
+            self?.onDetachTab?(id, screenPoint, sideBySide)
+        }
         tabStrip.onContextAction = { [weak self] id, action in
             guard let self else { return }
             switch action {
@@ -197,16 +201,25 @@ final class ChromeHeaderView: NSView {
             }
         }
 
+        toolClip.translatesAutoresizingMaskIntoConstraints = false
+        toolClip.wantsLayer = true
+        toolClip.clipsToBounds = true
+        // Do not let the toolbar's intrinsic width force the window wider.
+        toolClip.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        toolClip.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
         toolRow.orientation = .horizontal
         toolRow.spacing = 2
         toolRow.alignment = .centerY
         toolRow.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 10)
         toolRow.translatesAutoresizingMaskIntoConstraints = false
-        toolRow.wantsLayer = true
+        toolRow.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        toolRow.setContentHuggingPriority(.defaultHigh, for: .horizontal)
 
         addSubview(tabRow)
         tabRow.addSubview(tabStrip)
-        addSubview(toolRow)
+        addSubview(toolClip)
+        toolClip.addSubview(toolRow)
 
         NSLayoutConstraint.activate([
             tabRow.topAnchor.constraint(equalTo: topAnchor),
@@ -220,17 +233,28 @@ final class ChromeHeaderView: NSView {
             tabStrip.topAnchor.constraint(equalTo: tabRow.topAnchor, constant: 2),
             tabStrip.bottomAnchor.constraint(equalTo: tabRow.bottomAnchor),
 
-            toolRow.topAnchor.constraint(equalTo: tabRow.bottomAnchor),
-            toolRow.leadingAnchor.constraint(equalTo: leadingAnchor),
-            toolRow.trailingAnchor.constraint(equalTo: trailingAnchor),
-            toolRow.bottomAnchor.constraint(equalTo: bottomAnchor),
-            toolRow.heightAnchor.constraint(equalToConstant: 30)
+            toolClip.topAnchor.constraint(equalTo: tabRow.bottomAnchor),
+            toolClip.leadingAnchor.constraint(equalTo: leadingAnchor),
+            toolClip.trailingAnchor.constraint(equalTo: trailingAnchor),
+            toolClip.bottomAnchor.constraint(equalTo: bottomAnchor),
+            toolClip.heightAnchor.constraint(equalToConstant: 30),
+
+            // Leading-aligned only — overflow on the right is clipped so the window can shrink.
+            toolRow.leadingAnchor.constraint(equalTo: toolClip.leadingAnchor),
+            toolRow.topAnchor.constraint(equalTo: toolClip.topAnchor),
+            toolRow.bottomAnchor.constraint(equalTo: toolClip.bottomAnchor)
         ])
 
         searchField = NSSearchField()
         searchField.placeholderString = "搜索"
         searchField.translatesAutoresizingMaskIntoConstraints = false
-        searchField.widthAnchor.constraint(equalToConstant: 160).isActive = true
+        searchField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        searchField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let searchWidth = searchField.widthAnchor.constraint(equalToConstant: 160)
+        searchWidth.priority = .defaultHigh
+        searchWidth.isActive = true
+        searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 72).isActive = true
+        searchWidthConstraint = searchWidth
     }
 
     private func rebuildTabs() {
@@ -252,7 +276,7 @@ final class ChromeHeaderView: NSView {
 
         toolRow.addArrangedSubview(iconButton("chevron.left", tip: "后退", action: #selector(BrowserWindowController.goBack(_:)), target: target))
         toolRow.addArrangedSubview(iconButton("chevron.right", tip: "前进", action: #selector(BrowserWindowController.goForward(_:)), target: target))
-        toolRow.addArrangedSubview(iconButton("chevron.up", tip: "上层文件夹", action: #selector(BrowserWindowController.goEnclosingFolder(_:)), target: target))
+        toolRow.addArrangedSubview(iconButton("chevron.up", tip: "上层文件夹 (⌘↑)", action: #selector(BrowserWindowController.goEnclosingFolder(_:)), target: target))
         toolRow.addArrangedSubview(separator())
         toolRow.addArrangedSubview(makeNewMenuButton(types: types ?? AppSettings.shared.newItemTypes, target: target))
         for type in AppSettings.shared.toolbarNewItemTypes {
@@ -261,7 +285,9 @@ final class ChromeHeaderView: NSView {
         bookmarkFolderStack.orientation = .horizontal
         bookmarkFolderStack.spacing = 4
         bookmarkFolderStack.alignment = .centerY
-        bookmarkFolderStack.setContentHuggingPriority(.required, for: .horizontal)
+        bookmarkFolderStack.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        bookmarkFolderStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        bookmarkFolderStack.setClippingResistancePriority(.defaultLow, for: .horizontal)
         toolRow.addArrangedSubview(bookmarkFolderStack)
         toolRow.addArrangedSubview(flexibleSpace())
 
@@ -270,6 +296,8 @@ final class ChromeHeaderView: NSView {
         fileActionsRow.spacing = 2
         fileActionsRow.alignment = .centerY
         fileActionsRow.translatesAutoresizingMaskIntoConstraints = false
+        fileActionsRow.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        fileActionsRow.setContentHuggingPriority(.required, for: .horizontal)
         fileActionButtons.removeAll()
         fileActionsRow.addArrangedSubview(
             fileActionButton(.rename, action: #selector(BrowserWindowController.rename(_:)), target: target)
@@ -445,7 +473,7 @@ final class TabStripView: NSView {
     var onSelectTab: ((UUID) -> Void)?
     var onCloseTab: ((UUID) -> Void)?
     var onNewTab: (() -> Void)?
-    var onDetachTab: ((UUID, NSPoint) -> Void)?
+    var onDetachTab: ((UUID, NSPoint, Bool) -> Void)?
     var onContextAction: ((UUID, TabContextAction) -> Void)?
 
     enum TabContextAction {
@@ -460,6 +488,12 @@ final class TabStripView: NSView {
     private var plusHovered = false
     private var tracking: NSTrackingArea?
     private var contextTabID: UUID?
+    // System clickCount does not reach 3 while ⌘ is held — track manually.
+    private var tabClickCount = 0
+    private var tabClickTabID: UUID?
+    private var tabClickHadCommand = false
+    private var tabClickTimestamp: TimeInterval = 0
+    private let tabClickInterval: TimeInterval = 0.55
 
     private let tabHeight: CGFloat = 30
     private let tabMinWidth: CGFloat = 120
@@ -630,10 +664,42 @@ final class TabStripView: NSView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    private static func isCommandHeld() -> Bool {
+        NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command)
+    }
+
+    private func resetTabClickSequence() {
+        tabClickCount = 0
+        tabClickTabID = nil
+        tabClickHadCommand = false
+    }
+
+    private func registerTabClick(on item: Item, event: NSEvent) -> (detached: Bool, sideBySide: Bool) {
+        let commandHeld = Self.isCommandHeld()
+        let interval = event.timestamp - tabClickTimestamp
+
+        if tabClickTabID == item.id, interval <= tabClickInterval {
+            tabClickCount += 1
+            tabClickHadCommand = tabClickHadCommand || commandHeld
+        } else {
+            tabClickCount = 1
+            tabClickTabID = item.id
+            tabClickHadCommand = commandHeld
+        }
+        tabClickTimestamp = event.timestamp
+
+        guard tabClickCount >= 3 else { return (false, false) }
+
+        let sideBySide = tabClickHadCommand || commandHeld
+        resetTabClickSequence()
+        return (true, sideBySide)
+    }
+
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
 
         if plusFrame.insetBy(dx: -2, dy: -2).contains(point) {
+            resetTabClickSequence()
             onNewTab?()
             return
         }
@@ -648,13 +714,16 @@ final class TabStripView: NSView {
             guard path.contains(point) else { continue }
 
             if item.canClose, let closeRect = closeFrames[item.id], closeRect.insetBy(dx: -3, dy: -3).contains(point) {
+                resetTabClickSequence()
                 onCloseTab?(item.id)
                 return
             }
 
             // Triple-click detaches the tab into a new NewFinder window.
-            if event.clickCount >= 3 {
-                onDetachTab?(item.id, NSEvent.mouseLocation)
+            // ⌘ + triple-click tiles side-by-side (up to 3 windows).
+            let detach = registerTabClick(on: item, event: event)
+            if detach.detached {
+                onDetachTab?(item.id, NSEvent.mouseLocation, detach.sideBySide)
                 NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .now)
                 return
             }

@@ -281,11 +281,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @discardableResult
-    func openNewWindow(with tab: BrowserTab, screenPoint: NSPoint) -> BrowserWindowController {
+    func openNewWindowSideBySide(from source: BrowserWindowController, with tab: BrowserTab) -> Bool {
         let controller = BrowserWindowController(tabs: [tab], activeID: tab.id)
         register(controller)
+        controller.showWindow(nil)
+        guard SideBySideManager.shared.attachSideBySide(source: source, new: controller) else {
+            windowControllers.removeAll { $0 === controller }
+            controller.window?.close()
+            return false
+        }
+        return true
+    }
+
+    @discardableResult
+    func openNewWindow(with tab: BrowserTab, screenPoint: NSPoint, matching sourceFrame: NSRect? = nil) -> BrowserWindowController {
+        let controller = BrowserWindowController(tabs: [tab], activeID: tab.id)
+        register(controller)
+        controller.showWindow(nil)
         if let window = controller.window {
             var frame = window.frame
+            if let sourceFrame {
+                frame.size = sourceFrame.size
+            }
             frame.origin = NSPoint(
                 x: screenPoint.x - min(120, frame.width / 4),
                 y: screenPoint.y - frame.height + 40
@@ -295,12 +312,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 frame.origin.x = min(max(frame.origin.x, visible.minX), visible.maxX - frame.width)
                 frame.origin.y = min(max(frame.origin.y, visible.minY), visible.maxY - frame.height)
             }
-            window.setFrame(frame, display: true)
-            window.makeKeyAndOrderFront(nil)
-        } else {
-            controller.showWindow(nil)
+            let applyFrame = {
+                window.setFrame(frame, display: true)
+                window.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+            }
+            applyFrame()
+            DispatchQueue.main.async(execute: applyFrame)
         }
-        NSApp.activate(ignoringOtherApps: true)
         return controller
     }
 
@@ -312,6 +331,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             queue: .main
         ) { [weak self, weak controller] _ in
             guard let self, let controller else { return }
+            SideBySideManager.shared.windowWillClose(controller)
             self.windowControllers.removeAll { $0 === controller }
         }
     }
@@ -706,6 +726,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         shortcutsMenu.addItem(withTitle: "剪切", action: #selector(BrowserWindowController.cut(_:)), keyEquivalent: "x")
         shortcutsMenu.addItem(withTitle: "拷贝", action: #selector(BrowserWindowController.copy(_:)), keyEquivalent: "c")
         shortcutsMenu.addItem(withTitle: "粘贴", action: #selector(BrowserWindowController.paste(_:)), keyEquivalent: "v")
+        let upItem = shortcutsMenu.addItem(
+            withTitle: "上层文件夹",
+            action: #selector(BrowserWindowController.goEnclosingFolder(_:)),
+            keyEquivalent: String(UnicodeScalar(NSUpArrowFunctionKey)!)
+        )
+        upItem.keyEquivalentModifierMask = .command
         let renameItem = shortcutsMenu.addItem(
             withTitle: "重命名",
             action: #selector(BrowserWindowController.rename(_:)),
