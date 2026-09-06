@@ -60,8 +60,11 @@ final class ContentViewController: NSViewController {
 
         listScroll = NSScrollView()
         listScroll.hasVerticalScroller = true
+        listScroll.hasHorizontalScroller = true
         listScroll.borderType = .noBorder
         listScroll.autohidesScrollers = true
+        listScroll.allowsMagnification = false
+        listScroll.usesPredominantAxisScrolling = true
         listScroll.translatesAutoresizingMaskIntoConstraints = false
 
         let table = NSTableView()
@@ -150,9 +153,11 @@ final class ContentViewController: NSViewController {
         menu.addItem(withTitle: "赋予修改权限", action: #selector(contextMakeWritable), keyEquivalent: "")
         listView.menu = menu
 
-        // Insert this controller into the responder chain so QLPreviewPanel can find us.
-        let previous = listView.nextResponder
-        listView.nextResponder = self
+        // Keep NSTableView → NSScrollView intact so mouse-wheel scrolling works.
+        // Insert this controller *after* the scroll view so QLPreviewPanel can still
+        // find us via the responder chain (Space / Quick Look).
+        let previous = listScroll.nextResponder
+        listScroll.nextResponder = self
         nextResponder = previous
 
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -170,6 +175,16 @@ final class ContentViewController: NSViewController {
             name: NSApplication.didBecomeActiveNotification,
             object: nil
         )
+    }
+
+    /// If we remain in the responder chain between a hit-tested subview and the
+    /// scroll view, still forward wheel events so scrolling never dies.
+    override func scrollWheel(with event: NSEvent) {
+        if let scroll = listScroll {
+            scroll.scrollWheel(with: event)
+        } else {
+            super.scrollWheel(with: event)
+        }
     }
 
     /// Re-tint rows after cut / copy / paste changes the pasteboard.
