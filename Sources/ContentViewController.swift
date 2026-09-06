@@ -1,4 +1,5 @@
 import AppKit
+import QuickLookUI
 import UniformTypeIdentifiers
 
 final class ContentViewController: NSViewController {
@@ -35,6 +36,8 @@ final class ContentViewController: NSViewController {
     private var renamingItem: FileItem?
     private var renamingOriginalName: String?
     private weak var openWithMenuItem: NSMenuItem?
+    /// URLs currently fed to QLPreviewPanel (non-archive files/folders).
+    private var previewItems: [URL] = []
 
     /// Ordered sort keys: index 0 is primary. Shift-click adds secondary keys.
     private struct SortKey: Equatable {
@@ -137,6 +140,7 @@ final class ContentViewController: NSViewController {
         openWith.submenu = NSMenu()
         openWithMenuItem = openWith
         menu.addItem(openWith)
+        menu.addItem(withTitle: "快速查看", action: #selector(contextQuickLook), keyEquivalent: "")
         menu.addItem(withTitle: "显示简介", action: #selector(contextGetInfo), keyEquivalent: "")
         menu.addItem(NSMenuItem.separator())
         menu.addItem(withTitle: "压缩…", action: #selector(contextCompress), keyEquivalent: "")
@@ -145,6 +149,11 @@ final class ContentViewController: NSViewController {
         menu.addItem(NSMenuItem.separator())
         menu.addItem(withTitle: "赋予修改权限", action: #selector(contextMakeWritable), keyEquivalent: "")
         listView.menu = menu
+
+        // Insert this controller into the responder chain so QLPreviewPanel can find us.
+        let previous = listView.nextResponder
+        listView.nextResponder = self
+        nextResponder = previous
 
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             // Must not use `self?.handleKey(event) ?? event`: when handleKey returns nil
@@ -611,6 +620,24 @@ final class ContentViewController: NSViewController {
         }
     }
 
+    /// After deleting the current selection: prefer the next row below, else the previous above.
+    func selectionURLAfterRemovingSelected() -> URL? {
+        let selected = listView.selectedRowIndexes
+        guard let bottom = selected.last else { return nil }
+
+        if bottom + 1 < items.count {
+            for idx in (bottom + 1)..<items.count where !selected.contains(idx) {
+                return items[idx].url
+            }
+        }
+        if let top = selected.first, top > 0 {
+            for idx in stride(from: top - 1, through: 0, by: -1) where !selected.contains(idx) {
+                return items[idx].url
+            }
+        }
+        return nil
+    }
+
     func select(urls: [URL]) {
         let set = Set(urls.map { $0.standardizedFileURL })
         var indexes = IndexSet()
@@ -783,6 +810,12 @@ final class ContentViewController: NSViewController {
             }
         }
 
+        // Space → Quick Look (Finder)
+        if event.keyCode == 49, flags.isEmpty {
+            toggleQuickLook()
+            return nil
+        }
+
         // Return / keypad Enter → open
         if event.keyCode == 36 || event.keyCode == 76, flags.isEmpty {
             guard let item = selectedItems.first else { return event }
@@ -811,6 +844,55 @@ final class ContentViewController: NSViewController {
 
     @objc private func contextOpen() {
         selectedItems.forEach { onOpen?($0) }
+    }
+
+    @objc private func contextQuickLook() {
+        ensureClickedRowSelected()
+        showQuickLook()
+    }
+
+    private var previewableURLs: [URL] {
+        selectedItems
+            .filter { !$0.isArchiveEntry }
+            .map(\.url.standardizedFileURL)
+    }
+
+    private func refreshPreviewItems() {
+        previewItems = previewableURLs
+    }
+
+    private func toggleQuickLook() {
+        if QLPreviewPanel.sharedPreviewPanelExists(),
+           let panel = QLPreviewPanel.shared(),
+           panel.isVisible {
+            panel.orderOut(nil)
+            return
+        }
+        showQuickLook()
+    }
+
+    private func showQuickLook() {
+        refreshPreviewItems()
+        guard !previewItems.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        guard let panel = QLPreviewPanel.shared() else { return }
+        view.window?.makeFirstResponder(listView)
+        panel.updateController()
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    private func syncQuickLookIfVisible() {
+        guard QLPreviewPanel.sharedPreviewPanelExists(),
+              let panel = QLPreviewPanel.shared(),
+              panel.isVisible else { return }
+        refreshPreviewItems()
+        if previewItems.isEmpty {
+            panel.orderOut(nil)
+            return
+        }
+        panel.reloadData()
     }
 
     @objc private func contextOpenWithOther() {
@@ -1104,6 +1186,9 @@ extension ContentViewController: NSMenuDelegate {
                  #selector(contextGetInfo):
                 item.isHidden = false
                 item.isEnabled = hasSelection
+            case #selector(contextQuickLook):
+                item.isHidden = false
+                item.isEnabled = !previewableURLs.isEmpty
             case #selector(contextMakeWritable):
                 let targets = selectedItems.filter { !$0.isArchiveEntry }
                 item.isHidden = targets.isEmpty
@@ -1209,6 +1294,7 @@ extension ContentViewController: NSTableViewDataSource, NSTableViewDelegate {
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         onSelectionChange?(selectedItems)
+        syncQuickLookIfVisible()
     }
 
     // MARK: - Drag source
@@ -1488,6 +1574,50 @@ extension ContentViewController: NSTableViewDataSource, NSTableViewDelegate {
         let ext = item.url.pathExtension
         if ext.isEmpty { return "文稿" }
         return ext.lowercased() + " 文稿"
+    }
+}
+
+extension ContentViewController: QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+    override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
+        !previewableURLs.isEmpty || !previewItems.isEmpty
+    }
+
+    override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        refreshPreviewItems()
+        panel.dataSource = self
+        panel.delegate = self
+        panel.currentPreviewItemIndex = 0
+    }
+
+    override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        panel.dataSource = nil
+        panel.delegate = nil
+        previewItems = []
+    }
+
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
+        previewItems.count
+    }
+
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> (any QLPreviewItem)! {
+        guard previewItems.indices.contains(index) else { return nil }
+        return previewItems[index] as NSURL
+    }
+
+    func previewPanel(_ panel: QLPreviewPanel!, handle event: NSEvent!) -> Bool {
+        guard event.type == .keyDown else { return false }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // Leave Space to the panel so it can dismiss (Finder behavior).
+        if event.keyCode == 49, flags.isEmpty {
+            return false
+        }
+        // Arrow / Home / End / Page keys → move selection in the file list.
+        let navKeys: Set<UInt16> = [123, 124, 125, 126, 115, 119, 116, 121]
+        if navKeys.contains(event.keyCode), flags.isEmpty || flags == .shift {
+            listView.keyDown(with: event)
+            return true
+        }
+        return false
     }
 }
 

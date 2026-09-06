@@ -57,6 +57,7 @@ swiftc \
   -target arm64-apple-macos13.0 \
   "${SOURCES[@]}" \
   -framework AppKit \
+  -framework QuickLookUI \
   -framework ServiceManagement \
   -framework CoreServices \
   -framework CoreGraphics \
@@ -72,6 +73,7 @@ if [[ "$(uname -m)" == "arm64" ]]; then
     -target x86_64-apple-macos13.0 \
     "${SOURCES[@]}" \
     -framework AppKit \
+    -framework QuickLookUI \
     -framework ServiceManagement \
     -framework CoreServices \
     -framework CoreGraphics \

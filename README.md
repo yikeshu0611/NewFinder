@@ -8,7 +8,7 @@
 
 在 [Releases](https://github.com/yikeshu0611/NewFinder/releases) 下载最新 `NewFinder-x.x.x.dmg`，拖入「应用程序」即可。
 
-**当前版本：1.1.6**
+**当前版本：1.1.7**
 
 ### 若提示 “Apple could not verify…” / “无法打开 NewFinder”
 
@@ -76,7 +76,7 @@
 open build/NewFinder.app
 ```
 
-产物：`dist/NewFinder-1.1.6.dmg`
+产物：`dist/NewFinder-1.1.7.dmg`
 
 ## 快捷键
 

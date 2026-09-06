@@ -42,7 +42,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerExternalShowObservers()
 
         let stealFinder = CommandLine.arguments.contains("--steal-finder")
-        if stealFinder {
+        let revealFiles = Self.commandLineRevealURLs()
+        let revealDir = Self.commandLineRevealDirectory()
+
+        if !revealFiles.isEmpty {
+            // Cold launch from Chrome "Show in Finder" (via WatchAgent --reveal).
+            reveal(revealFiles)
+            bringUIToFront()
+        } else if let revealDir {
+            openNewWindow(at: revealDir)
+            bringUIToFront()
+        } else if stealFinder {
             // Relaunched after Dock-Finder click: steal immediately, then ensure a window.
             scheduleFinderRedirect(settle: 0)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
@@ -55,6 +65,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             showFrontBrowserOrOpenDesktop()
             bringUIToFront()
         }
+    }
+
+    /// Files to select after cold launch (`--reveal /path`).
+    private static func commandLineRevealURLs() -> [URL] {
+        let args = CommandLine.arguments
+        var urls: [URL] = []
+        var index = 0
+        while index < args.count {
+            if args[index] == "--reveal", index + 1 < args.count {
+                urls.append(URL(fileURLWithPath: args[index + 1]).standardizedFileURL)
+                index += 2
+            } else {
+                index += 1
+            }
+        }
+        return urls
+    }
+
+    /// Folder only (`--reveal-dir /path`) when Finder had no selection.
+    private static func commandLineRevealDirectory() -> URL? {
+        let args = CommandLine.arguments
+        guard let index = args.firstIndex(of: "--reveal-dir"),
+              index + 1 < args.count else { return nil }
+        return URL(fileURLWithPath: args[index + 1]).standardizedFileURL
     }
 
     /// If another UI instance is already running, ask it to show and exit this process.
@@ -242,8 +276,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             front.selectAfterNavigate(select)
             front.openDirectoryInTab(parent)
         } else {
-            let browser = openNewWindow(at: parent)
-            browser.selectAfterNavigate(select)
+            openNewWindow(at: parent, select: select)
         }
         bringUIToFront()
     }
@@ -273,8 +306,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @discardableResult
-    func openNewWindow(at url: URL) -> BrowserWindowController {
-        let controller = BrowserWindowController(directory: url)
+    func openNewWindow(at url: URL, select: [URL] = []) -> BrowserWindowController {
+        let controller = BrowserWindowController(directory: url, select: select)
         register(controller)
         controller.showWindow(nil)
         return controller

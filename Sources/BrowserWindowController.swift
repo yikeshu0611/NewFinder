@@ -52,13 +52,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         set { activeTab.directory = newValue.standardizedFileURL }
     }
 
-    convenience init(directory: URL) {
+    convenience init(directory: URL, select: [URL] = []) {
         let initial = directory.standardizedFileURL
         let tab = BrowserTab(directory: initial)
-        self.init(tabs: [tab], activeID: tab.id)
+        self.init(tabs: [tab], activeID: tab.id, selectAfterLoad: select)
     }
 
-    init(tabs: [BrowserTab], activeID: UUID) {
+    init(tabs: [BrowserTab], activeID: UUID, selectAfterLoad: [URL] = []) {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1100, height: 700),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -76,6 +76,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
 
         self.tabs = tabs
         self.activeTabID = activeID
+        // Must be set before navigate → reloadContents captures pending selection.
+        self.pendingSelectURLs = selectAfterLoad.map(\.standardizedFileURL)
 
         configureUI()
         NotificationCenter.default.addObserver(
@@ -1275,10 +1277,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     @objc func moveToTrash(_ sender: Any?) {
         let urls = contentController.selectedItems.map(\.url)
         guard !urls.isEmpty else { NSSound.beep(); return }
+        let nextURL = contentController.selectionURLAfterRemovingSelected()
         do {
             try FileOperations.moveToTrash(urls)
             contentController.noteRemovedURLs(urls)
-            reloadAfterMutation()
+            reloadAfterMutation(select: nextURL.map { [$0] } ?? [])
             chromeHeader.flashFileActionSuccess(.trash)
         } catch {
             showError(error)
@@ -1878,14 +1881,25 @@ final class ClickablePathBarView: NSView {
 }
 
 /// Clips long breadcrumbs so they cannot force the window wider.
-/// When overflowing, keeps the trailing (current folder) visible.
+/// Hides whole leading segments (never mid-glyph) and shows "…" when collapsed,
+/// keeping the trailing (current folder) crumb visible.
 final class BreadcrumbClipView: NSView {
     private weak var stack: NSStackView?
+    private let ellipsisLabel: NSTextField = {
+        let label = NSTextField(labelWithString: "…")
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = .secondaryLabelColor
+        label.isHidden = true
+        label.translatesAutoresizingMaskIntoConstraints = true
+        return label
+    }()
 
     func embed(_ stack: NSStackView) {
         self.stack?.removeFromSuperview()
         self.stack = stack
-        stack.translatesAutoresizingMaskIntoConstraints = false
+        if ellipsisLabel.superview == nil {
+            addSubview(ellipsisLabel)
+        }
         addSubview(stack)
         // Frame-based layout in layout(); avoid Auto Layout fighting the clip.
         stack.translatesAutoresizingMaskIntoConstraints = true
@@ -1900,24 +1914,65 @@ final class BreadcrumbClipView: NSView {
     override func layout() {
         super.layout()
         guard let stack else { return }
-        // Detached from Auto Layout width — measure natural size of arranged crumbs.
-        let fitting = stack.fittingSize
-        var size = fitting
+
+        let views = stack.arrangedSubviews
+        for view in views {
+            view.isHidden = false
+        }
+        ellipsisLabel.isHidden = true
+
+        let available = bounds.width
+        let height = max(bounds.height, 20)
+
+        // Hide whole leading crumbs until the trail fits. Never clip mid-label.
+        while true {
+            stack.layoutSubtreeIfNeeded()
+            let width = max(stack.fittingSize.width, 0)
+            if width <= available { break }
+
+            let visibleButtons = views.enumerated().filter {
+                !$0.element.isHidden && $0.element is BreadcrumbButton
+            }
+            guard visibleButtons.count > 1 else { break }
+
+            let idx = visibleButtons[0].offset
+            views[idx].isHidden = true
+            if idx + 1 < views.count, views[idx + 1] is BreadcrumbChevronButton {
+                views[idx + 1].isHidden = true
+            }
+        }
+
+        let collapsed = views.contains(where: \.isHidden)
+        var leading: CGFloat = 0
+        if collapsed {
+            ellipsisLabel.isHidden = false
+            ellipsisLabel.sizeToFit()
+            let eSize = ellipsisLabel.fittingSize
+            ellipsisLabel.frame = NSRect(
+                x: 0,
+                y: (height - eSize.height) / 2,
+                width: eSize.width,
+                height: eSize.height
+            )
+            leading = eSize.width + 4
+        }
+
+        stack.layoutSubtreeIfNeeded()
+        var size = stack.fittingSize
         if size.width < 1 {
-            size.width = stack.intrinsicContentSize.width
+            size.width = max(0, available - leading)
         }
-        if size.height < 1 {
-            size.height = max(20, bounds.height)
-        }
+        size.height = height
+
+        // Prefer leading alignment; if still slightly over, pin trailing so leaf stays visible.
+        let contentWidth = available - leading
         let x: CGFloat
-        if size.width <= bounds.width {
-            x = 0
+        if size.width <= contentWidth {
+            x = leading
         } else {
-            // Overflow: pin to trailing edge so the leaf folder stays visible.
-            x = bounds.width - size.width
+            x = leading + (contentWidth - size.width)
         }
-        let y = (bounds.height - size.height) / 2
-        stack.frame = NSRect(x: x, y: y, width: size.width, height: size.height)
+        stack.frame = NSRect(x: x, y: 0, width: size.width, height: height)
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -2085,8 +2140,10 @@ final class BreadcrumbButton: NSButton {
         sendAction(on: [.leftMouseUp])
         wantsLayer = true
         layer?.cornerRadius = 4
-        setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        lineBreakMode = .byClipping
+        setContentCompressionResistancePriority(.required, for: .horizontal)
         setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .vertical)
     }
 
     override var intrinsicContentSize: NSSize {
