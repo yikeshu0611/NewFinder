@@ -30,6 +30,7 @@ enum WatchAgentMain {
 
 private final class WatchAgentDelegate: NSObject, NSApplicationDelegate {
     private var lastLaunchAt: Date?
+    private var leaveFinderAloneUntil: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let center = NSWorkspace.shared.notificationCenter
@@ -47,30 +48,75 @@ private final class WatchAgentDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] note in
             self?.handleFinderNote(note)
         }
+        center.addObserver(
+            forName: NSWorkspace.didMountNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let url = note.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL,
+                  FinderVolumeGuard.urlLooksLikeMountedVolume(url) else { return }
+            self?.leaveFinderAloneUntil = Date().addingTimeInterval(600)
+        }
+        center.addObserver(
+            forName: NSWorkspace.didUnmountNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            if !FinderVolumeGuard.hasMountedVolumes() {
+                self?.leaveFinderAloneUntil = nil
+            }
+        }
     }
 
     private func handleFinderNote(_ note: Notification) {
         guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
               app.bundleIdentifier == "com.apple.finder" else { return }
         guard !isUIInstanceRunning() else { return }
+        if let until = leaveFinderAloneUntil, Date() < until { return }
         if let last = lastLaunchAt, Date().timeIntervalSince(last) < 1.0 { return }
+
+        // Read selection BEFORE closing — same as UI path; skip /Volumes (DMG installers).
+        let context = probeFinderContext()
+        if contextInvolvesMountedVolume(context) || finderHasVolumeWindow() {
+            leaveFinderAloneUntil = Date().addingTimeInterval(600)
+            return
+        }
+
         lastLaunchAt = Date()
 
-        // Chrome "Show in Finder" selects the file first — read it BEFORE closing windows.
-        let context = probeFinderContext()
-        // Brief settle: Chrome sometimes sets selection a tick after Finder activates.
         if context.select.isEmpty && context.folder == nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+            // First DMG open: wait for mount window before closing anything.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { [weak self] in
                 guard let self, !self.isUIInstanceRunning() else { return }
+                if let until = self.leaveFinderAloneUntil, Date() < until { return }
                 let again = self.probeFinderContext()
-                self.closeFinderWindows()
+                if self.contextInvolvesMountedVolume(again) || self.finderHasVolumeWindow() {
+                    self.leaveFinderAloneUntil = Date().addingTimeInterval(600)
+                    return
+                }
+                self.closeFinderWindowsPreservingVolumes()
                 self.launchUIInstance(select: again.select, folder: again.folder)
             }
             return
         }
 
-        closeFinderWindows()
+        closeFinderWindowsPreservingVolumes()
         launchUIInstance(select: context.select, folder: context.folder)
+    }
+
+    private func contextInvolvesMountedVolume(_ context: FinderContext) -> Bool {
+        if let folder = context.folder, FinderVolumeGuard.urlLooksLikeMountedVolume(folder) {
+            return true
+        }
+        return FinderVolumeGuard.urlsInvolveMountedVolume(context.select)
+    }
+
+    private func finderHasVolumeWindow() -> Bool {
+        var error: NSDictionary?
+        let raw = NSAppleScript(source: FinderVolumeGuard.listWindowTargetsScript)?
+            .executeAndReturnError(&error)
+            .stringValue
+        return FinderVolumeGuard.windowTargetsInvolveMountedVolume(scriptResult: raw)
     }
 
     /// True when the NewFinder UI app is running.
@@ -132,16 +178,10 @@ private final class WatchAgentDelegate: NSObject, NSApplicationDelegate {
         return FinderContext(select: [], folder: nil)
     }
 
-    private func closeFinderWindows() {
-        let source = """
-        tell application "Finder"
-          try
-            close every window
-          end try
-        end tell
-        """
+    private func closeFinderWindowsPreservingVolumes() {
         var error: NSDictionary?
-        NSAppleScript(source: source)?.executeAndReturnError(&error)
+        NSAppleScript(source: FinderVolumeGuard.closeNonVolumeWindowsScript)?
+            .executeAndReturnError(&error)
     }
 
     private func launchUIInstance(select: [URL], folder: URL?) {

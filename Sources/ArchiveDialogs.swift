@@ -7,12 +7,7 @@ enum ArchiveDialogs {
         for urls: [URL],
         relativeTo directory: URL
     ) -> ArchiveCompressOptions? {
-        let defaultName: String
-        if urls.count == 1 {
-            defaultName = urls[0].deletingPathExtension().lastPathComponent + ".zip"
-        } else {
-            defaultName = "Archive.zip"
-        }
+        let defaultName = ArchiveSupport.suggestedCompressFileName(for: urls, in: directory)
 
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 480, height: 340),
@@ -229,15 +224,15 @@ enum ArchiveDialogs {
         for archives: [URL],
         relativeTo directory: URL
     ) -> ArchiveExtractOptions? {
-        let defaultFolder: String
+        let suggestedFolder: String
         if archives.count == 1 {
-            defaultFolder = ArchiveSupport.extractFolderName(for: archives[0])
+            suggestedFolder = ArchiveSupport.extractFolderName(for: archives[0])
         } else {
-            defaultFolder = ""
+            suggestedFolder = ""
         }
 
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 260),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 260),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -245,7 +240,7 @@ enum ArchiveDialogs {
         panel.title = "解压"
         panel.isFloatingPanel = true
 
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 480, height: 260))
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 260))
         panel.contentView = content
 
         let pathLabel = makeLabel("解压到")
@@ -253,8 +248,11 @@ enum ArchiveDialogs {
         let browseBtn = NSButton(title: "选择…", target: nil, action: nil)
 
         let nameLabel = makeLabel("文件夹名")
-        let nameField = NSTextField(string: defaultFolder)
+        let nameField = NSTextField(string: "")
         nameField.placeholderString = "留空则直接解压到上方目录"
+
+        let useNameCheck = NSButton(checkboxWithTitle: "使用压缩文件名", target: nil, action: nil)
+        useNameCheck.state = .off
 
         let passwordLabel = makeLabel("密码")
         let passwordField = NSSecureTextField(string: "")
@@ -268,7 +266,7 @@ enum ArchiveDialogs {
         cancelBtn.keyEquivalent = "\u{1b}"
 
         [
-            pathLabel, pathField, browseBtn, nameLabel, nameField,
+            pathLabel, pathField, browseBtn, nameLabel, nameField, useNameCheck,
             passwordLabel, passwordField, deleteCheck, cancelBtn, okBtn
         ].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
@@ -290,8 +288,11 @@ enum ArchiveDialogs {
             nameLabel.topAnchor.constraint(equalTo: pathLabel.bottomAnchor, constant: 16),
             nameLabel.widthAnchor.constraint(equalToConstant: 70),
             nameField.leadingAnchor.constraint(equalTo: pathField.leadingAnchor),
-            nameField.trailingAnchor.constraint(equalTo: browseBtn.trailingAnchor),
             nameField.centerYAnchor.constraint(equalTo: nameLabel.centerYAnchor),
+            useNameCheck.leadingAnchor.constraint(equalTo: nameField.trailingAnchor, constant: 8),
+            useNameCheck.trailingAnchor.constraint(equalTo: browseBtn.trailingAnchor),
+            useNameCheck.centerYAnchor.constraint(equalTo: nameLabel.centerYAnchor),
+            useNameCheck.widthAnchor.constraint(greaterThanOrEqualToConstant: 120),
 
             passwordLabel.leadingAnchor.constraint(equalTo: pathLabel.leadingAnchor),
             passwordLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 16),
@@ -314,21 +315,27 @@ enum ArchiveDialogs {
             let panel: NSPanel
             let pathField: NSTextField
             let nameField: NSTextField
+            let useNameCheck: NSButton
             let passwordField: NSSecureTextField
             let deleteCheck: NSButton
+            let suggestedFolder: String
 
             init(
                 panel: NSPanel,
                 pathField: NSTextField,
                 nameField: NSTextField,
+                useNameCheck: NSButton,
                 passwordField: NSSecureTextField,
-                deleteCheck: NSButton
+                deleteCheck: NSButton,
+                suggestedFolder: String
             ) {
                 self.panel = panel
                 self.pathField = pathField
                 self.nameField = nameField
+                self.useNameCheck = useNameCheck
                 self.passwordField = passwordField
                 self.deleteCheck = deleteCheck
+                self.suggestedFolder = suggestedFolder
             }
 
             @objc func browse() {
@@ -343,6 +350,20 @@ enum ArchiveDialogs {
                 }
             }
 
+            @objc func toggleUseArchiveName() {
+                let on = useNameCheck.state == .on
+                nameField.isEnabled = !on
+                if on {
+                    nameField.stringValue = suggestedFolder
+                    nameField.placeholderString = suggestedFolder.isEmpty
+                        ? "将使用各压缩包文件名"
+                        : suggestedFolder
+                } else {
+                    nameField.stringValue = ""
+                    nameField.placeholderString = "留空则直接解压到上方目录"
+                }
+            }
+
             @objc func cancel() {
                 result = nil
                 NSApp.stopModal(withCode: .cancel)
@@ -350,11 +371,13 @@ enum ArchiveDialogs {
             }
 
             @objc func ok() {
+                let useArchiveName = useNameCheck.state == .on
                 result = ArchiveExtractOptions(
                     directory: URL(fileURLWithPath: pathField.stringValue).standardizedFileURL,
-                    folderName: nameField.stringValue,
+                    folderName: useArchiveName ? "" : nameField.stringValue,
                     password: passwordField.stringValue,
-                    deleteSource: deleteCheck.state == .on
+                    deleteSource: deleteCheck.state == .on,
+                    useArchiveName: useArchiveName
                 )
                 NSApp.stopModal(withCode: .OK)
                 panel.orderOut(nil)
@@ -365,11 +388,15 @@ enum ArchiveDialogs {
             panel: panel,
             pathField: pathField,
             nameField: nameField,
+            useNameCheck: useNameCheck,
             passwordField: passwordField,
-            deleteCheck: deleteCheck
+            deleteCheck: deleteCheck,
+            suggestedFolder: suggestedFolder
         )
         browseBtn.target = handler
         browseBtn.action = #selector(Handler.browse)
+        useNameCheck.target = handler
+        useNameCheck.action = #selector(Handler.toggleUseArchiveName)
         cancelBtn.target = handler
         cancelBtn.action = #selector(Handler.cancel)
         okBtn.target = handler

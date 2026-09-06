@@ -781,7 +781,7 @@ final class ContentViewController: NSViewController {
 
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
 
-        // ⌘C / ⌘X / ⌘V
+        // ⌘C / ⌘X / ⌘V / ⌘A
         if flags == .command,
            let ch = event.charactersIgnoringModifiers?.lowercased() {
             switch ch {
@@ -793,6 +793,9 @@ final class ContentViewController: NSViewController {
                 return nil
             case "v":
                 onPasteRequest?()
+                return nil
+            case "a":
+                selectAll()
                 return nil
             default:
                 break
@@ -1081,8 +1084,12 @@ final class ContentViewController: NSViewController {
             switch result {
             case .success:
                 if options.deleteSource {
-                    do { try FileOperations.moveToTrash(urls) }
-                    catch { self.presentArchiveError(title: "压缩成功，但删除原文件失败", error: error) }
+                    let archivePath = options.archiveURL.standardizedFileURL.path
+                    let toTrash = urls.filter { $0.standardizedFileURL.path != archivePath }
+                    if !toTrash.isEmpty {
+                        do { try FileOperations.moveToTrash(toTrash) }
+                        catch { self.presentArchiveError(title: "压缩成功，但删除原文件失败", error: error) }
+                    }
                 }
                 self.onDirectoryNeedsReload?()
             case .failure(let error):
@@ -1097,14 +1104,17 @@ final class ContentViewController: NSViewController {
         guard !urls.isEmpty else { return }
         let base = urls.first?.deletingLastPathComponent() ?? URL(fileURLWithPath: NSHomeDirectory())
         guard let options = ArchiveDialogs.runExtractDialog(for: urls, relativeTo: base) else { return }
-        try? FileManager.default.createDirectory(at: options.destinationURL, withIntermediateDirectories: true)
         ArchiveSupport.extract(urls: urls, options: options) { [weak self] result in
             guard let self else { return }
             switch result {
             case .success:
                 if options.deleteSource {
-                    do { try FileOperations.moveToTrash(urls) }
-                    catch { self.presentArchiveError(title: "解压成功，但删除压缩包失败", error: error) }
+                    let destPath = options.destinationURL.standardizedFileURL.path
+                    let toTrash = urls.filter { $0.standardizedFileURL.path != destPath }
+                    if !toTrash.isEmpty {
+                        do { try FileOperations.moveToTrash(toTrash) }
+                        catch { self.presentArchiveError(title: "解压成功，但删除压缩包失败", error: error) }
+                    }
                 }
                 self.onDirectoryNeedsReload?()
             case .failure(let error):

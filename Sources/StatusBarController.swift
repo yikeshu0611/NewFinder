@@ -5,6 +5,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     static let shared = StatusBarController()
 
     private var statusItem: NSStatusItem?
+    private var statusMenu = NSMenu()
     private weak var zoomMenuItem: NSMenuItem?
     private var helpers: [AnyObject] = []
 
@@ -15,14 +16,15 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             let image = NSImage(systemSymbolName: "folder.fill", accessibilityDescription: "NewFinder")
             image?.isTemplate = true
             button.image = image
-            button.toolTip = "NewFinder"
+            button.toolTip = "NewFinder（单击显示，右键菜单）"
+            button.target = self
+            button.action = #selector(statusItemClicked(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
-        let menu = NSMenu()
-        menu.delegate = self
-        item.menu = menu
+        statusMenu.delegate = self
         statusItem = item
-        rebuildMenu(menu)
+        rebuildMenu(statusMenu)
     }
 
     func refreshZoomTitle(_ percent: Int? = nil) {
@@ -32,6 +34,20 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         rebuildMenu(menu)
+    }
+
+    @objc private func statusItemClicked(_ sender: Any?) {
+        let event = NSApp.currentEvent
+        if event?.type == .rightMouseUp
+            || event?.modifierFlags.contains(.control) == true {
+            guard let button = statusItem?.button else { return }
+            // Attach menu only for this popup so left-click stays a direct show.
+            statusItem?.menu = statusMenu
+            statusMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 2), in: button)
+            statusItem?.menu = nil
+            return
+        }
+        AppDelegate.shared.userRequestedShowUI()
     }
 
     private func rebuildMenu(_ menu: NSMenu) {

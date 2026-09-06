@@ -90,10 +90,24 @@ enum ArchiveEngine {
 
     static func defaultArchiveName(for items: [URL], format: CompressFormat) -> String {
         if items.count == 1 {
-            let base = items[0].deletingPathExtension().lastPathComponent
+            let item = items[0]
+            var base = stemName(for: item)
+            if looksLikeArchive(item) {
+                base += " 压缩"
+            }
             return "\(base).\(format.fileExtension)"
         }
         return "Archive.\(format.fileExtension)"
+    }
+
+    /// Strip one archive extension (including `.tar.gz`) for suggested names.
+    static func stemName(for url: URL) -> String {
+        let name = url.lastPathComponent
+        let lower = name.lowercased()
+        if lower.hasSuffix(".tar.gz") { return String(name.dropLast(7)) }
+        if lower.hasSuffix(".tar.bz2") { return String(name.dropLast(8)) }
+        if lower.hasSuffix(".tar.xz") { return String(name.dropLast(7)) }
+        return url.deletingPathExtension().lastPathComponent
     }
 
     static func compress(
@@ -131,11 +145,89 @@ enum ArchiveEngine {
         archive: URL,
         to directory: URL,
         password: String? = nil,
+        protecting otherArchives: [URL] = [],
         progress: @escaping (String) -> Void
     ) async throws {
         try Task.checkCancellation()
         progress("正在解压…")
 
+        let fm = FileManager.default
+        let archive = archive.standardizedFileURL
+        let directory = directory.standardizedFileURL
+        var protectedPaths = Set(otherArchives.map { $0.standardizedFileURL.path })
+        protectedPaths.insert(archive.path)
+
+        guard fm.fileExists(atPath: archive.path) else {
+            throw ArchiveError.toolFailed("压缩包不存在：\(archive.lastPathComponent)")
+        }
+        if directory.path == archive.path {
+            throw ArchiveError.toolFailed("解压目标不能是压缩包本身")
+        }
+
+        // If the archive lives inside the destination tree, extract via a temp folder
+        // first. Otherwise an entry named like the archive can overwrite the source
+        // mid-read (ditto/unzip), which then fails with “文件不存在”.
+        if archiveIsInsideDestination(archive, destination: directory) {
+            let staging = fm.temporaryDirectory
+                .appendingPathComponent("NewFinder-extract-\(UUID().uuidString)", isDirectory: true)
+            try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+            defer { try? fm.removeItem(at: staging) }
+            try await extractDirect(archive: archive, to: staging, password: password)
+            try mergeExtractedContents(from: staging, into: directory, protecting: protectedPaths)
+        } else {
+            try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+            try await extractDirect(archive: archive, to: directory, password: password)
+        }
+
+        progress("解压完成")
+    }
+
+    /// True when writing into `destination` could replace `archive` itself.
+    private static func archiveIsInsideDestination(_ archive: URL, destination: URL) -> Bool {
+        let dest = destination.path
+        let parent = archive.deletingLastPathComponent().path
+        if parent == dest { return true }
+        return archive.path.hasPrefix(dest.hasSuffix("/") ? dest : dest + "/")
+    }
+
+    private static func mergeExtractedContents(
+        from staging: URL,
+        into destination: URL,
+        protecting protectedPaths: Set<String>
+    ) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: destination, withIntermediateDirectories: true)
+        let items = try fm.contentsOfDirectory(
+            at: staging,
+            includingPropertiesForKeys: nil,
+            options: []
+        )
+        for item in items {
+            var target = destination.appendingPathComponent(item.lastPathComponent)
+            if protectedPaths.contains(target.standardizedFileURL.path) {
+                // Keep source archives; place the same-named entry beside them.
+                let stem = stemName(for: target)
+                let ext = item.pathExtension
+                let renamed = ext.isEmpty ? "\(stem) 内容" : "\(stem) 内容.\(ext)"
+                target = destination.appendingPathComponent(renamed)
+                var index = 2
+                while fm.fileExists(atPath: target.path) {
+                    let again = ext.isEmpty ? "\(stem) 内容 \(index)" : "\(stem) 内容 \(index).\(ext)"
+                    target = destination.appendingPathComponent(again)
+                    index += 1
+                }
+            } else if fm.fileExists(atPath: target.path) {
+                try fm.removeItem(at: target)
+            }
+            try fm.moveItem(at: item, to: target)
+        }
+    }
+
+    private static func extractDirect(
+        archive: URL,
+        to directory: URL,
+        password: String?
+    ) async throws {
         let name = archive.lastPathComponent.lowercased()
         let ext = archive.pathExtension.lowercased()
 
@@ -162,8 +254,6 @@ enum ArchiveEngine {
         } else {
             throw ArchiveError.unsupportedArchive(archive.lastPathComponent)
         }
-
-        progress("解压完成")
     }
 
     /// Flat list of all entries inside an archive (files and inferred directories).
@@ -243,30 +333,29 @@ enum ArchiveEngine {
         password: String?,
         split: SplitVolumeSize
     ) async throws {
-        if FileManager.default.fileExists(atPath: destination.path) {
-            try FileManager.default.removeItem(at: destination)
-        }
-        // Remove leftover split parts
-        let base = destination.deletingPathExtension().path
-        let parent = destination.deletingLastPathComponent()
-        if let files = try? FileManager.default.contentsOfDirectory(atPath: parent.path) {
-            for name in files where name.hasPrefix((base as NSString).lastPathComponent + ".z") {
-                try? FileManager.default.removeItem(at: parent.appendingPathComponent(name))
-            }
-        }
-
-        let staging = FileManager.default.temporaryDirectory
+        let fm = FileManager.default
+        let staging = fm.temporaryDirectory
             .appendingPathComponent("NewFinder-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: staging) }
+        let outputDir = fm.temporaryDirectory
+            .appendingPathComponent("NewFinder-zipout-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+        try fm.createDirectory(at: outputDir, withIntermediateDirectories: true)
+        defer {
+            try? fm.removeItem(at: staging)
+            try? fm.removeItem(at: outputDir)
+        }
 
         for item in items {
-            try FileManager.default.copyItem(
+            try fm.copyItem(
                 at: item,
                 to: staging.appendingPathComponent(item.lastPathComponent)
             )
         }
 
+        // Always write to a temp zip first. Never delete the source until the new
+        // archive exists — re-compressing foo.zip used to wipe foo.zip (prefix "foo.z"
+        // also matched foo.zip) and then fail with “文件不存在”.
+        let tempZip = outputDir.appendingPathComponent("archive.zip")
         var zipArgs = "/usr/bin/zip -r"
         if let password, !password.isEmpty {
             zipArgs += " -P \(shellEscape(password))"
@@ -274,16 +363,63 @@ enum ArchiveEngine {
         if let splitArg = split.zipSplitArgument {
             zipArgs += " -s \(splitArg)"
         }
-        zipArgs += " \(shellEscape(destination.path)) ."
+        zipArgs += " \(shellEscape(tempZip.path)) ."
 
         try await run(
             "/bin/bash",
             ["-c", "cd \(shellEscape(staging.path)) && \(zipArgs)"],
             environment: ["LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"]
         )
-        // Info-ZIP on macOS stores UTF-8 bytes but often omits the UTF-8 flag,
-        // so other tools (and zipinfo) show garbled names. Mark non-ASCII entries.
-        try markZipFilenamesAsUTF8(at: destination)
+        guard fm.fileExists(atPath: tempZip.path) else {
+            throw ArchiveError.toolFailed("压缩完成但未生成 ZIP 文件")
+        }
+        try markZipFilenamesAsUTF8(at: tempZip)
+        try publishArchive(from: outputDir, primary: tempZip, to: destination)
+    }
+
+    /// Move a newly built archive (and optional `name.z01` split parts) into place.
+    /// Replaces the destination only after the new file is complete.
+    private static func publishArchive(from outputDir: URL, primary: URL, to destination: URL) throws {
+        let fm = FileManager.default
+        let dest = destination.standardizedFileURL
+        let destParent = dest.deletingLastPathComponent()
+        let destStem = dest.deletingPathExtension().lastPathComponent
+        try fm.createDirectory(at: destParent, withIntermediateDirectories: true)
+
+        removeNumericSplitParts(stem: destStem, in: destParent)
+
+        if fm.fileExists(atPath: dest.path) {
+            try fm.removeItem(at: dest)
+        }
+        try fm.moveItem(at: primary, to: dest)
+
+        let outStem = primary.deletingPathExtension().lastPathComponent
+        if let files = try? fm.contentsOfDirectory(atPath: outputDir.path) {
+            for name in files {
+                guard isNumericSplitPart(name, stem: outStem) else { continue }
+                let suffix = String(name.dropFirst(outStem.count)) // .z01
+                let target = destParent.appendingPathComponent(destStem + suffix)
+                if fm.fileExists(atPath: target.path) {
+                    try fm.removeItem(at: target)
+                }
+                try fm.moveItem(at: outputDir.appendingPathComponent(name), to: target)
+            }
+        }
+    }
+
+    /// Info-ZIP split parts are `name.z01`, `name.z02`, … — not `name.zip`.
+    private static func isNumericSplitPart(_ fileName: String, stem: String) -> Bool {
+        let prefix = stem + ".z"
+        guard fileName.hasPrefix(prefix) else { return false }
+        let digits = fileName.dropFirst(prefix.count)
+        return !digits.isEmpty && digits.count <= 3 && digits.allSatisfy(\.isNumber)
+    }
+
+    private static func removeNumericSplitParts(stem: String, in directory: URL) {
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return }
+        for name in files where isNumericSplitPart(name, stem: stem) {
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
+        }
     }
 
     /// Set general-purpose bit 11 (UTF-8) on local + central headers for non-ASCII names.
@@ -327,36 +463,35 @@ enum ArchiveEngine {
     }
 
     private static func compressTarGz(items: [URL], to destination: URL) async throws {
-        if FileManager.default.fileExists(atPath: destination.path) {
-            try FileManager.default.removeItem(at: destination)
-        }
-
-        var args = ["-czf", destination.path]
-        // Use -C parent + basename so paths inside archive are short
-        if items.count == 1 {
-            let item = items[0]
-            args += ["-C", item.deletingLastPathComponent().path, item.lastPathComponent]
-            try await run("/usr/bin/tar", args)
-            return
-        }
-
-        let staging = FileManager.default.temporaryDirectory
+        let fm = FileManager.default
+        let staging = fm.temporaryDirectory
             .appendingPathComponent("NewFinder-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: staging) }
+        let outputDir = fm.temporaryDirectory
+            .appendingPathComponent("NewFinder-tarout-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+        try fm.createDirectory(at: outputDir, withIntermediateDirectories: true)
+        defer {
+            try? fm.removeItem(at: staging)
+            try? fm.removeItem(at: outputDir)
+        }
 
         for item in items {
-            try FileManager.default.copyItem(
+            try fm.copyItem(
                 at: item,
                 to: staging.appendingPathComponent(item.lastPathComponent)
             )
         }
 
+        let tempArchive = outputDir.appendingPathComponent("archive.tar.gz")
         try await run("/usr/bin/tar", [
-            "-czf", destination.path,
+            "-czf", tempArchive.path,
             "-C", staging.path,
             "."
         ])
+        guard fm.fileExists(atPath: tempArchive.path) else {
+            throw ArchiveError.toolFailed("压缩完成但未生成 TAR.GZ 文件")
+        }
+        try publishArchive(from: outputDir, primary: tempArchive, to: destination)
     }
 
     private static func extractWithOptionalTools(

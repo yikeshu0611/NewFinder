@@ -961,6 +961,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             openArchiveItem(item, in: activeTab)
             return
         }
+        if !item.isDirectory, DMGInstallSupport.isDiskImage(item.url) {
+            _ = AppDelegate.shared.openDiskImage(item.url)
+            return
+        }
         if !item.isDirectory, ArchiveSupport.looksLikeArchive(item.url) {
             openArchiveInTab(item.url)
             return

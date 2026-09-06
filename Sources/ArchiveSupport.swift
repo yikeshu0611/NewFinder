@@ -36,11 +36,21 @@ struct ArchiveExtractOptions {
     var folderName: String // empty = extract into directory directly
     var password: String
     var deleteSource: Bool
+    /// When true, each archive extracts into a subfolder named after the archive stem.
+    var useArchiveName: Bool = false
 
     var destinationURL: URL {
         let name = folderName.trimmingCharacters(in: .whitespacesAndNewlines)
         if name.isEmpty { return directory }
         return directory.appendingPathComponent(name, isDirectory: true)
+    }
+
+    func destinationURL(for archive: URL) -> URL {
+        if useArchiveName {
+            let name = ArchiveEngine.stemName(for: archive)
+            return directory.appendingPathComponent(name, isDirectory: true)
+        }
+        return destinationURL
     }
 }
 
@@ -51,12 +61,24 @@ enum ArchiveSupport {
     }
 
     static func extractFolderName(for archive: URL) -> String {
-        let name = archive.lastPathComponent
-        let lower = name.lowercased()
-        if lower.hasSuffix(".tar.gz") { return String(name.dropLast(7)) }
-        if lower.hasSuffix(".tar.bz2") { return String(name.dropLast(8)) }
-        if lower.hasSuffix(".tar.xz") { return String(name.dropLast(7)) }
-        return archive.deletingPathExtension().lastPathComponent
+        ArchiveEngine.stemName(for: archive)
+    }
+
+    /// Suggested ZIP name that does not collide with the selected files.
+    static func suggestedCompressFileName(for urls: [URL], in directory: URL) -> String {
+        let proposed = ArchiveEngine.defaultArchiveName(for: urls, format: .zip)
+        let avoid = Set(urls.map { $0.standardizedFileURL.path })
+        var name = proposed
+        var index = 2
+        while true {
+            let candidate = directory.appendingPathComponent(name).standardizedFileURL
+            if !avoid.contains(candidate.path), !FileManager.default.fileExists(atPath: candidate.path) {
+                return name
+            }
+            let stem = (proposed as NSString).deletingPathExtension
+            name = "\(stem) \(index).zip"
+            index += 1
+        }
     }
 
     static func compress(
@@ -88,18 +110,23 @@ enum ArchiveSupport {
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
         let password = options.password.isEmpty ? nil : options.password
-        let destination = options.destinationURL
+        let archives = urls.map(\.standardizedFileURL)
         Task {
             do {
-                try FileManager.default.createDirectory(
-                    at: destination,
-                    withIntermediateDirectories: true
-                )
-                for archive in urls {
+                for archive in archives {
+                    let destination = options.destinationURL(for: archive).standardizedFileURL
+                    if destination.path == archive.path {
+                        throw ArchiveError.toolFailed("解压目标不能是压缩包本身")
+                    }
+                    try FileManager.default.createDirectory(
+                        at: destination,
+                        withIntermediateDirectories: true
+                    )
                     try await ArchiveEngine.extract(
                         archive: archive,
                         to: destination,
                         password: password,
+                        protecting: archives,
                         progress: { _ in }
                     )
                 }

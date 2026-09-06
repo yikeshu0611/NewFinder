@@ -9,10 +9,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static let stealFinderNotification = Notification.Name("com.zhangjing.NewFinder.stealFinder")
 
     private var windowControllers: [BrowserWindowController] = []
+    private var dmgInstallWindows: [DMGInstallWindowController] = []
     private var isRedirectingFinder = false
     private var lastFinderRedirectAt: Date?
     /// Ignore Finder activation storms right after we steal focus (policy / close-window churn).
     private var suppressFinderRedirectUntil: Date?
+    /// While a DMG /Volumes window is in use — do not steal at all (prevents Finder↔NF ping-pong).
+    private var leaveFinderAloneUntil: Date?
     private var finderWindowPollTimer: Timer?
     private var pendingRedirectWorkItem: DispatchWorkItem?
     private var didWarnFinderAutomation = false
@@ -130,15 +133,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func handleExternalShowUI(_ notification: Notification) {
-        showFrontBrowserOrOpenDesktop()
-        bringUIToFront()
+        userRequestedShowUI()
     }
 
     @objc private func handleExternalStealFinder(_ notification: Notification) {
         scheduleFinderRedirect(settle: 0)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            self?.showFrontBrowserOrOpenDesktop()
-            self?.bringUIToFront()
+            self?.userRequestedShowUI()
         }
     }
 
@@ -150,6 +151,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 at: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop")
             )
         }
+    }
+
+    /// Menu bar / reopen / external show — bring NF forward without closing a DMG installer.
+    func userRequestedShowUI() {
+        suppressFinderRedirectUntil = Date().addingTimeInterval(1.0)
+        pendingRedirectWorkItem?.cancel()
+        pendingRedirectWorkItem = nil
+        isRedirectingFinder = false
+        showFrontBrowserOrOpenDesktop()
+        bringUIToFront()
+        // Keep any open DMG installer above the browser if present.
+        dmgInstallWindows.last?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    @discardableResult
+    func openDiskImage(_ dmgURL: URL) -> Bool {
+        let standardized = dmgURL.standardizedFileURL
+        guard DMGInstallSupport.isDiskImage(standardized) else { return false }
+
+        if let existing = dmgInstallWindows.first(where: { $0.mountedSourceDMG == standardized }) {
+            existing.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return true
+        }
+
+        do {
+            let mounted = try DMGInstallSupport.attach(dmgURL: standardized)
+            beginLeavingFinderAlone()
+            presentDMGInstaller(mounted: mounted)
+            return true
+        } catch {
+            let alert = NSAlert(error: error)
+            alert.runModal()
+            return false
+        }
+    }
+
+    /// Show installer for an already-mounted volume (e.g. after Finder opened a DMG).
+    @discardableResult
+    func presentInstallerForMountedVolume(_ volumeURL: URL) -> Bool {
+        let volume = volumeURL.standardizedFileURL
+        guard DMGInstallSupport.looksLikeInstallerVolume(volume) else { return false }
+        if let existing = dmgInstallWindows.first(where: { $0.mountURL == volume }) {
+            existing.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return true
+        }
+
+        let mounted = DMGInstallSupport.MountedImage(
+            device: volume.path,
+            mountURL: volume,
+            sourceDMG: nil
+        )
+        beginLeavingFinderAlone()
+        presentDMGInstaller(mounted: mounted)
+        return true
+    }
+
+    private func presentDMGInstaller(mounted: DMGInstallSupport.MountedImage) {
+        let controller = DMGInstallWindowController(mounted: mounted)
+        dmgInstallWindows.append(controller)
+        suppressFinderRedirectUntil = Date().addingTimeInterval(1.5)
+        pendingRedirectWorkItem?.cancel()
+        isRedirectingFinder = false
+        controller.showWindow(nil)
+        NSApp.unhide(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        controller.window?.makeKeyAndOrderFront(nil)
+    }
+
+    func dmgInstallWindowDidClose(_ controller: DMGInstallWindowController) {
+        dmgInstallWindows.removeAll { $0 === controller }
     }
 
     /// Keep a background watch process so Dock-Finder still routes to NewFinder after Quit.
@@ -209,8 +282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         // Accessory apps sometimes report `flag == false` even with a visible window.
-        showFrontBrowserOrOpenDesktop()
-        bringUIToFront()
+        userRequestedShowUI()
         return true
     }
 
@@ -236,6 +308,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var directories: [URL] = []
         var files: [URL] = []
         for url in standardized {
+            if DMGInstallSupport.isDiskImage(url), !((try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true) {
+                _ = openDiskImage(url)
+                continue
+            }
             let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
             if values?.isPackage == true {
                 NSWorkspace.shared.open(url)
@@ -472,14 +548,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] note in
             self?.handleWorkspaceAppNote(note)
         }
+        // Opening a DMG mounts under /Volumes/ — stop stealing until the volume goes away.
+        center.addObserver(
+            forName: NSWorkspace.didMountNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let url = note.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL,
+                  FinderVolumeGuard.urlLooksLikeMountedVolume(url) else { return }
+            self?.beginLeavingFinderAlone()
+        }
+        center.addObserver(
+            forName: NSWorkspace.didUnmountNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            // Resume normal interception once nothing remains under /Volumes/.
+            if !FinderVolumeGuard.hasMountedVolumes() {
+                self.leaveFinderAloneUntil = nil
+            }
+        }
         updateFinderWindowPollTimer()
+    }
+
+    private func beginLeavingFinderAlone(for duration: TimeInterval = 600) {
+        let until = Date().addingTimeInterval(duration)
+        leaveFinderAloneUntil = until
+        suppressFinderRedirectUntil = until
+        pendingRedirectWorkItem?.cancel()
+        pendingRedirectWorkItem = nil
+        isRedirectingFinder = false
+    }
+
+    /// True while a DMG/installer session should not be stolen.
+    private func isLeavingFinderAloneForVolumes() -> Bool {
+        if let until = leaveFinderAloneUntil, Date() < until { return true }
+        return false
+    }
+
+    private func shouldSuppressRedirect() -> Bool {
+        if isLeavingFinderAloneForVolumes() { return false }
+        if let until = suppressFinderRedirectUntil, Date() < until { return true }
+        return false
     }
 
     private func handleWorkspaceAppNote(_ note: Notification) {
         guard AppSettings.shared.redirectFinderClicks else { return }
         guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
               app.bundleIdentifier == "com.apple.finder" else { return }
-        if let until = suppressFinderRedirectUntil, Date() < until { return }
+        if shouldSuppressRedirect() { return }
         // Tiny settle so selection exists; keep short to avoid visible lag.
         scheduleFinderRedirect(settle: 0.04)
     }
@@ -497,6 +615,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func scheduleFinderRedirect(settle: TimeInterval) {
         guard AppSettings.shared.redirectFinderClicks else { return }
+        if shouldSuppressRedirect() { return }
         pendingRedirectWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             self?.redirectFinderActivationToNewFinder()
@@ -512,8 +631,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func pollFinderWindowsIfNeeded() {
         guard AppSettings.shared.redirectFinderClicks else { return }
         guard !isRedirectingFinder else { return }
-        if let until = suppressFinderRedirectUntil, Date() < until { return }
-        // CGWindowList is much faster than AppleScript for detection.
+        if shouldSuppressRedirect() { return }
+        // Only when Finder is frontmost — a background DMG window must not yank focus from NF.
+        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.finder" else { return }
         guard finderLooksLikeItHasBrowserWindows() else { return }
         scheduleFinderRedirect(settle: 0)
     }
@@ -554,7 +674,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func redirectFinderActivationToNewFinder() {
         guard AppSettings.shared.redirectFinderClicks else { return }
         guard !isRedirectingFinder else { return }
-        if let until = suppressFinderRedirectUntil, Date() < until { return }
         if let last = lastFinderRedirectAt, Date().timeIntervalSince(last) < 0.8 {
             return
         }
@@ -562,41 +681,144 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let frontIsFinder = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.finder"
         guard frontIsFinder || finderLooksLikeItHasBrowserWindows() else { return }
 
+        // During a DMG session: probe without stealing. Stay on installer if still on /Volumes/.
+        if isLeavingFinderAloneForVolumes() {
+            let context = probeFinderContext()
+            if finderContextInvolvesMountedVolume(context) || finderHasVolumeWindow() {
+                return
+            }
+            // Finder moved to a normal folder — resume interception.
+            leaveFinderAloneUntil = nil
+        } else if let until = suppressFinderRedirectUntil, Date() < until {
+            return
+        }
+
         isRedirectingFinder = true
         lastFinderRedirectAt = Date()
         // Closing Finder / activating NF can re-fire Finder notifications — pause briefly.
         suppressFinderRedirectUntil = Date().addingTimeInterval(1.2)
 
-        // Switch focus first so the Finder flash is as short as possible.
+        // Switch focus first so the Finder flash is as short as possible (same as before).
         forceActivateNewFinder()
 
         let context = probeFinderContext()
-        closeFinderWindowsViaAppleScript()
-        applyFinderContext(context)
+        if finderContextInvolvesMountedVolume(context) || finderHasVolumeWindow() {
+            beginLeavingFinderAlone()
+            // Prefer NewFinder's installer UI over the fragile system Finder sheet.
+            if let volume = volumeURLForInstaller(from: context) {
+                _ = presentInstallerForMountedVolume(volume)
+                closeFinderWindowsPreservingVolumes()
+            } else {
+                reactivateFinder()
+            }
+            isRedirectingFinder = false
+            return
+        }
 
         if context.selectURLs.isEmpty && context.folderURL == nil {
-            // Selection may arrive a frame later (Chrome). One quick async retry only.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            // First DMG open: mount + installer often arrive after Finder activates.
+            // Do NOT close windows yet — wait and re-check for /Volumes/.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { [weak self] in
                 guard let self else { return }
+                defer { self.isRedirectingFinder = false }
+
                 let again = self.probeFinderContext()
-                if !again.selectURLs.isEmpty || again.folderURL != nil {
-                    self.closeFinderWindowsViaAppleScript()
-                    self.applyFinderContext(again)
-                    self.forceActivateNewFinder()
-                    self.suppressFinderRedirectUntil = Date().addingTimeInterval(1.2)
-                } else if self.finderLooksLikeItHasBrowserWindows() || self.finderHasOpenWindows() {
+                if self.finderContextInvolvesMountedVolume(again) || self.finderHasVolumeWindow() {
+                    self.beginLeavingFinderAlone()
+                    if let volume = self.volumeURLForInstaller(from: again) {
+                        _ = self.presentInstallerForMountedVolume(volume)
+                        self.closeFinderWindowsPreservingVolumes()
+                    } else {
+                        self.reactivateFinder()
+                    }
+                    return
+                }
+
+                self.closeFinderWindowsPreservingVolumes()
+                self.applyFinderContext(again)
+                self.forceActivateNewFinder()
+                if again.selectURLs.isEmpty && again.folderURL == nil,
+                   self.finderLooksLikeItHasBrowserWindows() || self.finderHasOpenWindows() {
                     self.noteFinderAutomationFailureIfNeeded()
                 }
-                self.isRedirectingFinder = false
             }
-        } else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-                self?.isRedirectingFinder = false
-            }
+            return
+        }
+
+        closeFinderWindowsPreservingVolumes()
+        applyFinderContext(context)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            self?.isRedirectingFinder = false
         }
     }
 
+    private func finderContextInvolvesMountedVolume(_ context: FinderContext) -> Bool {
+        if let folder = context.folderURL, FinderVolumeGuard.urlLooksLikeMountedVolume(folder) {
+            return true
+        }
+        return FinderVolumeGuard.urlsInvolveMountedVolume(context.selectURLs)
+    }
+
+    /// Finder window target under /Volumes/ (works even before FileManager lists the mount).
+    private func finderHasVolumeWindow() -> Bool {
+        let (raw, _) = runAppleScript(FinderVolumeGuard.listWindowTargetsScript)
+        return FinderVolumeGuard.windowTargetsInvolveMountedVolume(scriptResult: raw)
+    }
+
+    private func volumeURLForInstaller(from context: FinderContext) -> URL? {
+        let candidates = context.selectURLs.map { url -> URL in
+            FinderVolumeGuard.urlLooksLikeMountedVolume(url) ? url : url.deletingLastPathComponent()
+        } + [context.folderURL].compactMap { $0 }
+
+        for url in candidates {
+            var volume = url.standardizedFileURL
+            // Climb to /Volumes/Name
+            let parts = volume.pathComponents
+            if parts.count >= 3, parts[1] == "Volumes" {
+                volume = URL(fileURLWithPath: "/" + parts[1] + "/" + parts[2], isDirectory: true)
+            }
+            if DMGInstallSupport.looksLikeInstallerVolume(volume) {
+                return volume
+            }
+        }
+
+        // Fall back to any Finder window on /Volumes that looks like an installer.
+        let (raw, _) = runAppleScript(FinderVolumeGuard.listWindowTargetsScript)
+        let paths = (raw ?? "")
+            .split(separator: "\n")
+            .map(String.init)
+            .filter { !$0.isEmpty }
+        for path in paths where FinderVolumeGuard.pathLooksLikeMountedVolume(path) {
+            var volume = URL(fileURLWithPath: path, isDirectory: true)
+            let parts = volume.pathComponents
+            if parts.count >= 3, parts[1] == "Volumes" {
+                volume = URL(fileURLWithPath: "/" + parts[1] + "/" + parts[2], isDirectory: true)
+            }
+            if DMGInstallSupport.looksLikeInstallerVolume(volume) {
+                return volume
+            }
+        }
+        return nil
+    }
+
+    private func reactivateFinder() {
+        NSRunningApplication
+            .runningApplications(withBundleIdentifier: "com.apple.finder")
+            .first?
+            .activate(options: [.activateIgnoringOtherApps])
+    }
+
+    /// Close Finder windows except those on `/Volumes/` (DMG installers, USB, etc.).
+    /// Always filter by path — never `close every window` while a mount may still be appearing.
+    private func closeFinderWindowsPreservingVolumes() {
+        _ = runAppleScript(FinderVolumeGuard.closeNonVolumeWindowsScript)
+    }
+
     private func applyFinderContext(_ context: FinderContext) {
+        if finderContextInvolvesMountedVolume(context) {
+            reactivateFinder()
+            return
+        }
         if !context.selectURLs.isEmpty {
             reveal(context.selectURLs)
         } else if hasActiveBrowserWindow() {
@@ -759,6 +981,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         shortcutsMenu.addItem(withTitle: "剪切", action: #selector(BrowserWindowController.cut(_:)), keyEquivalent: "x")
         shortcutsMenu.addItem(withTitle: "拷贝", action: #selector(BrowserWindowController.copy(_:)), keyEquivalent: "c")
         shortcutsMenu.addItem(withTitle: "粘贴", action: #selector(BrowserWindowController.paste(_:)), keyEquivalent: "v")
+        shortcutsMenu.addItem(withTitle: "全选", action: #selector(BrowserWindowController.selectAllItems(_:)), keyEquivalent: "a")
         let upItem = shortcutsMenu.addItem(
             withTitle: "上层文件夹",
             action: #selector(BrowserWindowController.goEnclosingFolder(_:)),
@@ -854,12 +1077,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func showNewFinderFromMenu(_ sender: Any?) {
-        showFrontBrowserOrOpenDesktop()
-        bringUIToFront()
+        userRequestedShowUI()
     }
 
     @objc func focusBrowserWindowFromMenu(_ sender: NSMenuItem) {
         guard let controller = sender.representedObject as? BrowserWindowController else { return }
+        suppressFinderRedirectUntil = Date().addingTimeInterval(1.0)
         controller.window?.makeKeyAndOrderFront(nil)
         bringUIToFront()
     }
