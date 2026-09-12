@@ -32,13 +32,22 @@ struct FileItem: Hashable {
         let isPackage = values?.isPackage == true
         let name = url.lastPathComponent
         guard !name.isEmpty else { return nil }
+        let size: Int64?
+        if isDirectory && !isPackage {
+            size = nil
+        } else if isPackage {
+            // Package totals are filled asynchronously after listing (keeps /Applications fast).
+            size = nil
+        } else {
+            size = Int64(values?.fileSize ?? 0)
+        }
         return FileItem(
             url: url,
             name: name,
             isDirectory: isDirectory && !isPackage,
             isPackage: isPackage,
             isHidden: values?.isHidden == true || name.hasPrefix("."),
-            fileSize: (isDirectory && !isPackage) ? nil : Int64(values?.fileSize ?? 0),
+            fileSize: size,
             modificationDate: values?.contentModificationDate,
             creationDate: nil,
             archiveEntryPath: nil
@@ -62,16 +71,38 @@ struct FileItem: Hashable {
 
         let isDirectory = values?.isDirectory == true
         let isPackage = values?.isPackage == true
+        let size: Int64?
+        if isDirectory && !isPackage {
+            size = nil
+        } else if isPackage {
+            size = nil
+        } else {
+            size = Int64(values?.fileSize ?? 0)
+        }
         return FileItem(
             url: url,
             name: values?.localizedName ?? url.lastPathComponent,
             isDirectory: isDirectory && !isPackage,
             isPackage: isPackage,
             isHidden: values?.isHidden == true || url.lastPathComponent.hasPrefix("."),
-            fileSize: isDirectory ? nil : Int64(values?.fileSize ?? 0),
+            fileSize: size,
             modificationDate: values?.contentModificationDate,
             creationDate: values?.creationDate,
             archiveEntryPath: nil
+        )
+    }
+
+    func withFileSize(_ size: Int64?) -> FileItem {
+        FileItem(
+            url: url,
+            name: name,
+            isDirectory: isDirectory,
+            isPackage: isPackage,
+            isHidden: isHidden,
+            fileSize: size,
+            modificationDate: modificationDate,
+            creationDate: creationDate,
+            archiveEntryPath: archiveEntryPath
         )
     }
 
@@ -107,13 +138,46 @@ struct Bookmark: Codable, Identifiable, Equatable {
     var name: String
     var path: String
     var folder: String
+    /// Left sidebar and top bar keep completely separate bookmark sets.
+    var placement: FavoritesPlacement
 
-    init(id: UUID = UUID(), name: String, path: String, folder: String = "收藏") {
+    init(
+        id: UUID = UUID(),
+        name: String,
+        path: String,
+        folder: String = "收藏",
+        placement: FavoritesPlacement = .left
+    ) {
         self.id = id
         self.name = name
         self.path = path
         self.folder = folder
+        self.placement = placement
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, path, folder, placement
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        path = try container.decode(String.self, forKey: .path)
+        folder = try container.decodeIfPresent(String.self, forKey: .folder) ?? "收藏"
+        // Migrate legacy "both" → left; top copies are not auto-created.
+        let raw = try container.decodeIfPresent(String.self, forKey: .placement) ?? FavoritesPlacement.left.rawValue
+        if raw == "both" {
+            placement = .left
+        } else {
+            placement = FavoritesPlacement(rawValue: raw) ?? .left
+        }
+    }
+}
+
+enum FavoritesPlacement: String, Codable {
+    case left
+    case top
 }
 
 final class AppSettings {
@@ -127,11 +191,18 @@ final class AppSettings {
         static let toolbarNewItemTypes = "toolbarNewItemTypes"
         static let bookmarks = "bookmarks"
         static let bookmarkFolderOrder = "bookmarkFolderOrder"
+        static let topBookmarkFolderOrder = "topBookmarkFolderOrder"
+        static let favoritesSidebarWidth = "favoritesSidebarWidth"
+        static let favoritesSidebarVisible = "favoritesSidebarVisible"
+        static let favoritesTopBarVisible = "favoritesTopBarVisible"
         static let languageChinese = "languageChinese"
         static let redirectFinder = "redirectFinderClicks"
         static let launchAtLogin = "launchAtLogin"
         static let openWithDefaultHistory = "openWithDefaultHistory"
+        static let openWithAppHistory = "openWithAppHistory"
+        static let openWithAppHistoryByType = "openWithAppHistoryByType"
         static let uiZoomPercent = "uiZoomPercent"
+        static let recentOpenHistory = "recentOpenHistory"
     }
 
     /// Content zoom 30%…500%. Default 100. Adjusted via menu-bar slider.
@@ -240,7 +311,7 @@ final class AppSettings {
         }
     }
 
-    /// Types marked「展示在工具栏」, New-menu order (fixed first, then custom A–Z).
+    /// Types marked「单独展示」, New-menu order (fixed first, then custom A–Z).
     var toolbarNewItemTypes: [String] {
         let keys = toolbarNewItemTypeKeys
         return newItemTypes.filter { keys.contains($0.lowercased()) }
@@ -308,6 +379,93 @@ final class AppSettings {
         set { defaults.set(newValue, forKey: Keys.bookmarkFolderOrder) }
     }
 
+    /// Folder order for the top favorites bar only (independent from the left sidebar).
+    var topBookmarkFolderOrder: [String] {
+        get { defaults.stringArray(forKey: Keys.topBookmarkFolderOrder) ?? [] }
+        set { defaults.set(newValue, forKey: Keys.topBookmarkFolderOrder) }
+    }
+
+    func bookmarks(in placement: FavoritesPlacement) -> [Bookmark] {
+        bookmarks.filter { $0.placement == placement }
+    }
+
+    /// True when the bookmark sits on the bar itself (Chrome-style), not inside a folder.
+    static func isFavoritesBarFolder(_ raw: String) -> Bool {
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty || name == "收藏栏" || name == "收藏夹" || name == "收藏"
+    }
+
+    /// Bookmarks placed directly on the favorites bar (no folder).
+    func rootBookmarks(in placement: FavoritesPlacement) -> [Bookmark] {
+        bookmarks(in: placement).filter { Self.isFavoritesBarFolder($0.folder) }
+    }
+
+    /// Bookmarks inside a real named folder (not the bar).
+    func bookmarks(in folder: String, placement: FavoritesPlacement) -> [Bookmark] {
+        let target = folder.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !Self.isFavoritesBarFolder(target) else {
+            return rootBookmarks(in: placement)
+        }
+        return bookmarks(in: placement)
+            .filter {
+                let name = $0.folder.trimmingCharacters(in: .whitespacesAndNewlines)
+                return !Self.isFavoritesBarFolder(name) && name == target
+            }
+    }
+
+    /// Real folders only — never invents a「收藏栏」folder chip/group.
+    func orderedBookmarkFolders(for placement: FavoritesPlacement) -> [String] {
+        let order = placement == .top ? topBookmarkFolderOrder : bookmarkFolderOrder
+        let surfaceBookmarks = bookmarks(in: placement)
+        var result: [String] = []
+        var seen = Set<String>()
+
+        for folder in order {
+            let name = folder.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty, !Self.isFavoritesBarFolder(name), !seen.contains(name) else { continue }
+            result.append(name)
+            seen.insert(name)
+        }
+        for bookmark in surfaceBookmarks {
+            let name = bookmark.folder.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty, !Self.isFavoritesBarFolder(name), !seen.contains(name) else { continue }
+            result.append(name)
+            seen.insert(name)
+        }
+        return result
+    }
+
+    /// Left sidebar folders (backward-compatible name).
+    func orderedBookmarkFolders() -> [String] {
+        orderedBookmarkFolders(for: .left)
+    }
+
+    /// Left favorites sidebar width (points). Default 220; no hard min/max.
+    var favoritesSidebarWidth: CGFloat {
+        get {
+            let stored = defaults.object(forKey: Keys.favoritesSidebarWidth) as? Double
+            return max(0, CGFloat(stored ?? 220))
+        }
+        set { defaults.set(Double(max(0, newValue)), forKey: Keys.favoritesSidebarWidth) }
+    }
+
+    var favoritesSidebarVisible: Bool {
+        get {
+            if defaults.object(forKey: Keys.favoritesSidebarVisible) == nil { return true }
+            return defaults.bool(forKey: Keys.favoritesSidebarVisible)
+        }
+        set { defaults.set(newValue, forKey: Keys.favoritesSidebarVisible) }
+    }
+
+    /// Top favorites chip bar (independent from the left sidebar).
+    var favoritesTopBarVisible: Bool {
+        get {
+            if defaults.object(forKey: Keys.favoritesTopBarVisible) == nil { return true }
+            return defaults.bool(forKey: Keys.favoritesTopBarVisible)
+        }
+        set { defaults.set(newValue, forKey: Keys.favoritesTopBarVisible) }
+    }
+
     var preferChinese: Bool {
         get {
             if defaults.object(forKey: Keys.languageChinese) == nil { return true }
@@ -328,9 +486,99 @@ final class AppSettings {
         list.insert(key, at: 0)
         openWithDefaultHistory = list
     }
+
+    /// Apps recently used via「打开方式」(open or set-default). Newest first. Global fallback.
+    var openWithAppHistory: [String] {
+        get {
+            let stored = defaults.stringArray(forKey: Keys.openWithAppHistory) ?? []
+            if !stored.isEmpty { return stored }
+            return openWithDefaultHistory
+        }
+        set { defaults.set(Array(newValue.prefix(30)), forKey: Keys.openWithAppHistory) }
+    }
+
+    /// Per file-type open-with history: typeKey → [bundleID or path], newest first.
+    var openWithAppHistoryByType: [String: [String]] {
+        get {
+            guard let data = defaults.data(forKey: Keys.openWithAppHistoryByType),
+                  let dict = try? JSONDecoder().decode([String: [String]].self, from: data) else {
+                return [:]
+            }
+            return dict
+        }
+        set {
+            if let data = try? JSONEncoder().encode(newValue) {
+                defaults.set(data, forKey: Keys.openWithAppHistoryByType)
+            }
+        }
+    }
+
+    static func openWithTypeKey(for fileURL: URL) -> String {
+        let ext = fileURL.pathExtension.lowercased()
+        if !ext.isEmpty { return "ext.\(ext)" }
+        if let type = try? fileURL.resourceValues(forKeys: [.contentTypeKey]).contentType {
+            return "uti.\(type.identifier)"
+        }
+        return "unknown"
+    }
+
+    func openWithHistoryKeys(forFile fileURL: URL) -> [String] {
+        let typeKey = Self.openWithTypeKey(for: fileURL)
+        let typed = openWithAppHistoryByType[typeKey] ?? []
+        if !typed.isEmpty { return typed }
+        // Upgrade path: reuse global history until per-type entries exist.
+        return openWithAppHistory
+    }
+
+    func rememberOpenWithApp(bundleID: String, path: String, forFile fileURL: URL? = nil) {
+        let key = bundleID.isEmpty ? path : bundleID
+        guard !key.isEmpty else { return }
+
+        var global = openWithAppHistory.filter { $0 != key }
+        global.insert(key, at: 0)
+        openWithAppHistory = global
+
+        guard let fileURL else { return }
+        let typeKey = Self.openWithTypeKey(for: fileURL)
+        var byType = openWithAppHistoryByType
+        var list = (byType[typeKey] ?? []).filter { $0 != key }
+        list.insert(key, at: 0)
+        byType[typeKey] = Array(list.prefix(15))
+        openWithAppHistoryByType = byType
+    }
+
+    /// Global recent open history (folders + files), most-recent first. Persisted.
+    var recentOpenHistory: [VisitRecord] {
+        get {
+            guard let data = defaults.data(forKey: Keys.recentOpenHistory),
+                  let items = try? JSONDecoder().decode([VisitRecord].self, from: data) else {
+                return []
+            }
+            return items
+        }
+        set {
+            if let data = try? JSONEncoder().encode(Array(newValue.prefix(80))) {
+                defaults.set(data, forKey: Keys.recentOpenHistory)
+            }
+        }
+    }
+
+    func recordOpenHistory(_ url: URL) {
+        let standardized = url.standardizedFileURL
+        var list = recentOpenHistory.filter { $0.url.standardizedFileURL != standardized }
+        list.insert(VisitRecord(url: standardized, visitedAt: Date()), at: 0)
+        if list.count > 80 {
+            list = Array(list.prefix(80))
+        }
+        recentOpenHistory = list
+    }
+
+    func clearOpenHistory() {
+        recentOpenHistory = []
+    }
 }
 
-struct VisitRecord: Equatable {
+struct VisitRecord: Equatable, Codable {
     var url: URL
     var visitedAt: Date
 }
@@ -388,5 +636,6 @@ final class NavigationHistory {
         if recentVisits.count > maxRecent {
             recentVisits = Array(recentVisits.prefix(maxRecent))
         }
+        AppSettings.shared.recordOpenHistory(standardized)
     }
 }

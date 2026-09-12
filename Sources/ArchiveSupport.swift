@@ -190,11 +190,8 @@ enum ArchiveSupport {
             }
         }
 
-        return children.values.sorted { lhs, rhs in
-            if lhs.isDirectory != rhs.isDirectory {
-                return lhs.isDirectory && !rhs.isDirectory
-            }
-            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+        return children.values.sorted {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
         }
     }
 

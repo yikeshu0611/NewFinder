@@ -22,13 +22,9 @@ enum FileOperations {
             }
         }
 
-        // Folders first, then name (Finder-like). Done here so UI can skip a second full sort
-        // when the default name sort is active.
-        items.sort { lhs, rhs in
-            if lhs.isDirectory != rhs.isDirectory {
-                return lhs.isDirectory && !rhs.isDirectory
-            }
-            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+        // Name A–Z only — do not group folders ahead of files.
+        items.sort {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
         }
         return items
     }
@@ -244,6 +240,87 @@ enum FileOperations {
         }
     }
 
+    /// User Trash folder (`~/.Trash`) and volume trash folders (`/Volumes/…/.Trashes/<uid>`).
+    static func isTrashDirectory(_ url: URL) -> Bool {
+        let standardized = url.standardizedFileURL
+        let homeTrash = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".Trash", isDirectory: true)
+            .standardizedFileURL
+        if standardized.path == homeTrash.path { return true }
+
+        let parts = standardized.pathComponents
+        // "/", "Volumes", "Disk", ".Trashes", "501"
+        guard parts.count >= 5,
+              parts[1] == "Volumes",
+              parts[parts.count - 2] == ".Trashes" else {
+            return false
+        }
+        return true
+    }
+
+    static var userTrashDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".Trash", isDirectory: true)
+            .standardizedFileURL
+    }
+
+    static func isURLInTrash(_ url: URL) -> Bool {
+        isTrashDirectory(url.deletingLastPathComponent().standardizedFileURL)
+            || isTrashDirectory(url.standardizedFileURL)
+    }
+
+    /// `/Applications`, `~/Applications` (and similar) — uninstall-friendly listing.
+    static func isApplicationsDirectory(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        let homeApps = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Applications", isDirectory: true)
+            .standardizedFileURL.path
+        if path == "/Applications" || path == homeApps { return true }
+        // Localized display name folders still use these POSIX paths on disk.
+        return false
+    }
+
+    /// Permanently delete items (used inside Trash).
+    static func permanentlyDelete(_ urls: [URL]) throws {
+        for url in urls {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+
+    /// Empty a trash folder. Skips `.` / `..`; removes remaining entries.
+    static func emptyTrash(at trashURL: URL) throws {
+        guard isTrashDirectory(trashURL) else { return }
+        let urls = try FileManager.default.contentsOfDirectory(
+            at: trashURL,
+            includingPropertiesForKeys: nil,
+            options: []
+        )
+        for url in urls {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    /// Restore via Finder's Put Away (keeps original-location metadata).
+    static func putBackFromTrash(_ urls: [URL]) {
+        for url in urls {
+            let path = url.path
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            let source = """
+            tell application "Finder"
+              try
+                set theItem to (POSIX file "\(path)") as alias
+                put away theItem
+              end try
+            end tell
+            """
+            var error: NSDictionary?
+            if let script = NSAppleScript(source: source) {
+                _ = script.executeAndReturnError(&error)
+            }
+        }
+    }
+
     /// Grant owner write permission and clear Finder/user immutable flags.
     /// Directories are processed recursively.
     static func makeWritable(_ urls: [URL]) throws {
@@ -418,6 +495,55 @@ enum FileOperations {
         return ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
     }
 
+    /// Recursive on-disk size for packages (Finder-like). Call off the main thread.
+    static func directoryByteSize(at url: URL) -> Int64 {
+        var total: Int64 = 0
+        let keys: Set<URLResourceKey> = [
+            .isRegularFileKey,
+            .fileSizeKey,
+            .fileAllocatedSizeKey,
+            .totalFileAllocatedSizeKey
+        ]
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: Array(keys),
+            options: []
+        ) else {
+            return 0
+        }
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: keys),
+                  values.isRegularFile == true else { continue }
+            if let n = values.totalFileAllocatedSize
+                ?? values.fileAllocatedSize
+                ?? values.fileSize {
+                total += Int64(n)
+            }
+        }
+        return total
+    }
+
+    private static let packageSizeCacheQueue = DispatchQueue(label: "com.zhangjing.NewFinder.packageSizeCache")
+    private static var packageSizeCache: [String: (mod: TimeInterval, size: Int64)] = [:]
+
+    /// Cached package size; recomputes when modification date changes.
+    static func cachedPackageByteSize(at url: URL, modificationDate: Date?) -> Int64 {
+        let key = url.standardizedFileURL.path
+        let mod = modificationDate?.timeIntervalSince1970 ?? 0
+        if let hit = packageSizeCacheQueue.sync(execute: { packageSizeCache[key] }),
+           abs(hit.mod - mod) < 0.5 {
+            return hit.size
+        }
+        let size = directoryByteSize(at: url)
+        packageSizeCacheQueue.sync {
+            packageSizeCache[key] = (mod, size)
+            if packageSizeCache.count > 400 {
+                packageSizeCache.removeAll(keepingCapacity: true)
+            }
+        }
+        return size
+    }
+
     static func formatDate(_ date: Date?) -> String {
         guard let date else { return "--" }
         let formatter = DateFormatter()
@@ -469,24 +595,23 @@ enum FileOperations {
         var results: [URL] = []
         let fm = FileManager.default
         guard let enumerator = fm.enumerator(
-            at: root,
+            at: root.standardizedFileURL,
             includingPropertiesForKeys: [.isDirectoryKey, .isHiddenKey],
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) else { return [] }
 
         for case let fileURL as URL in enumerator {
-            let name = fileURL.lastPathComponent.lowercased()
-            let relative = fileURL.path
-                .replacingOccurrences(of: root.path, with: "")
-                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                .lowercased()
-            let haystack = relative.isEmpty ? name : relative
-            if keywords.allSatisfy({ haystack.contains($0) }) {
-                results.append(fileURL)
+            let standardized = fileURL.standardizedFileURL
+            let name = standardized.lastPathComponent.lowercased()
+            // Match file/folder name only — searching "2" should not list unrelated items.
+            if keywords.allSatisfy({ name.contains($0) }) {
+                results.append(standardized)
                 if results.count >= limit { break }
             }
         }
-        return results
+        return results.sorted {
+            $0.path.localizedStandardCompare($1.path) == .orderedAscending
+        }
     }
 
     static func mountedVolumes() -> [URL] {

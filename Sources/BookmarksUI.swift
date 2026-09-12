@@ -1,97 +1,135 @@
 import AppKit
 
-/// Folder chip on the toolbar (FinderPathBar-style); drag to reorder.
+/// Folder chip or direct bookmark link on the top favorites bar (Chrome-style).
 final class BookmarkFolderButton: NSButton {
     var folderName: String = ""
+    var bookmarkID: UUID?
+    var bookmarkPath: String = ""
     var onClick: (() -> Void)?
     var onRightClick: (() -> Void)?
     var onOrderChanged: (() -> Void)?
-
-    private var dragStartPoint: NSPoint?
-    private var isDragging = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         bezelStyle = .inline
         isBordered = false
         font = .systemFont(ofSize: 13)
-        contentTintColor = NSColor(calibratedWhite: 0.32, alpha: 1)
+        contentTintColor = .labelColor
         translatesAutoresizingMaskIntoConstraints = false
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        applyNormalTitleColor()
+    }
+
+    override var title: String {
+        get { super.title }
+        set {
+            super.title = newValue
+            applyNormalTitleColor()
+        }
+    }
+
+    private func applyNormalTitleColor() {
+        contentTintColor = .labelColor
+        let text = attributedTitle.string.isEmpty ? title : attributedTitle.string
+        guard !text.isEmpty else { return }
+        attributedTitle = NSAttributedString(string: text, attributes: [
+            .font: font ?? .systemFont(ofSize: 13),
+            .foregroundColor: NSColor.labelColor
+        ])
     }
 
     required init?(coder: NSCoder) {
         nil
     }
 
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     override func mouseDown(with event: NSEvent) {
-        dragStartPoint = convert(event.locationInWindow, from: nil)
-        isDragging = false
-    }
+        let startScreen = NSEvent.mouseLocation
+        var dragging = false
+        var pushedCursor = false
 
-    override func mouseDragged(with event: NSEvent) {
-        guard let start = dragStartPoint else { return }
-        let current = convert(event.locationInWindow, from: nil)
-        let distance = hypot(current.x - start.x, current.y - start.y)
+        while true {
+            guard let next = NSApp.nextEvent(
+                matching: [.leftMouseDragged, .leftMouseUp],
+                until: .distantFuture,
+                inMode: .eventTracking,
+                dequeue: true
+            ) else { break }
 
-        if !isDragging {
-            guard distance > 5 else { return }
-            isDragging = true
-            alphaValue = 0.65
-            NSCursor.closedHand.push()
-        }
+            let mouse = NSEvent.mouseLocation
 
-        guard let stack = superview as? NSStackView else { return }
-        let location = stack.convert(event.locationInWindow, from: nil)
-        let target = targetIndex(for: location.x, in: stack)
-        guard let currentIndex = stack.arrangedSubviews.firstIndex(of: self),
-              target != currentIndex else { return }
-        stack.insertArrangedSubview(self, at: target)
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        defer {
-            dragStartPoint = nil
-            isDragging = false
-            alphaValue = 1
-            if NSCursor.current == NSCursor.closedHand {
-                NSCursor.pop()
+            if next.type == .leftMouseUp {
+                if dragging {
+                    if pushedCursor { NSCursor.pop() }
+                    alphaValue = 1
+                    onOrderChanged?()
+                } else if isMouseInside(screenPoint: mouse) {
+                    onClick?()
+                }
+                break
             }
-        }
 
-        if isDragging {
-            onOrderChanged?()
-            return
-        }
+            let distance = hypot(mouse.x - startScreen.x, mouse.y - startScreen.y)
+            if !dragging {
+                guard distance > 4 else { continue }
+                dragging = true
+                alphaValue = 0.65
+                NSCursor.closedHand.push()
+                pushedCursor = true
+            }
 
-        let point = convert(event.locationInWindow, from: nil)
-        guard bounds.insetBy(dx: -2, dy: -2).contains(point) else { return }
-        onClick?()
+            guard let stack = superview as? NSStackView,
+                  let stackWindow = stack.window else { continue }
+            let pointInWindow = stackWindow.convertPoint(fromScreen: mouse)
+            let location = stack.convert(pointInWindow, from: nil)
+            let target = targetIndex(for: location.x, in: stack)
+            guard let currentIndex = stack.arrangedSubviews.firstIndex(of: self),
+                  target != currentIndex else { continue }
+            stack.insertArrangedSubview(self, at: target)
+            stack.layoutSubtreeIfNeeded()
+        }
     }
 
     override func rightMouseDown(with event: NSEvent) {
         onRightClick?()
     }
 
+    private func isMouseInside(screenPoint: NSPoint) -> Bool {
+        guard let window else { return false }
+        let pointInWindow = window.convertPoint(fromScreen: screenPoint)
+        let pointInView = convert(pointInWindow, from: nil)
+        return bounds.insetBy(dx: -2, dy: -2).contains(pointInView)
+    }
+
     private func targetIndex(for locationX: CGFloat, in stack: NSStackView) -> Int {
-        var target = 0
-        for view in stack.arrangedSubviews {
-            guard view !== self else { continue }
-            if locationX > view.frame.midX {
-                target += 1
+        let views = stack.arrangedSubviews
+        guard !views.isEmpty else { return 0 }
+        var best = 0
+        var bestDist = CGFloat.greatestFiniteMagnitude
+        for (index, view) in views.enumerated() {
+            let dist = abs(locationX - view.frame.midX)
+            if dist < bestDist {
+                bestDist = dist
+                best = index
             }
         }
-        return min(max(0, target), stack.arrangedSubviews.count - 1)
+        return best
     }
 }
 
-/// Menu row: left-click opens, right-click edits.
+/// Simple menu row for custom NSMenuItem views (e.g. New menu). Click opens.
 final class BookmarkMenuRowView: NSView {
     var onOpen: (() -> Void)?
     var onEdit: (() -> Void)?
+
     private let label: NSTextField
     private var trackingAreaRef: NSTrackingArea?
 
-    init(title: String, path: String, font: NSFont, width: CGFloat) {
+    init(title: String, path: String, font: NSFont, width: CGFloat, bookmarkID: UUID? = nil) {
         self.label = NSTextField(labelWithString: title)
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: 26))
         toolTip = path
@@ -103,16 +141,26 @@ final class BookmarkMenuRowView: NSView {
         label.alignment = .left
         label.lineBreakMode = .byTruncatingTail
         label.translatesAutoresizingMaskIntoConstraints = false
+        label.isEditable = false
+        label.isSelectable = false
+        label.refusesFirstResponder = true
+        label.isEnabled = false
         addSubview(label)
         NSLayoutConstraint.activate([
             label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            label.centerYAnchor.constraint(equalTo: centerYAnchor)
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            heightAnchor.constraint(equalToConstant: 26),
+            widthAnchor.constraint(equalToConstant: width)
         ])
     }
 
     required init?(coder: NSCoder) {
         nil
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        frame.contains(point) ? self : nil
     }
 
     override func updateTrackingAreas() {
@@ -131,8 +179,8 @@ final class BookmarkMenuRowView: NSView {
     }
 
     override func mouseEntered(with event: NSEvent) {
-        layer?.backgroundColor = NSColor.selectedMenuItemColor.cgColor
-        label.textColor = .selectedMenuItemTextColor
+        layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+        label.textColor = .white
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -140,7 +188,9 @@ final class BookmarkMenuRowView: NSView {
         label.textColor = .labelColor
     }
 
-    override func mouseDown(with event: NSEvent) {}
+    override func mouseDown(with event: NSEvent) {
+        // Defer open to mouseUp so the same down doesn't select while the menu is still settling.
+    }
 
     override func mouseUp(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)

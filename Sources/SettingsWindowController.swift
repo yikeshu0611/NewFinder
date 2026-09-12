@@ -21,7 +21,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     private init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 520),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 540),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -60,12 +60,37 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private func configure() {
         guard let content = window?.contentView else { return }
 
+        let tabView = NSTabView()
+        tabView.translatesAutoresizingMaskIntoConstraints = false
+        tabView.tabViewType = .topTabsBezelBorder
+        content.addSubview(tabView)
+
+        let generalItem = NSTabViewItem(identifier: "general")
+        generalItem.label = "常规"
+        generalItem.view = makeGeneralTab()
+        tabView.addTabViewItem(generalItem)
+
+        let shortcutsItem = NSTabViewItem(identifier: "shortcuts")
+        shortcutsItem.label = "快捷键"
+        shortcutsItem.view = makeShortcutsTab()
+        tabView.addTabViewItem(shortcutsItem)
+
+        NSLayoutConstraint.activate([
+            tabView.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            tabView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            tabView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            tabView.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12)
+        ])
+    }
+
+    private func makeGeneralTab() -> NSView {
+        let container = NSView()
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(stack)
+        container.addSubview(stack)
 
         let title = NSTextField(labelWithString: "常规")
         title.font = .boldSystemFont(ofSize: 13)
@@ -105,7 +130,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         updateStatusLabel = NSTextField(wrappingLabelWithString: "")
         updateStatusLabel.textColor = .secondaryLabelColor
         updateStatusLabel.font = .systemFont(ofSize: 11)
-        updateStatusLabel.preferredMaxLayoutWidth = 520
+        updateStatusLabel.preferredMaxLayoutWidth = 500
         updateStatusLabel.isHidden = true
         stack.addArrangedSubview(updateStatusLabel)
 
@@ -113,10 +138,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         newTitle.font = .boldSystemFont(ofSize: 13)
         stack.addArrangedSubview(newTitle)
 
-        let newHint = NSTextField(wrappingLabelWithString: "文件夹 / txt / docx / pptx / xlsx 名称不可改。勾选「展示在工具栏」后会出现在 New 右侧；删除后可用「添加类型」恢复。")
+        let newHint = NSTextField(wrappingLabelWithString: "文件夹 / txt / docx / pptx / xlsx 名称不可改。勾选「单独展示」后会出现在 New 左侧；删除后可用「添加类型」恢复。")
         newHint.font = .systemFont(ofSize: 11)
         newHint.textColor = .secondaryLabelColor
-        newHint.preferredMaxLayoutWidth = 520
+        newHint.preferredMaxLayoutWidth = 500
         stack.addArrangedSubview(newHint)
 
         typeRowsStack = NSStackView()
@@ -132,11 +157,112 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         stack.addArrangedSubview(addTypeButton)
 
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 16),
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
             typeRowsStack.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
+        return container
+    }
+
+    private func makeShortcutsTab() -> NSView {
+        let container = NSView()
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 14
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(stack)
+
+        let title = NSTextField(labelWithString: "文件操作快捷键")
+        title.font = .boldSystemFont(ofSize: 13)
+        stack.addArrangedSubview(title)
+
+        let hint = NSTextField(wrappingLabelWithString: "以下操作已从工具栏移除，请使用快捷键完成。先选中文件或文件夹，再按下对应按键。")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        hint.preferredMaxLayoutWidth = 500
+        stack.addArrangedSubview(hint)
+
+        let rows: [(String, String, String)] = [
+            ("重命名", "F2", "编辑选中项的名称"),
+            ("拷贝", "⌘C", "复制选中项到剪贴板"),
+            ("剪切", "⌘X", "剪切选中项（粘贴后移动）"),
+            ("粘贴", "⌘V", "粘贴到当前文件夹或展开中的文件夹"),
+            ("移到废纸篓", "Delete 或 ⌘⌫", "删除选中项")
+        ]
+
+        let list = NSStackView()
+        list.orientation = .vertical
+        list.alignment = .leading
+        list.spacing = 0
+        list.translatesAutoresizingMaskIntoConstraints = false
+        list.wantsLayer = true
+        list.layer?.cornerRadius = 8
+        list.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+
+        for (index, entry) in rows.enumerated() {
+            list.addArrangedSubview(makeShortcutRow(name: entry.0, keys: entry.1, detail: entry.2))
+            if index < rows.count - 1 {
+                let divider = NSBox()
+                divider.boxType = .separator
+                divider.translatesAutoresizingMaskIntoConstraints = false
+                list.addArrangedSubview(divider)
+                divider.widthAnchor.constraint(equalTo: list.widthAnchor).isActive = true
+            }
+        }
+        stack.addArrangedSubview(list)
+
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 16),
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            list.widthAnchor.constraint(equalTo: stack.widthAnchor)
+        ])
+        return container
+    }
+
+    private func makeShortcutRow(name: String, keys: String, detail: String) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        let nameLabel = NSTextField(labelWithString: name)
+        nameLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        nameLabel.translatesAutoresizingMaskIntoConstraints = false
+        nameLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        let detailLabel = NSTextField(labelWithString: detail)
+        detailLabel.font = .systemFont(ofSize: 12)
+        detailLabel.textColor = .secondaryLabelColor
+        detailLabel.translatesAutoresizingMaskIntoConstraints = false
+        detailLabel.lineBreakMode = .byTruncatingTail
+        detailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let keyLabel = NSTextField(labelWithString: keys)
+        keyLabel.font = .monospacedSystemFont(ofSize: 13, weight: .semibold)
+        keyLabel.textColor = .labelColor
+        keyLabel.alignment = .right
+        keyLabel.translatesAutoresizingMaskIntoConstraints = false
+        keyLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addSubview(nameLabel)
+        row.addSubview(detailLabel)
+        row.addSubview(keyLabel)
+
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 40),
+
+            nameLabel.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 14),
+            nameLabel.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+
+            detailLabel.leadingAnchor.constraint(equalTo: nameLabel.trailingAnchor, constant: 8),
+            detailLabel.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            detailLabel.trailingAnchor.constraint(lessThanOrEqualTo: keyLabel.leadingAnchor, constant: -12),
+
+            keyLabel.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -14),
+            keyLabel.centerYAnchor.constraint(equalTo: row.centerYAnchor)
+        ])
+        return row
     }
 
     private func reloadValues() {
@@ -263,7 +389,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         field.widthAnchor.constraint(equalToConstant: 100).isActive = true
 
         let toolbarCheck = NSButton(
-            checkboxWithTitle: "展示在工具栏",
+            checkboxWithTitle: "单独展示",
             target: self,
             action: #selector(typesChanged)
         )

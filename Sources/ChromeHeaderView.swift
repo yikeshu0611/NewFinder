@@ -8,8 +8,13 @@ final class BrowserTab {
     var archiveURL: URL?
     /// Path inside the archive ("" = root). Use `/` separators, no leading slash.
     var archiveInternalPath: String = ""
+    /// Virtual tab hosting the in-app Activity Monitor.
+    var isActivityMonitorTab = false
+    /// Virtual tab hosting the temperature monitor.
+    var isTemperatureTab = false
 
     var isArchiveTab: Bool { archiveURL != nil }
+    var isSpecialContentTab: Bool { isActivityMonitorTab || isTemperatureTab }
 
     init(directory: URL) {
         self.directory = directory.standardizedFileURL
@@ -23,9 +28,32 @@ final class BrowserTab {
         history.navigate(to: archive.standardizedFileURL)
     }
 
+    init(activityMonitor: Void) {
+        isActivityMonitorTab = true
+        // Sentinel path — never listed; excluded from directory-tab matching.
+        directory = URL(fileURLWithPath: "/NewFinder/ActivityMonitor", isDirectory: true)
+    }
+
+    init(temperature: Void) {
+        isTemperatureTab = true
+        directory = URL(fileURLWithPath: "/NewFinder/Temperature", isDirectory: true)
+    }
+
     var title: String {
+        if isActivityMonitorTab {
+            return "活动监视器"
+        }
+        if isTemperatureTab {
+            return "温度"
+        }
         if let archiveURL {
             return archiveURL.lastPathComponent
+        }
+        if FileOperations.isTrashDirectory(directory) {
+            return "废纸篓"
+        }
+        if FileOperations.isApplicationsDirectory(directory) {
+            return "应用程序"
         }
         if directory.path == "/" { return "Macintosh HD" }
         let name = directory.lastPathComponent
@@ -33,7 +61,7 @@ final class BrowserTab {
     }
 }
 
-/// Chrome-like header: tab strip on top, tools below.
+/// Chrome-like header: tab strip.
 enum TabInsertSide {
     case left, right
 }
@@ -49,52 +77,17 @@ final class ChromeHeaderView: NSView {
     var onNewTabRelative: ((UUID, TabInsertSide) -> Void)?
     var onCloseTabsRelative: ((UUID, TabCloseScope) -> Void)?
     var onDetachTab: ((UUID, NSPoint, Bool) -> Void)?
+    /// Double-click empty titlebar / tab-strip chrome → maximize / restore.
+    var onDoubleClickEmptyArea: (() -> Void)?
 
     private let tabRow = NSView()
     private let tabStrip = TabStripView()
-    private let toolClip = NSView()
-    private let toolRow = NSStackView()
+    private let trailingToolsHost = NSView()
     private var searchField: NSSearchField!
     private var searchWidthConstraint: NSLayoutConstraint?
-    private weak var showHiddenButton: NSButton?
-    private let bookmarkFolderStack = NSStackView()
     private weak var actionTarget: AnyObject?
-    private var fileActionButtons: [FileActionKind: NSButton] = [:]
-    private var fileActionFlashTokens: [FileActionKind: Int] = [:]
-
-    enum FileActionKind: Hashable {
-        case rename, copy, cut, paste, trash
-
-        var symbol: String {
-            switch self {
-            case .rename: return "pencil"
-            case .copy: return "doc.on.doc"
-            case .cut: return "scissors"
-            case .paste: return "clipboard"
-            case .trash: return "trash"
-            }
-        }
-
-        var tip: String {
-            switch self {
-            case .rename: return "重命名 (F2)"
-            case .copy: return "拷贝"
-            case .cut: return "剪切"
-            case .paste: return "粘贴"
-            case .trash: return "移到废纸篓"
-            }
-        }
-
-        var doneTip: String {
-            switch self {
-            case .rename: return "已重命名"
-            case .copy: return "已拷贝"
-            case .cut: return "已剪切"
-            case .paste: return "已粘贴"
-            case .trash: return "已移到废纸篓"
-            }
-        }
-    }
+    private weak var externalNewToolsStack: NSStackView?
+    private var tabStripTrailingToToolsConstraint: NSLayoutConstraint!
 
     private(set) var tabs: [BrowserTab] = []
     private(set) var activeTabID: UUID?
@@ -117,22 +110,47 @@ final class ChromeHeaderView: NSView {
         rebuildTabs()
     }
 
+    override func mouseDown(with event: NSEvent) {
+        // Clicks that land on empty header chrome (not tabs / tools) toggle fill-screen.
+        if event.clickCount == 2 {
+            onDoubleClickEmptyArea?()
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
     private func updateAppearance() {
         let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        layer?.backgroundColor = (dark
+        let chrome = dark
             ? NSColor(calibratedWhite: 0.18, alpha: 1)
-            : NSColor(calibratedWhite: 0.82, alpha: 1)).cgColor
-        toolClip.layer?.backgroundColor = (dark
-            ? NSColor(calibratedWhite: 0.22, alpha: 1)
-            : NSColor(calibratedWhite: 0.94, alpha: 1)).cgColor
-        tabRow.layer?.backgroundColor = (dark
-            ? NSColor(calibratedWhite: 0.15, alpha: 1)
-            : NSColor(calibratedWhite: 0.78, alpha: 1)).cgColor
+            : NSColor(calibratedWhite: 0.82, alpha: 1)
+        layer?.backgroundColor = chrome.cgColor
+        tabRow.layer?.backgroundColor = chrome.cgColor
     }
 
     func bind(target: AnyObject) {
         actionTarget = target
         rebuildTools()
+    }
+
+    /// Host New / toolbar-type buttons in an external stack (titlebar trailing cluster).
+    func attachNewTools(to stack: NSStackView) {
+        externalNewToolsStack = stack
+        rebuildTools()
+    }
+
+    /// Places show-hidden + New near the trailing close button.
+    func attachLeadingTools(_ tools: NSView) {
+        trailingToolsHost.subviews.forEach { $0.removeFromSuperview() }
+        tools.removeFromSuperview()
+        tools.translatesAutoresizingMaskIntoConstraints = false
+        trailingToolsHost.addSubview(tools)
+        NSLayoutConstraint.activate([
+            tools.leadingAnchor.constraint(equalTo: trailingToolsHost.leadingAnchor),
+            tools.trailingAnchor.constraint(equalTo: trailingToolsHost.trailingAnchor),
+            tools.centerYAnchor.constraint(equalTo: trailingToolsHost.centerYAnchor),
+            tools.heightAnchor.constraint(equalToConstant: 24)
+        ])
     }
 
     func setTabs(_ tabs: [BrowserTab], activeID: UUID?) {
@@ -145,37 +163,6 @@ final class ChromeHeaderView: NSView {
         rebuildTools(types: types)
     }
 
-    func syncShowHiddenFilesButton(_ showHidden: Bool) {
-        guard let button = showHiddenButton else { return }
-        let symbol = showHidden ? "eye" : "eye.slash"
-        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: showHidden ? "隐藏隐藏项" : "显示隐藏项")
-        button.image?.isTemplate = true
-        button.contentTintColor = showHidden ? .controlAccentColor : .labelColor
-        button.toolTip = showHidden ? "隐藏隐藏项 (⌘.)" : "显示隐藏项 (⌘.)"
-    }
-
-    /// Brief green checkmark on a toolbar file-action button (same as path-bar copy feedback).
-    func flashFileActionSuccess(_ kind: FileActionKind) {
-        guard let button = fileActionButtons[kind] else { return }
-        let token = (fileActionFlashTokens[kind] ?? 0) + 1
-        fileActionFlashTokens[kind] = token
-        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
-        button.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: kind.doneTip)?
-            .withSymbolConfiguration(config)
-        button.image?.isTemplate = true
-        button.contentTintColor = .systemGreen
-        button.toolTip = kind.doneTip
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self, weak button] in
-            guard let self, let button, self.fileActionFlashTokens[kind] == token else { return }
-            button.image = NSImage(systemSymbolName: kind.symbol, accessibilityDescription: kind.tip)?
-                .withSymbolConfiguration(config)
-            button.image?.isTemplate = true
-            button.contentTintColor = .labelColor
-            button.toolTip = kind.tip
-        }
-    }
-
     var searchFieldView: NSSearchField { searchField }
 
     private func configure() {
@@ -186,6 +173,7 @@ final class ChromeHeaderView: NSView {
         tabStrip.onSelectTab = { [weak self] id in self?.onSelectTab?(id) }
         tabStrip.onCloseTab = { [weak self] id in self?.onCloseTab?(id) }
         tabStrip.onNewTab = { [weak self] in self?.onNewTab?() }
+        tabStrip.onDoubleClickEmptyArea = { [weak self] in self?.onDoubleClickEmptyArea?() }
         tabStrip.onDetachTab = { [weak self] id, screenPoint, sideBySide in
             self?.onDetachTab?(id, screenPoint, sideBySide)
         }
@@ -201,48 +189,35 @@ final class ChromeHeaderView: NSView {
             }
         }
 
-        toolClip.translatesAutoresizingMaskIntoConstraints = false
-        toolClip.wantsLayer = true
-        toolClip.clipsToBounds = true
-        // Do not let the toolbar's intrinsic width force the window wider.
-        toolClip.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        toolClip.setContentHuggingPriority(.defaultLow, for: .horizontal)
-
-        toolRow.orientation = .horizontal
-        toolRow.spacing = 2
-        toolRow.alignment = .centerY
-        toolRow.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 10)
-        toolRow.translatesAutoresizingMaskIntoConstraints = false
-        toolRow.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        toolRow.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        trailingToolsHost.translatesAutoresizingMaskIntoConstraints = false
+        trailingToolsHost.setContentHuggingPriority(.required, for: .horizontal)
+        trailingToolsHost.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         addSubview(tabRow)
         tabRow.addSubview(tabStrip)
-        addSubview(toolClip)
-        toolClip.addSubview(toolRow)
+        tabRow.addSubview(trailingToolsHost)
+
+        tabStripTrailingToToolsConstraint = tabStrip.trailingAnchor.constraint(
+            equalTo: trailingToolsHost.leadingAnchor,
+            constant: -6
+        )
 
         NSLayoutConstraint.activate([
             tabRow.topAnchor.constraint(equalTo: topAnchor),
             tabRow.leadingAnchor.constraint(equalTo: leadingAnchor),
             tabRow.trailingAnchor.constraint(equalTo: trailingAnchor),
+            tabRow.bottomAnchor.constraint(equalTo: bottomAnchor),
             tabRow.heightAnchor.constraint(equalToConstant: 32),
 
-            // Tabs start after traffic lights; + sits right after the last tab (inside strip).
-            tabStrip.leadingAnchor.constraint(equalTo: tabRow.leadingAnchor, constant: 78),
-            tabStrip.trailingAnchor.constraint(equalTo: tabRow.trailingAnchor, constant: -10),
+            tabStrip.leadingAnchor.constraint(equalTo: tabRow.leadingAnchor, constant: 10),
             tabStrip.topAnchor.constraint(equalTo: tabRow.topAnchor, constant: 2),
             tabStrip.bottomAnchor.constraint(equalTo: tabRow.bottomAnchor),
+            tabStripTrailingToToolsConstraint,
 
-            toolClip.topAnchor.constraint(equalTo: tabRow.bottomAnchor),
-            toolClip.leadingAnchor.constraint(equalTo: leadingAnchor),
-            toolClip.trailingAnchor.constraint(equalTo: trailingAnchor),
-            toolClip.bottomAnchor.constraint(equalTo: bottomAnchor),
-            toolClip.heightAnchor.constraint(equalToConstant: 30),
-
-            // Leading-aligned only — overflow on the right is clipped so the window can shrink.
-            toolRow.leadingAnchor.constraint(equalTo: toolClip.leadingAnchor),
-            toolRow.topAnchor.constraint(equalTo: toolClip.topAnchor),
-            toolRow.bottomAnchor.constraint(equalTo: toolClip.bottomAnchor)
+            // Close button lives inside trailingToolsHost; only a small outer margin.
+            trailingToolsHost.trailingAnchor.constraint(equalTo: tabRow.trailingAnchor, constant: -10),
+            trailingToolsHost.centerYAnchor.constraint(equalTo: tabRow.centerYAnchor),
+            trailingToolsHost.heightAnchor.constraint(equalToConstant: 24)
         ])
 
         searchField = NSSearchField()
@@ -250,7 +225,7 @@ final class ChromeHeaderView: NSView {
         searchField.translatesAutoresizingMaskIntoConstraints = false
         searchField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         searchField.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let searchWidth = searchField.widthAnchor.constraint(equalToConstant: 160)
+        let searchWidth = searchField.widthAnchor.constraint(equalToConstant: 140)
         searchWidth.priority = .defaultHigh
         searchWidth.isActive = true
         searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 72).isActive = true
@@ -259,10 +234,18 @@ final class ChromeHeaderView: NSView {
 
     private func rebuildTabs() {
         let items: [TabStripView.Item] = tabs.map { tab in
-            TabStripView.Item(
+            let icon: NSImage?
+            if tab.isActivityMonitorTab {
+                icon = NSImage(systemSymbolName: "chart.bar.doc.horizontal", accessibilityDescription: nil)
+            } else if tab.isTemperatureTab {
+                icon = NSImage(systemSymbolName: "thermometer.medium", accessibilityDescription: nil)
+            } else {
+                icon = NSWorkspace.shared.icon(forFile: tab.directory.path)
+            }
+            return TabStripView.Item(
                 id: tab.id,
                 title: tab.title,
-                icon: NSWorkspace.shared.icon(forFile: tab.directory.path),
+                icon: icon,
                 isActive: tab.id == activeTabID,
                 canClose: tabs.count > 1
             )
@@ -271,65 +254,24 @@ final class ChromeHeaderView: NSView {
     }
 
     private func rebuildTools(types: [String]? = nil) {
+        guard let toolRow = externalNewToolsStack, let target = actionTarget else { return }
         toolRow.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        guard let target = actionTarget else { return }
 
-        toolRow.addArrangedSubview(iconButton("chevron.left", tip: "后退", action: #selector(BrowserWindowController.goBack(_:)), target: target))
-        toolRow.addArrangedSubview(iconButton("chevron.right", tip: "前进", action: #selector(BrowserWindowController.goForward(_:)), target: target))
-        toolRow.addArrangedSubview(iconButton("chevron.up", tip: "上层文件夹 (⌘↑)", action: #selector(BrowserWindowController.goEnclosingFolder(_:)), target: target))
-        toolRow.addArrangedSubview(separator())
-        toolRow.addArrangedSubview(makeNewMenuButton(types: types ?? AppSettings.shared.newItemTypes, target: target))
         for type in AppSettings.shared.toolbarNewItemTypes {
             toolRow.addArrangedSubview(makeToolbarNewTypeButton(type: type, target: target))
         }
-        bookmarkFolderStack.orientation = .horizontal
-        bookmarkFolderStack.spacing = 4
-        bookmarkFolderStack.alignment = .centerY
-        bookmarkFolderStack.setContentHuggingPriority(.defaultHigh, for: .horizontal)
-        bookmarkFolderStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        bookmarkFolderStack.setClippingResistancePriority(.defaultLow, for: .horizontal)
-        toolRow.addArrangedSubview(bookmarkFolderStack)
-        toolRow.addArrangedSubview(flexibleSpace())
-
-        let fileActionsRow = NSStackView()
-        fileActionsRow.orientation = .horizontal
-        fileActionsRow.spacing = 2
-        fileActionsRow.alignment = .centerY
-        fileActionsRow.translatesAutoresizingMaskIntoConstraints = false
-        fileActionsRow.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        fileActionsRow.setContentHuggingPriority(.required, for: .horizontal)
-        fileActionButtons.removeAll()
-        fileActionsRow.addArrangedSubview(
-            fileActionButton(.rename, action: #selector(BrowserWindowController.rename(_:)), target: target)
-        )
-        fileActionsRow.addArrangedSubview(
-            fileActionButton(.copy, action: #selector(BrowserWindowController.copy(_:)), target: target)
-        )
-        fileActionsRow.addArrangedSubview(
-            fileActionButton(.cut, action: #selector(BrowserWindowController.cut(_:)), target: target)
-        )
-        fileActionsRow.addArrangedSubview(
-            fileActionButton(.paste, action: #selector(BrowserWindowController.paste(_:)), target: target)
-        )
-        fileActionsRow.addArrangedSubview(
-            fileActionButton(.trash, action: #selector(BrowserWindowController.moveToTrash(_:)), target: target)
-        )
-        let hiddenBtn = iconButton("eye.slash", tip: "显示隐藏项 (⌘.)", action: #selector(BrowserWindowController.toggleHiddenFiles(_:)), target: target)
-        showHiddenButton = hiddenBtn
-        syncShowHiddenFilesButton(AppSettings.shared.showHiddenFiles)
-        fileActionsRow.addArrangedSubview(hiddenBtn)
-        toolRow.addArrangedSubview(fileActionsRow)
-        toolRow.addArrangedSubview(flexibleSpace())
+        toolRow.addArrangedSubview(makeNewMenuButton(types: types ?? AppSettings.shared.newItemTypes, target: target))
 
         searchField.target = target
         searchField.action = #selector(BrowserWindowController.searchChanged(_:))
-        toolRow.addArrangedSubview(searchField)
-        toolRow.addArrangedSubview(makeAppChromeMenuButton())
+        // Search lives on the path bar (after the bookmark star); history / gear sit in the titlebar.
     }
 
-    var bookmarkFoldersContainer: NSStackView { bookmarkFolderStack }
+    func makeChromeMenuButton() -> NSButton {
+        makeAppChromeMenuButton()
+    }
 
-    private func makeNewMenuButton(types: [String], target: AnyObject) -> NSButton {
+    func makeNewMenuButton(types: [String], target: AnyObject) -> NSButton {
         let button = NewMenuButton()
         button.bezelStyle = .inline
         button.isBordered = false
@@ -361,7 +303,7 @@ final class ChromeHeaderView: NSView {
         return button
     }
 
-    private func makeToolbarNewTypeButton(type: String, target: AnyObject) -> NSButton {
+    func makeToolbarNewTypeButton(type: String, target: AnyObject) -> NSButton {
         let button = ToolbarNewTypeButton()
         button.itemType = type
         let title = AppSettings.displayName(forNewItemType: type)
@@ -398,19 +340,13 @@ final class ChromeHeaderView: NSView {
             .withSymbolConfiguration(config)
         button.image?.isTemplate = true
         button.contentTintColor = .labelColor
-        button.toolTip = "菜单（显示 / 窗口 / 缩放 / 更新 / 设置）"
+        button.toolTip = "菜单（缩放 / 更新 / 设置 / 转到）"
         button.focusRingType = .none
         button.translatesAutoresizingMaskIntoConstraints = false
         button.setContentHuggingPriority(.required, for: .horizontal)
         button.setContentCompressionResistancePriority(.required, for: .horizontal)
         button.widthAnchor.constraint(equalToConstant: 20).isActive = true
         button.heightAnchor.constraint(equalToConstant: 20).isActive = true
-        return button
-    }
-
-    private func fileActionButton(_ kind: FileActionKind, action: Selector, target: AnyObject) -> NSButton {
-        let button = iconButton(kind.symbol, tip: kind.tip, action: action, target: target)
-        fileActionButtons[kind] = button
         return button
     }
 
@@ -445,17 +381,8 @@ final class ChromeHeaderView: NSView {
         return box
     }
 
-    private func flexibleSpace() -> NSView {
-        let view = NSView()
-        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        view.translatesAutoresizingMaskIntoConstraints = false
-        view.widthAnchor.constraint(greaterThanOrEqualToConstant: 8).isActive = true
-        return view
-    }
-
     override var intrinsicContentSize: NSSize {
-        NSSize(width: NSView.noIntrinsicMetric, height: 62)
+        NSSize(width: NSView.noIntrinsicMetric, height: 32)
     }
 }
 
@@ -474,6 +401,7 @@ final class TabStripView: NSView {
     var onCloseTab: ((UUID) -> Void)?
     var onNewTab: (() -> Void)?
     var onDetachTab: ((UUID, NSPoint, Bool) -> Void)?
+    var onDoubleClickEmptyArea: (() -> Void)?
     var onContextAction: ((UUID, TabContextAction) -> Void)?
 
     enum TabContextAction {
@@ -731,6 +659,11 @@ final class TabStripView: NSView {
             onSelectTab?(item.id)
             return
         }
+
+        // Empty chrome (between tabs / after +) — double-click toggles fill-screen.
+        if event.clickCount == 2 {
+            onDoubleClickEmptyArea?()
+        }
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -959,12 +892,12 @@ final class NewMenuButton: NSButton {
     }
 }
 
-/// Toolbar shortcut for a Settings「展示在工具栏」custom New type.
+/// Toolbar shortcut for a Settings「单独展示」custom New type.
 final class ToolbarNewTypeButton: NSButton {
     var itemType: String = ""
 }
 
-/// Toolbar gear: pops the former menu-bar chrome (显示 / 窗口 / 缩放 / 更新 / 设置).
+/// Toolbar gear: pops chrome menu (缩放 / 更新 / 设置).
 final class AppChromeMenuButton: NSButton {
     private var menuHelpers: [AnyObject] = []
 
@@ -982,7 +915,7 @@ final class AppChromeMenuButton: NSButton {
 
     private func showMenu() {
         let menu = NSMenu()
-        menuHelpers = AppDelegate.shared.populateChromeMenu(menu)
+        menuHelpers = AppDelegate.shared.populateChromeMenu(menu, includeShowAndWindows: false)
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: bounds.height + 4), in: self)
     }
 }

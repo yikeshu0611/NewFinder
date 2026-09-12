@@ -106,6 +106,11 @@ enum OpenWithCatalog {
 
         let bid = Bundle(url: appURL)?.bundleIdentifier
         let remember = {
+            AppSettings.shared.rememberOpenWithApp(
+                bundleID: bid ?? "",
+                path: appURL.path,
+                forFile: primary
+            )
             AppSettings.shared.rememberOpenWithDefaultApp(
                 bundleID: bid ?? "",
                 path: appURL.path
@@ -143,53 +148,115 @@ enum OpenWithCatalog {
         completion?(nil)
     }
 
+    /// Resolve an installed app from a stored bundle id or path.
+    static func appInfo(forHistoryKey key: String) -> AppInfo? {
+        if key.hasPrefix("/") {
+            let url = URL(fileURLWithPath: key).standardizedFileURL
+            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+            return AppInfo(
+                url: url,
+                name: FileManager.default.displayName(atPath: url.path),
+                bundleIdentifier: Bundle(url: url)?.bundleIdentifier
+            )
+        }
+        let urls = NSWorkspace.shared.urlsForApplications(withBundleIdentifier: key)
+        guard let url = urls.first?.standardizedFileURL else { return nil }
+        return AppInfo(
+            url: url,
+            name: FileManager.default.displayName(atPath: url.path),
+            bundleIdentifier: key
+        )
+    }
+
+    /// Four-part「打开方式」list:
+    /// 1) current default app for this file
+    /// 2) apps that previously opened this file type
+    /// 3) system-recommended apps for this type (not every installed app)
+    /// 4) callers add action items (「其他…」)
     static func sectionedApps(for fileURL: URL) -> (
         currentDefault: AppInfo?,
         history: [AppInfo],
-        others: [AppInfo]
+        recommended: [AppInfo],
+        defaultURL: URL?
     ) {
-        let all = allInstalledApps()
-        let defaultURL = defaultApp(for: fileURL)
-        let current = all.first { $0.url.standardizedFileURL == defaultURL }
+        let defaultURL = defaultApp(for: fileURL)?.standardizedFileURL
+        // Type-capable apps only — never scan all installed applications.
+        let recommendedAll = dedupe(NSWorkspace.shared.urlsForApplications(toOpen: fileURL))
 
-        let historyKeys = Set(AppSettings.shared.openWithDefaultHistory)
-        let history = all
-            .filter { app in
-                guard app.url.standardizedFileURL != defaultURL else { return false }
-                if let bid = app.bundleIdentifier, historyKeys.contains(bid) { return true }
-                return historyKeys.contains(app.url.path)
+        let selfBundle = Bundle.main.bundleIdentifier
+        var seen = Set<String>()
+
+        // 1. Current default opener for this file / type.
+        var currentDefault: AppInfo?
+        if let defaultURL {
+            let info = AppInfo(
+                url: defaultURL,
+                name: FileManager.default.displayName(atPath: defaultURL.path),
+                bundleIdentifier: Bundle(url: defaultURL)?.bundleIdentifier
+            )
+            if info.bundleIdentifier != selfBundle {
+                currentDefault = info
+                seen.insert(info.identity)
             }
-            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        }
 
-        let used = Set(
-            ([current].compactMap { $0 } + history).map(\.identity)
-        )
-        let others = all
-            .filter { !used.contains($0.identity) }
-            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        // 2. History of apps used to open this file type (newest first).
+        var history: [AppInfo] = []
+        let typeKey = AppSettings.openWithTypeKey(for: fileURL)
+        let typedKeys = AppSettings.shared.openWithAppHistoryByType[typeKey] ?? []
+        let historyKeys: [String]
+        if !typedKeys.isEmpty {
+            historyKeys = typedKeys
+        } else {
+            // First-run fallback: global open-with history, but only apps that can open this type.
+            let canOpen = Set(recommendedAll.map(\.identity))
+            historyKeys = AppSettings.shared.openWithAppHistory.filter { key in
+                guard let info = appInfo(forHistoryKey: key) else { return false }
+                return canOpen.contains(info.identity)
+            }
+        }
+        for key in historyKeys {
+            guard let info = appInfo(forHistoryKey: key) else { continue }
+            if let bid = info.bundleIdentifier, bid == selfBundle { continue }
+            guard !seen.contains(info.identity) else { continue }
+            seen.insert(info.identity)
+            history.append(info)
+            if history.count >= 10 { break }
+        }
 
-        return (current, history, others)
+        // 3. Recommended apps for this type only (system list), excluding 1 & 2.
+        var recommended: [AppInfo] = []
+        for info in recommendedAll {
+            if let bid = info.bundleIdentifier, bid == selfBundle { continue }
+            guard !seen.contains(info.identity) else { continue }
+            seen.insert(info.identity)
+            recommended.append(info)
+            if recommended.count >= 12 { break }
+        }
+
+        return (currentDefault, history, recommended, defaultURL)
     }
 }
 
-// MARK: - Row view (icon + name + checkbox on the right)
+// MARK: - Row view (icon + name)
 
 final class OpenWithRowView: NSView {
     var appURL: URL!
     var onOpen: (() -> Void)?
-    var onSetDefault: (() -> Void)?
     private(set) var displayName: String = ""
 
     private let iconView = NSImageView()
     private let titleLabel = NSTextField(labelWithString: "")
-    private let checkbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+    private var tracking: NSTrackingArea?
+    private var isHovered = false
 
-    static let rowWidth: CGFloat = 300
+    static let rowWidth: CGFloat = 220
     static let rowHeight: CGFloat = 24
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+        layer?.cornerRadius = 4
 
         iconView.imageScaling = .scaleProportionallyDown
         iconView.translatesAutoresizingMaskIntoConstraints = false
@@ -198,16 +265,8 @@ final class OpenWithRowView: NSView {
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        checkbox.setButtonType(.switch)
-        checkbox.title = ""
-        checkbox.toolTip = "勾选：设为默认打开方式"
-        checkbox.target = self
-        checkbox.action = #selector(checkboxClicked)
-        checkbox.translatesAutoresizingMaskIntoConstraints = false
-
         addSubview(iconView)
         addSubview(titleLabel)
-        addSubview(checkbox)
 
         NSLayoutConstraint.activate([
             iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
@@ -215,12 +274,8 @@ final class OpenWithRowView: NSView {
             iconView.widthAnchor.constraint(equalToConstant: 16),
             iconView.heightAnchor.constraint(equalToConstant: 16),
 
-            checkbox.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            checkbox.centerYAnchor.constraint(equalTo: centerYAnchor),
-            checkbox.widthAnchor.constraint(equalToConstant: 18),
-
             titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
-            titleLabel.trailingAnchor.constraint(equalTo: checkbox.leadingAnchor, constant: -8),
+            titleLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor)
         ])
     }
@@ -230,29 +285,53 @@ final class OpenWithRowView: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func configure(name: String, icon: NSImage, isDefault: Bool) {
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking {
+            removeTrackingArea(tracking)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.activeInActiveApp, .mouseEnteredAndExited, .mouseMoved, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        setHovered(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        setHovered(false)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        if !isHovered { setHovered(true) }
+    }
+
+    private func setHovered(_ hovered: Bool) {
+        guard isHovered != hovered else { return }
+        isHovered = hovered
+        layer?.backgroundColor = hovered
+            ? NSColor.selectedContentBackgroundColor.cgColor
+            : NSColor.clear.cgColor
+        titleLabel.textColor = hovered ? .selectedMenuItemTextColor : .labelColor
+    }
+
+    func configure(name: String, icon: NSImage) {
         displayName = name
         titleLabel.stringValue = name
+        titleLabel.textColor = .labelColor
         let sized = icon.copy() as? NSImage ?? icon
         sized.size = NSSize(width: 16, height: 16)
         iconView.image = sized
-        checkbox.state = isDefault ? .on : .off
-    }
-
-    func setDefaultChecked(_ on: Bool) {
-        checkbox.state = on ? .on : .off
-    }
-
-    @objc private func checkboxClicked() {
-        checkbox.state = .on
-        onSetDefault?()
+        setHovered(false)
     }
 
     override func mouseUp(with event: NSEvent) {
-        let loc = convert(event.locationInWindow, from: nil)
-        if checkbox.frame.insetBy(dx: -4, dy: -4).contains(loc) {
-            return
-        }
         onOpen?()
         enclosingMenuItem?.menu?.cancelTracking()
     }

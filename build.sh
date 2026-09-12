@@ -37,6 +37,7 @@ SOURCES=(
   "$ROOT_DIR/Sources/WatchAgentMain.swift"
   "$ROOT_DIR/Sources/Models.swift"
   "$ROOT_DIR/Sources/FileOperations.swift"
+  "$ROOT_DIR/Sources/AppUninstallSupport.swift"
   "$ROOT_DIR/Sources/ArchiveEngine.swift"
   "$ROOT_DIR/Sources/ArchiveSupport.swift"
   "$ROOT_DIR/Sources/ArchiveDialogs.swift"
@@ -50,8 +51,12 @@ SOURCES=(
   "$ROOT_DIR/Sources/ChromeHeaderView.swift"
   "$ROOT_DIR/Sources/ContentViewController.swift"
   "$ROOT_DIR/Sources/SettingsWindowController.swift"
+  "$ROOT_DIR/Sources/ActivityMonitorViewController.swift"
+  "$ROOT_DIR/Sources/TemperatureSensorReader.swift"
+  "$ROOT_DIR/Sources/TemperatureViewController.swift"
   "$ROOT_DIR/Sources/UpdateChecker.swift"
   "$ROOT_DIR/Sources/BookmarksUI.swift"
+  "$ROOT_DIR/Sources/FavoritesSidebarViewController.swift"
 )
 
 swiftc \

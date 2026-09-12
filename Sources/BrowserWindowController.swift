@@ -15,14 +15,28 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
 
     private var chromeHeader: ChromeHeaderView!
     private var contentController: ContentViewController!
+    private var activityMonitorController: ActivityMonitorViewController!
+    private var temperatureController: TemperatureViewController!
+    private var statusBarView: NSView!
+    private var favoritesSidebar: FavoritesSidebarViewController!
+    private var mainSplitView: NSSplitView!
     private var pathBarContainer: NSView!
     private var pathField: NSTextField!
     private var breadcrumbClip: BreadcrumbClipView!
     private var breadcrumbStack: NSStackView!
     private var historyMenuButton: NSButton!
+    private var recentHistoryButton: NSButton!
+    private var backButton: NSButton!
+    private var forwardButton: NSButton!
+    private var upButton: NSButton!
+    private var titlebarLeadingStack: NSStackView!
+    private var titlebarNewToolsStack: NSStackView!
+    private var titlebarUtilityStack: NSStackView!
+    private var showHiddenButton: NSButton!
     private var copyPathButton: NSButton!
     private var copyPathFlashToken = 0
     private var pathBookmarkButton: NSButton!
+    private var pathTrailingStack: NSStackView!
     private var pathBarVisible = true
     private var statusLabel: NSTextField!
     private var autocompletePanel: NSPanel?
@@ -30,6 +44,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     private var autocompleteCandidates: [String] = []
     private var isEditingPath = false
     private var pathEditClickMonitor: Any?
+    private var favoritesKeyMonitor: Any?
     private var directoryWatcher: DispatchSourceFileSystemObject?
     private var watchedFD: Int32 = -1
     private var pendingSelectURLs: [URL] = []
@@ -37,15 +52,24 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     private var suppressDirectoryWatchUntil: Date?
     private var contentLoadGeneration = 0
     private var pendingReloadWorkItem: DispatchWorkItem?
+    private var packageSizeWorkItem: DispatchWorkItem?
     private var searchField: NSSearchField!
     private var pathBarTopConstraint: NSLayoutConstraint!
+    private var pathBarHeightConstraint: NSLayoutConstraint!
     private var bookmarkEditorPanel: NSPanel?
     private weak var bookmarkFolderField: NSTextField?
     private weak var bookmarkFolderPicker: NSPopUpButton?
     private weak var bookmarkNameField: NSTextField?
     private weak var bookmarkPathField: NSTextField?
+    private weak var bookmarkPlacementControl: NSSegmentedControl?
+    private var favoritesTopBar: NSView!
+    private var favoritesTopStack: NSStackView!
+    private var favoritesTopBarHeightConstraint: NSLayoutConstraint!
+    private var isApplyingFavoritesLayout = false
     private var editingBookmarkID: UUID?
+    private var editingBookmarkPlacement: FavoritesPlacement = .left
     private var editingBookmarkFolderName: String?
+    private var editingBookmarkFolderPlacement: FavoritesPlacement = .left
 
     private(set) var currentDirectory: URL {
         get { activeTab.directory }
@@ -61,13 +85,18 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     init(tabs: [BrowserTab], activeID: UUID, selectAfterLoad: [URL] = []) {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1100, height: 700),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.minSize = .zero
+        // Keep only close; embed it in the trailing titlebar tools (macOS traffic-light style).
+        window.standardWindowButton(.closeButton)?.isHidden = true
+        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        window.standardWindowButton(.zoomButton)?.isHidden = true
+        window.standardWindowButton(.documentIconButton)?.isHidden = true
         // Follow the user when Chrome / Finder reveal a file on another Space.
         window.collectionBehavior.insert(.moveToActiveSpace)
         window.center()
@@ -92,7 +121,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             name: SettingsWindowController.didChangeNotification,
             object: nil
         )
-        navigate(to: activeTab.directory, recordHistory: false)
+        if activeTab.isActivityMonitorTab {
+            showActivityMonitorTab()
+        } else if activeTab.isTemperatureTab {
+            showTemperatureTab()
+        } else if activeTab.isArchiveTab {
+            updatePathChrome()
+            reloadContents()
+        } else {
+            navigate(to: activeTab.directory, recordHistory: false)
+        }
         refreshTabBar()
     }
 
@@ -135,6 +173,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         chromeHeader.onDetachTab = { [weak self] id, screenPoint, sideBySide in
             self?.detachTabToNewWindow(id, screenPoint: screenPoint, sideBySide: sideBySide)
         }
+        chromeHeader.onDoubleClickEmptyArea = { [weak self] in
+            self?.toggleFillScreenFromTitlebar()
+        }
         searchField = chromeHeader.searchFieldView
 
         pathBarContainer = ClickablePathBarView()
@@ -162,6 +203,68 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         historyMenuButton.translatesAutoresizingMaskIntoConstraints = false
         historyMenuButton.focusRingType = .none
 
+        backButton = makePathBarNavButton(
+            symbol: "chevron.left",
+            tip: "后退",
+            action: #selector(goBack(_:))
+        )
+        forwardButton = makePathBarNavButton(
+            symbol: "chevron.right",
+            tip: "前进",
+            action: #selector(goForward(_:))
+        )
+        upButton = makePathBarNavButton(
+            symbol: "chevron.up",
+            tip: "上层文件夹 (⌘↑)",
+            action: #selector(goEnclosingFolder(_:))
+        )
+
+        titlebarUtilityStack = makeTitlebarUtilityStack()
+        titlebarNewToolsStack = NSStackView()
+        titlebarNewToolsStack.orientation = .horizontal
+        titlebarNewToolsStack.alignment = .centerY
+        titlebarNewToolsStack.spacing = 2
+        titlebarNewToolsStack.translatesAutoresizingMaskIntoConstraints = false
+        titlebarNewToolsStack.setContentHuggingPriority(.required, for: .horizontal)
+        titlebarNewToolsStack.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        recentHistoryButton = NSButton()
+        recentHistoryButton.bezelStyle = .inline
+        recentHistoryButton.isBordered = false
+        let historyConfig = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+        recentHistoryButton.image = NSImage(systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: "历史")?
+            .withSymbolConfiguration(historyConfig)
+        recentHistoryButton.image?.isTemplate = true
+        recentHistoryButton.contentTintColor = .labelColor
+        recentHistoryButton.toolTip = "最近打开的历史"
+        recentHistoryButton.target = self
+        recentHistoryButton.action = #selector(toggleHistoryPage(_:))
+        recentHistoryButton.translatesAutoresizingMaskIntoConstraints = false
+        recentHistoryButton.focusRingType = .none
+        recentHistoryButton.setContentHuggingPriority(.required, for: .horizontal)
+        recentHistoryButton.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        recentHistoryButton.heightAnchor.constraint(equalToConstant: 20).isActive = true
+
+        let chromeMenuButton = chromeHeader.makeChromeMenuButton()
+        let titlebarCloseButton = makeTitlebarCloseButton()
+
+        // Trailing titlebar cluster: New… · 隐藏 · 历史 · 设置 · 关闭
+        titlebarLeadingStack = NSStackView(views: [
+            titlebarNewToolsStack,
+            titlebarUtilityStack,
+            recentHistoryButton,
+            chromeMenuButton,
+            titlebarCloseButton
+        ])
+        titlebarLeadingStack.orientation = .horizontal
+        titlebarLeadingStack.alignment = .centerY
+        titlebarLeadingStack.spacing = 4
+        titlebarLeadingStack.translatesAutoresizingMaskIntoConstraints = false
+        titlebarLeadingStack.setContentHuggingPriority(.required, for: .horizontal)
+
+        // Populate New after bind(target:) already ran.
+        chromeHeader.attachNewTools(to: titlebarNewToolsStack)
+
         copyPathButton = NSButton()
         copyPathButton.bezelStyle = .inline
         copyPathButton.isBordered = false
@@ -185,6 +288,17 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         pathBookmarkButton.action = #selector(showBookmarkEditor(_:))
         pathBookmarkButton.translatesAutoresizingMaskIntoConstraints = false
         pathBookmarkButton.focusRingType = .none
+        pathBookmarkButton.setContentHuggingPriority(.required, for: .horizontal)
+        pathBookmarkButton.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        pathBookmarkButton.heightAnchor.constraint(equalToConstant: 22).isActive = true
+
+        pathTrailingStack = NSStackView(views: [pathBookmarkButton, searchField])
+        pathTrailingStack.orientation = .horizontal
+        pathTrailingStack.spacing = 6
+        pathTrailingStack.alignment = .centerY
+        pathTrailingStack.translatesAutoresizingMaskIntoConstraints = false
+        pathTrailingStack.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        pathTrailingStack.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
 
         breadcrumbStack = PassThroughStackView()
         breadcrumbStack.orientation = .horizontal
@@ -214,16 +328,24 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         pathField.translatesAutoresizingMaskIntoConstraints = false
         pathField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        pathBarContainer.addSubview(backButton)
+        pathBarContainer.addSubview(forwardButton)
+        pathBarContainer.addSubview(upButton)
         pathBarContainer.addSubview(copyPathButton)
         pathBarContainer.addSubview(historyMenuButton)
         pathBarContainer.addSubview(breadcrumbClip)
         pathBarContainer.addSubview(pathField)
-        pathBarContainer.addSubview(pathBookmarkButton)
+        pathBarContainer.addSubview(pathTrailingStack)
         pathBarContainer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         contentController = ContentViewController()
         contentController.onOpen = { [weak self] item in
-            self?.openItem(item)
+            guard let self else { return }
+            if self.contentController.isShowingHistory {
+                self.openHistoryURL(item.url)
+            } else {
+                self.openItem(item)
+            }
         }
         contentController.onSelectionChange = { [weak self] items in
             self?.updateStatus(selection: items)
@@ -243,6 +365,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         contentController.onGoEnclosingFolder = { [weak self] in
             self?.goEnclosingFolder(nil)
         }
+        contentController.onToggleFavoritesSidebar = { [weak self] in
+            self?.toggleFavoritesSidebar(nil)
+        }
+        contentController.onToggleFavoritesTopBar = { [weak self] in
+            self?.toggleFavoritesTopBar(nil)
+        }
+        contentController.onCopyPathRequest = { [weak self] in
+            self?.copyPath(nil)
+        }
         contentController.onCommitRename = { [weak self] item, newName in
             self?.commitRename(item, to: newName)
         }
@@ -259,7 +390,62 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         contentController.onPerformFileDrop = { [weak self] urls, destination, copying in
             self?.handleFileDrop(urls: urls, destination: destination, copying: copying)
         }
+        contentController.onClearSearch = { [weak self] in
+            self?.searchField.stringValue = ""
+            self?.contentController.setSearchResultsMode(query: nil, scopeName: "", resultCount: 0)
+            self?.reloadContents()
+        }
+        contentController.onClearOpenHistory = { [weak self] in
+            self?.clearRecentOpenHistory(nil)
+        }
+        contentController.onDismissHistoryPage = { [weak self] in
+            self?.closeHistoryPage()
+        }
+        contentController.onRevealInEnclosingFolder = { [weak self] url in
+            guard let self else { return }
+            let target = url.standardizedFileURL
+            self.suppressDirectoryWatchUntil = Date().addingTimeInterval(1.2)
+            self.pendingSelectURLs = [target]
+            self.navigate(to: target.deletingLastPathComponent())
+        }
+        contentController.onEmptyTrash = { [weak self] in
+            self?.emptyTrash(nil)
+        }
+        contentController.onPutBackFromTrash = { [weak self] in
+            self?.putBackFromTrash(nil)
+        }
+        contentController.onDeleteFromTrash = { [weak self] in
+            self?.deleteForeverFromTrash(nil)
+        }
+        contentController.onUninstallApps = { [weak self] in
+            self?.uninstallSelectedApps(nil)
+        }
         contentController.view.translatesAutoresizingMaskIntoConstraints = false
+
+        favoritesSidebar = FavoritesSidebarViewController()
+        favoritesSidebar.onOpenBookmark = { [weak self] bookmark in
+            self?.navigate(to: URL(fileURLWithPath: bookmark.path))
+        }
+        favoritesSidebar.onEditBookmark = { [weak self] bookmark in
+            self?.presentBookmarkEditor(for: bookmark, preferredPlacement: .left)
+        }
+        favoritesSidebar.onRemoveBookmark = { [weak self] bookmark in
+            self?.removeBookmark(id: bookmark.id)
+        }
+        favoritesSidebar.onRenameFolder = { [weak self] folder in
+            self?.showBookmarkFolderEditor(folder, placement: .left)
+        }
+        favoritesSidebar.onDeleteFolder = { [weak self] folder in
+            self?.deleteBookmarkFolder(folder, placement: .left)
+        }
+        favoritesSidebar.onAddCurrentToFolder = { [weak self] folder in
+            self?.addCurrentDirectoryToFolder(folder, placement: .left)
+        }
+        _ = favoritesSidebar.view
+        // Titlebar cluster is hosted on the window root (same row as the close button).
+
+        let rightColumn = NSView()
+        // NSSplitView manages child frames; keep autoresizing masks on.
 
         statusLabel = NSTextField(labelWithString: "")
         statusLabel.font = .systemFont(ofSize: 11)
@@ -271,26 +457,58 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         statusBar.wantsLayer = true
         statusBar.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
         statusBar.addSubview(statusLabel)
+        statusBarView = statusBar
 
-        root.addSubview(chromeHeader)
-        root.addSubview(pathBarContainer)
-        root.addSubview(contentController.view)
-        root.addSubview(statusBar)
+        // Right column: path + files + status (full-width chrome sits above the split).
+        pathBarContainer.translatesAutoresizingMaskIntoConstraints = false
+        rightColumn.addSubview(pathBarContainer)
+        rightColumn.addSubview(contentController.view)
 
-        pathBarTopConstraint = pathBarContainer.topAnchor.constraint(equalTo: chromeHeader.bottomAnchor)
+        activityMonitorController = ActivityMonitorViewController()
+        activityMonitorController.onSummaryChange = { [weak self] text in
+            self?.statusLabel.stringValue = text
+        }
+        let amView = activityMonitorController.view
+        amView.translatesAutoresizingMaskIntoConstraints = false
+        amView.isHidden = true
+        rightColumn.addSubview(amView)
+
+        temperatureController = TemperatureViewController()
+        temperatureController.onSummaryChange = { [weak self] text in
+            self?.statusLabel.stringValue = text
+        }
+        let tempView = temperatureController.view
+        tempView.translatesAutoresizingMaskIntoConstraints = false
+        tempView.isHidden = true
+        rightColumn.addSubview(tempView)
+
+        rightColumn.addSubview(statusBar)
+
+        pathBarTopConstraint = pathBarContainer.topAnchor.constraint(equalTo: rightColumn.topAnchor)
+        pathBarHeightConstraint = pathBarContainer.heightAnchor.constraint(equalToConstant: 29)
 
         NSLayoutConstraint.activate([
-            chromeHeader.topAnchor.constraint(equalTo: root.topAnchor),
-            chromeHeader.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            chromeHeader.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            chromeHeader.heightAnchor.constraint(equalToConstant: 62),
-
             pathBarTopConstraint,
-            pathBarContainer.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            pathBarContainer.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            pathBarContainer.heightAnchor.constraint(equalToConstant: 28),
+            pathBarContainer.leadingAnchor.constraint(equalTo: rightColumn.leadingAnchor),
+            pathBarContainer.trailingAnchor.constraint(equalTo: rightColumn.trailingAnchor),
+            pathBarHeightConstraint,
 
-            copyPathButton.leadingAnchor.constraint(equalTo: pathBarContainer.leadingAnchor, constant: 6),
+            backButton.leadingAnchor.constraint(equalTo: pathBarContainer.leadingAnchor, constant: 6),
+            backButton.centerYAnchor.constraint(equalTo: pathBarContainer.centerYAnchor),
+            backButton.widthAnchor.constraint(equalToConstant: 20),
+            backButton.heightAnchor.constraint(equalToConstant: 20),
+
+            forwardButton.leadingAnchor.constraint(equalTo: backButton.trailingAnchor, constant: 2),
+            forwardButton.centerYAnchor.constraint(equalTo: pathBarContainer.centerYAnchor),
+            forwardButton.widthAnchor.constraint(equalToConstant: 20),
+            forwardButton.heightAnchor.constraint(equalToConstant: 20),
+
+            upButton.leadingAnchor.constraint(equalTo: forwardButton.trailingAnchor, constant: 2),
+            upButton.centerYAnchor.constraint(equalTo: pathBarContainer.centerYAnchor),
+            upButton.widthAnchor.constraint(equalToConstant: 20),
+            upButton.heightAnchor.constraint(equalToConstant: 20),
+
+            copyPathButton.leadingAnchor.constraint(equalTo: upButton.trailingAnchor, constant: 6),
             copyPathButton.centerYAnchor.constraint(equalTo: pathBarContainer.centerYAnchor),
             copyPathButton.widthAnchor.constraint(equalToConstant: 22),
             copyPathButton.heightAnchor.constraint(equalToConstant: 22),
@@ -301,36 +519,110 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             historyMenuButton.heightAnchor.constraint(equalToConstant: 18),
 
             breadcrumbClip.leadingAnchor.constraint(equalTo: historyMenuButton.trailingAnchor, constant: 4),
-            breadcrumbClip.trailingAnchor.constraint(equalTo: pathBookmarkButton.leadingAnchor, constant: -8),
+            breadcrumbClip.trailingAnchor.constraint(equalTo: pathTrailingStack.leadingAnchor, constant: -8),
             breadcrumbClip.topAnchor.constraint(equalTo: pathBarContainer.topAnchor),
             breadcrumbClip.bottomAnchor.constraint(equalTo: pathBarContainer.bottomAnchor),
 
             pathField.leadingAnchor.constraint(equalTo: historyMenuButton.trailingAnchor, constant: 4),
-            pathField.trailingAnchor.constraint(equalTo: pathBookmarkButton.leadingAnchor, constant: -8),
+            pathField.trailingAnchor.constraint(equalTo: pathTrailingStack.leadingAnchor, constant: -8),
             pathField.centerYAnchor.constraint(equalTo: pathBarContainer.centerYAnchor),
             pathField.heightAnchor.constraint(equalToConstant: 22),
 
-            pathBookmarkButton.trailingAnchor.constraint(equalTo: pathBarContainer.trailingAnchor, constant: -8),
-            pathBookmarkButton.centerYAnchor.constraint(equalTo: pathBarContainer.centerYAnchor),
-            pathBookmarkButton.widthAnchor.constraint(equalToConstant: 22),
-            pathBookmarkButton.heightAnchor.constraint(equalToConstant: 22),
+            pathTrailingStack.trailingAnchor.constraint(equalTo: pathBarContainer.trailingAnchor, constant: -8),
+            pathTrailingStack.centerYAnchor.constraint(equalTo: pathBarContainer.centerYAnchor),
+            pathTrailingStack.heightAnchor.constraint(equalToConstant: 22),
 
             contentController.view.topAnchor.constraint(equalTo: pathBarContainer.bottomAnchor),
-            contentController.view.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            contentController.view.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            contentController.view.leadingAnchor.constraint(equalTo: rightColumn.leadingAnchor),
+            contentController.view.trailingAnchor.constraint(equalTo: rightColumn.trailingAnchor),
             contentController.view.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
 
-            statusBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            statusBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            statusBar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            amView.topAnchor.constraint(equalTo: pathBarContainer.bottomAnchor),
+            amView.leadingAnchor.constraint(equalTo: rightColumn.leadingAnchor),
+            amView.trailingAnchor.constraint(equalTo: rightColumn.trailingAnchor),
+            amView.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+
+            tempView.topAnchor.constraint(equalTo: pathBarContainer.bottomAnchor),
+            tempView.leadingAnchor.constraint(equalTo: rightColumn.leadingAnchor),
+            tempView.trailingAnchor.constraint(equalTo: rightColumn.trailingAnchor),
+            tempView.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+
+            statusBar.leadingAnchor.constraint(equalTo: rightColumn.leadingAnchor),
+            statusBar.trailingAnchor.constraint(equalTo: rightColumn.trailingAnchor),
+            statusBar.bottomAnchor.constraint(equalTo: rightColumn.bottomAnchor),
             statusBar.heightAnchor.constraint(equalToConstant: 22),
 
             statusLabel.leadingAnchor.constraint(equalTo: statusBar.leadingAnchor, constant: 12),
             statusLabel.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor)
         ])
 
+        mainSplitView = NSSplitView()
+        mainSplitView.isVertical = true
+        mainSplitView.dividerStyle = .thin
+        mainSplitView.translatesAutoresizingMaskIntoConstraints = false
+        mainSplitView.delegate = self
+        favoritesSidebar.view.frame = NSRect(x: 0, y: 0, width: settings.favoritesSidebarWidth, height: 700)
+        rightColumn.frame = NSRect(x: 0, y: 0, width: 900, height: 700)
+        mainSplitView.addSubview(favoritesSidebar.view)
+        mainSplitView.addSubview(rightColumn)
+        // Sidebar keeps its width; content column absorbs window resize.
+        mainSplitView.setHoldingPriority(NSLayoutConstraint.Priority(270), forSubviewAt: 0)
+        mainSplitView.setHoldingPriority(NSLayoutConstraint.Priority(249), forSubviewAt: 1)
+
+        chromeHeader.translatesAutoresizingMaskIntoConstraints = false
+        chromeHeader.attachNewTools(to: titlebarNewToolsStack)
+        chromeHeader.attachLeadingTools(titlebarLeadingStack)
+
+        favoritesTopBar = NSView()
+        favoritesTopBar.translatesAutoresizingMaskIntoConstraints = false
+        favoritesTopBar.wantsLayer = true
+        favoritesTopBar.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        favoritesTopBar.clipsToBounds = true
+
+        favoritesTopStack = NSStackView()
+        favoritesTopStack.orientation = .horizontal
+        favoritesTopStack.alignment = .centerY
+        favoritesTopStack.spacing = 8
+        favoritesTopStack.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 10)
+        favoritesTopStack.translatesAutoresizingMaskIntoConstraints = false
+        favoritesTopStack.setHuggingPriority(.required, for: .horizontal)
+        favoritesTopStack.setContentHuggingPriority(.required, for: .horizontal)
+        favoritesTopBar.addSubview(favoritesTopStack)
+
+        root.addSubview(chromeHeader)
+        root.addSubview(favoritesTopBar)
+        root.addSubview(mainSplitView)
+
+        favoritesTopBarHeightConstraint = favoritesTopBar.heightAnchor.constraint(equalToConstant: 0)
+
+        NSLayoutConstraint.activate([
+            chromeHeader.topAnchor.constraint(equalTo: root.topAnchor),
+            chromeHeader.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            chromeHeader.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            chromeHeader.heightAnchor.constraint(equalToConstant: 32),
+
+            favoritesTopBar.topAnchor.constraint(equalTo: chromeHeader.bottomAnchor),
+            favoritesTopBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            favoritesTopBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            favoritesTopBarHeightConstraint,
+
+            favoritesTopStack.leadingAnchor.constraint(equalTo: favoritesTopBar.leadingAnchor, constant: 8),
+            favoritesTopStack.trailingAnchor.constraint(lessThanOrEqualTo: favoritesTopBar.trailingAnchor, constant: -8),
+            favoritesTopStack.centerYAnchor.constraint(equalTo: favoritesTopBar.centerYAnchor),
+            favoritesTopStack.heightAnchor.constraint(equalTo: favoritesTopBar.heightAnchor),
+
+            mainSplitView.topAnchor.constraint(equalTo: favoritesTopBar.bottomAnchor),
+            mainSplitView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            mainSplitView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            mainSplitView.bottomAnchor.constraint(equalTo: root.bottomAnchor)
+        ])
+
         updatePathChrome()
         applyContentZoom(settings.uiZoomPercent)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.applyFavoritesLayout(animated: false)
+        }
         NotificationCenter.default.addObserver(
             forName: .uiZoomDidChange,
             object: nil,
@@ -339,6 +631,421 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             guard let self else { return }
             self.applyContentZoom(self.settings.uiZoomPercent)
         }
+        installFavoritesKeyMonitor()
+    }
+
+    /// Accessory apps don't reliably deliver hidden-menu key equivalents; handle ⌘O / ⌘⇧O directly.
+    private func installFavoritesKeyMonitor() {
+        if let favoritesKeyMonitor {
+            NSEvent.removeMonitor(favoritesKeyMonitor)
+            self.favoritesKeyMonitor = nil
+        }
+        favoritesKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.window?.isKeyWindow == true else { return event }
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let isO = event.keyCode == 31
+                || event.charactersIgnoringModifiers?.lowercased() == "o"
+            guard isO else { return event }
+            if flags == [.command, .shift] {
+                self.toggleFavoritesTopBar(nil)
+                return nil
+            }
+            if flags == .command {
+                self.toggleFavoritesSidebar(nil)
+                return nil
+            }
+            return event
+        }
+    }
+
+    private func applySidebarWidth(_ width: CGFloat) {
+        guard let split = mainSplitView else { return }
+        let total = split.bounds.width
+        guard total > 1 else { return }
+        let maxWidth = max(0, total - 120)
+        let clamped = min(maxWidth, max(0, width))
+        isApplyingFavoritesLayout = true
+        split.setPosition(clamped, ofDividerAt: 0)
+        isApplyingFavoritesLayout = false
+    }
+
+    private func applySidebarVisibility(animated: Bool) {
+        applyFavoritesLayout(animated: animated)
+    }
+
+    private func applyFavoritesLayout(animated: Bool) {
+        guard let split = mainSplitView else { return }
+        let showLeft = settings.favoritesSidebarVisible
+        let showTop = settings.favoritesTopBarVisible
+
+        let apply = {
+            self.isApplyingFavoritesLayout = true
+            defer { self.isApplyingFavoritesLayout = false }
+
+            self.favoritesSidebar.view.isHidden = !showLeft
+            if showLeft {
+                let width = max(0, self.settings.favoritesSidebarWidth)
+                let total = split.bounds.width
+                if total > 1 {
+                    let maxWidth = max(0, total - 120)
+                    let clamped = min(maxWidth, width)
+                    split.setPosition(clamped, ofDividerAt: 0)
+                }
+            } else {
+                split.setPosition(0, ofDividerAt: 0)
+            }
+
+            self.favoritesTopBar.isHidden = !showTop
+            self.favoritesTopBarHeightConstraint.constant = showTop ? 29 : 0
+            if showTop {
+                self.reloadFavoritesTopBar()
+            }
+
+            split.adjustSubviews()
+            self.window?.contentView?.layoutSubtreeIfNeeded()
+        }
+
+        if animated {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.15
+                ctx.allowsImplicitAnimation = true
+                apply()
+            }
+        } else {
+            apply()
+        }
+    }
+
+    @objc func toggleFavoritesSidebar(_ sender: Any?) {
+        let opening = !settings.favoritesSidebarVisible
+        settings.favoritesSidebarVisible.toggle()
+        if opening, settings.favoritesSidebarWidth < 10 {
+            settings.favoritesSidebarWidth = 100
+        }
+        applyFavoritesLayout(animated: true)
+    }
+
+    @objc func toggleFavoritesTopBar(_ sender: Any?) {
+        settings.favoritesTopBarVisible.toggle()
+        applyFavoritesLayout(animated: true)
+    }
+
+    private var titlebarCloseHost: NSView?
+    /// Frame before double-click maximize; restored on the next double-click.
+    private var frameBeforeFillScreen: NSRect?
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        restoreFavoritesSidebarWidthIfNeeded()
+        hideSystemTrafficLights()
+        (titlebarCloseHost as? MacStyleCloseButton)?.refreshAppearance()
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        hideSystemTrafficLights()
+        (titlebarCloseHost as? MacStyleCloseButton)?.refreshAppearance()
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        restoreFavoritesSidebarWidthIfNeeded()
+        hideSystemTrafficLights()
+        clearFillScreenMemoryIfManuallyResized()
+    }
+
+    func windowDidUpdate(_ notification: Notification) {
+        // AppKit periodically re-shows / repositions the native traffic lights.
+        hideSystemTrafficLights()
+    }
+
+    /// Keep native traffic lights invisible — we use a trailing Mac-style close instead.
+    private func hideSystemTrafficLights() {
+        guard let window else { return }
+        for type: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
+            guard let button = window.standardWindowButton(type) else { continue }
+            if !button.isHidden { button.isHidden = true }
+            if button.alphaValue != 0 { button.alphaValue = 0 }
+        }
+    }
+
+    /// Double-click empty titlebar chrome: fill the screen, or restore previous size.
+    private func toggleFillScreenFromTitlebar() {
+        guard let window else { return }
+        if window.styleMask.contains(.fullScreen) {
+            window.toggleFullScreen(nil)
+            return
+        }
+        if isFilledToScreen {
+            if let previous = frameBeforeFillScreen {
+                window.setFrame(previous, display: true, animate: true)
+            } else if let screen = window.screen {
+                var frame = window.frame
+                frame.size = NSSize(
+                    width: min(1100, screen.visibleFrame.width * 0.85),
+                    height: min(700, screen.visibleFrame.height * 0.85)
+                )
+                frame.origin.x = screen.visibleFrame.midX - frame.width / 2
+                frame.origin.y = screen.visibleFrame.midY - frame.height / 2
+                window.setFrame(frame, display: true, animate: true)
+            }
+            frameBeforeFillScreen = nil
+            return
+        }
+        guard let screen = window.screen ?? NSScreen.main else { return }
+        frameBeforeFillScreen = window.frame
+        window.setFrame(screen.visibleFrame, display: true, animate: true)
+    }
+
+    private var isFilledToScreen: Bool {
+        guard let window, let screen = window.screen else { return false }
+        let visible = screen.visibleFrame
+        let frame = window.frame
+        return abs(frame.minX - visible.minX) < 6
+            && abs(frame.minY - visible.minY) < 6
+            && abs(frame.width - visible.width) < 6
+            && abs(frame.height - visible.height) < 6
+    }
+
+    private func clearFillScreenMemoryIfManuallyResized() {
+        guard let previous = frameBeforeFillScreen,
+              let window,
+              let screen = window.screen,
+              !isFilledToScreen else { return }
+        let visible = screen.visibleFrame
+        let frame = window.frame
+        let nearPrevious = abs(frame.width - previous.width) < 8
+            && abs(frame.height - previous.height) < 8
+        let nearFill = abs(frame.width - visible.width) < 8
+            && abs(frame.height - visible.height) < 8
+        if !nearPrevious && !nearFill {
+            frameBeforeFillScreen = nil
+        }
+    }
+
+    /// Trailing Mac traffic-light close (custom — system button keeps jumping back to the leading titlebar).
+    private func makeTitlebarCloseButton() -> NSView {
+        let button = MacStyleCloseButton()
+        button.target = self
+        button.action = #selector(closeWindowFromTitlebar(_:))
+        button.toolTip = "关闭"
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.setContentHuggingPriority(.required, for: .horizontal)
+        button.setContentCompressionResistancePriority(.required, for: .horizontal)
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: 20),
+            button.heightAnchor.constraint(equalToConstant: 20)
+        ])
+        titlebarCloseHost = button
+        hideSystemTrafficLights()
+        return button
+    }
+
+    @objc private func closeWindowFromTitlebar(_ sender: Any?) {
+        guard let window else { return }
+        // performClose can no-op if AppKit thinks the (hidden) system close is disabled;
+        // close() always dismisses our accessory-style browser window.
+        window.close()
+    }
+
+    /// Keep the remembered sidebar width after layout / window resize.
+    private func restoreFavoritesSidebarWidthIfNeeded() {
+        guard !isApplyingFavoritesLayout else { return }
+        guard settings.favoritesSidebarVisible,
+              favoritesSidebar?.view.isHidden == false,
+              let split = mainSplitView,
+              split.bounds.width > 1,
+              let current = split.subviews.first?.bounds.width else { return }
+        let target = max(0, settings.favoritesSidebarWidth)
+        guard abs(current - target) > 2 else { return }
+        applySidebarWidth(target)
+    }
+
+    private func reloadFavoritesTopBar() {
+        guard favoritesTopStack != nil else { return }
+        favoritesTopStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+
+        // Direct bar links first (Chrome bookmark bar), then real folders.
+        for bookmark in settings.rootBookmarks(in: .top) {
+            let button = BookmarkFolderButton(frame: .zero)
+            button.title = bookmark.name
+            button.bookmarkID = bookmark.id
+            button.bookmarkPath = bookmark.path
+            button.toolTip = bookmark.path
+            button.setContentHuggingPriority(.required, for: .horizontal)
+            button.onClick = { [weak self] in
+                let url = URL(fileURLWithPath: (bookmark.path as NSString).expandingTildeInPath)
+                    .standardizedFileURL
+                self?.navigate(to: url)
+            }
+            button.onRightClick = { [weak self] in
+                self?.presentBookmarkEditor(for: bookmark, preferredPlacement: .top)
+            }
+            button.onOrderChanged = { [weak self] in
+                self?.persistTopFavoritesBarOrder()
+            }
+            favoritesTopStack.addArrangedSubview(button)
+        }
+
+        for folder in settings.orderedBookmarkFolders(for: .top) {
+            let button = BookmarkFolderButton(frame: .zero)
+            button.title = folder
+            button.folderName = folder
+            button.setContentHuggingPriority(.required, for: .horizontal)
+            button.onClick = { [weak self, weak button] in
+                guard let self, let button else { return }
+                DispatchQueue.main.async {
+                    self.showTopFavoritesFolderMenu(button.folderName, from: button)
+                }
+            }
+            button.onRightClick = { [weak self] in
+                self?.showBookmarkFolderEditor(folder, placement: .top)
+            }
+            button.onOrderChanged = { [weak self] in
+                self?.persistTopFavoritesBarOrder()
+            }
+            favoritesTopStack.addArrangedSubview(button)
+        }
+    }
+
+    private func persistTopFavoritesBarOrder() {
+        var folderOrder: [String] = []
+        var rootIDs: [UUID] = []
+        for view in favoritesTopStack.arrangedSubviews {
+            guard let button = view as? BookmarkFolderButton else { continue }
+            if let id = button.bookmarkID {
+                rootIDs.append(id)
+            } else if !button.folderName.isEmpty {
+                folderOrder.append(button.folderName)
+            }
+        }
+        settings.topBookmarkFolderOrder = folderOrder
+
+        guard !rootIDs.isEmpty else { return }
+        var byID = Dictionary(
+            uniqueKeysWithValues: settings.bookmarks
+                .filter { $0.placement == .top && AppSettings.isFavoritesBarFolder($0.folder) }
+                .map { ($0.id, $0) }
+        )
+        var reorderedRoot: [Bookmark] = []
+        for id in rootIDs {
+            if var item = byID.removeValue(forKey: id) {
+                item.folder = ""
+                reorderedRoot.append(item)
+            }
+        }
+        reorderedRoot.append(contentsOf: byID.values.map { item in
+            var copy = item
+            copy.folder = ""
+            return copy
+        })
+
+        var result: [Bookmark] = []
+        var inserted = false
+        for bookmark in settings.bookmarks {
+            if bookmark.placement == .top && AppSettings.isFavoritesBarFolder(bookmark.folder) {
+                if !inserted {
+                    result.append(contentsOf: reorderedRoot)
+                    inserted = true
+                }
+            } else {
+                result.append(bookmark)
+            }
+        }
+        if !inserted {
+            result.append(contentsOf: reorderedRoot)
+        }
+        settings.bookmarks = result
+    }
+
+    private func showTopFavoritesFolderMenu(_ folder: String, from source: NSView) {
+        let bookmarks = settings.bookmarks(in: folder, placement: .top)
+        let menu = NSMenu(title: folder)
+        let itemFont = NSFont.systemFont(ofSize: 13)
+        let rowWidth = max(
+            160,
+            ceil(
+                (bookmarks.map { ($0.name as NSString).size(withAttributes: [.font: itemFont]).width }.max() ?? 80) + 24
+            )
+        )
+
+        if bookmarks.isEmpty {
+            let empty = NSMenuItem(title: "暂无收藏", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+        } else {
+            for bookmark in bookmarks {
+                let item = NSMenuItem(title: bookmark.name, action: nil, keyEquivalent: "")
+                let row = BookmarkMenuRowView(
+                    title: bookmark.name,
+                    path: bookmark.path,
+                    font: itemFont,
+                    width: rowWidth
+                )
+                row.onOpen = { [weak self, weak menu] in
+                    menu?.cancelTracking()
+                    let url = URL(fileURLWithPath: (bookmark.path as NSString).expandingTildeInPath)
+                        .standardizedFileURL
+                    DispatchQueue.main.async {
+                        self?.navigate(to: url)
+                    }
+                }
+                row.onEdit = { [weak self, weak menu] in
+                    menu?.cancelTracking()
+                    DispatchQueue.main.async {
+                        self?.presentBookmarkEditor(for: bookmark, preferredPlacement: .top)
+                    }
+                }
+                item.view = row
+                menu.addItem(item)
+            }
+        }
+
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: source.bounds.height + 4), in: source)
+    }
+
+    private func makePathBarNavButton(symbol: String, tip: String, action: Selector) -> NSButton {
+        let button = NSButton()
+        button.bezelStyle = .inline
+        button.isBordered = false
+        button.controlSize = .small
+        let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .regular)
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tip)?
+            .withSymbolConfiguration(config)
+        button.image?.isTemplate = true
+        button.contentTintColor = .labelColor
+        button.toolTip = tip
+        button.target = self
+        button.action = action
+        button.focusRingType = .none
+        button.translatesAutoresizingMaskIntoConstraints = false
+        return button
+    }
+
+    private func makeTitlebarUtilityStack() -> NSStackView {
+        let stack = NSStackView()
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 1
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        showHiddenButton = makePathBarNavButton(
+            symbol: settings.showHiddenFiles ? "dot.circle.fill" : "dot.circle",
+            tip: settings.showHiddenFiles ? "隐藏隐藏项 (⌘.)" : "显示隐藏项 (⌘.)",
+            action: #selector(toggleHiddenFiles(_:))
+        )
+        showHiddenButton.widthAnchor.constraint(equalToConstant: 18).isActive = true
+        showHiddenButton.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        if settings.showHiddenFiles {
+            showHiddenButton.contentTintColor = .controlAccentColor
+        }
+        stack.addArrangedSubview(showHiddenButton)
+        return stack
+    }
+
+    private func syncShowHiddenFilesButton(_ showHidden: Bool) {
+        let symbol = showHidden ? "dot.circle.fill" : "dot.circle"
+        showHiddenButton.image = NSImage(systemSymbolName: symbol, accessibilityDescription: showHidden ? "隐藏隐藏项" : "显示隐藏项")
+        showHiddenButton.image?.isTemplate = true
+        showHiddenButton.contentTintColor = showHidden ? .controlAccentColor : .labelColor
+        showHiddenButton.toolTip = showHidden ? "隐藏隐藏项 (⌘.)" : "显示隐藏项 (⌘.)"
     }
 
     private func applyContentZoom(_ percent: Int) {
@@ -371,10 +1078,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             return
         }
         let standardized = url.standardizedFileURL
-        if let existing = tabs.first(where: { $0.directory.standardizedFileURL == standardized }) {
+        if let existing = tabs.first(where: {
+            !$0.isActivityMonitorTab
+                && !$0.isTemperatureTab
+                && !$0.isArchiveTab
+                && $0.directory.standardizedFileURL == standardized
+        }) {
             if existing.id == activeTabID {
                 window?.makeKeyAndOrderFront(nil)
                 searchField.stringValue = ""
+                contentController.setSearchResultsMode(query: nil, scopeName: "", resultCount: 0)
                 // Revealing a file (pending select) or an empty/stale list must reload.
                 if !pendingSelectURLs.isEmpty || contentController.items.isEmpty {
                     reloadContents()
@@ -416,6 +1129,22 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         guard let tab = tabs.first(where: { $0.id == id }) else { return }
         activeTabID = id
         refreshTabBar()
+
+        if contentController.isShowingHistory {
+            contentController.setHistoryMode(active: false, itemCount: 0)
+            syncHistoryButtonAppearance(active: false)
+        }
+
+        if tab.isActivityMonitorTab {
+            showActivityMonitorTab()
+            return
+        }
+        if tab.isTemperatureTab {
+            showTemperatureTab()
+            return
+        }
+
+        hideSpecialContentTabsIfNeeded()
         if tab.isArchiveTab {
             stopWatching()
             window?.title = tab.archiveInternalPath.isEmpty
@@ -426,6 +1155,90 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         } else {
             navigate(to: tab.directory, recordHistory: false)
         }
+    }
+
+    /// Open (or focus) the Activity Monitor as a browser tab.
+    func openActivityMonitorInTab() {
+        if let existing = tabs.first(where: { $0.isActivityMonitorTab }) {
+            selectTab(existing.id)
+            window?.makeKeyAndOrderFront(nil)
+            return
+        }
+        let tab = BrowserTab(activityMonitor: ())
+        if let index = tabs.firstIndex(where: { $0.id == activeTabID }) {
+            tabs.insert(tab, at: index + 1)
+        } else {
+            tabs.append(tab)
+        }
+        selectTab(tab.id)
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Open (or focus) the Temperature monitor as a browser tab.
+    func openTemperatureInTab() {
+        if let existing = tabs.first(where: { $0.isTemperatureTab }) {
+            selectTab(existing.id)
+            window?.makeKeyAndOrderFront(nil)
+            return
+        }
+        let tab = BrowserTab(temperature: ())
+        if let index = tabs.firstIndex(where: { $0.id == activeTabID }) {
+            tabs.insert(tab, at: index + 1)
+        } else {
+            tabs.append(tab)
+        }
+        selectTab(tab.id)
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    private func showActivityMonitorTab() {
+        stopWatching()
+        searchField.stringValue = ""
+        contentController.setSearchResultsMode(query: nil, scopeName: "", resultCount: 0)
+        contentController.setTrashMode(active: false, itemCount: 0)
+        contentController.setApplicationsMode(active: false)
+        hideTemperatureTabIfNeeded()
+        contentController.view.isHidden = true
+        activityMonitorController.view.isHidden = false
+        activityMonitorController.activate()
+        window?.title = "活动监视器"
+        statusLabel.stringValue = "活动监视器"
+        updatePathBarCoverage()
+        refreshTabBar()
+    }
+
+    private func showTemperatureTab() {
+        stopWatching()
+        searchField.stringValue = ""
+        contentController.setSearchResultsMode(query: nil, scopeName: "", resultCount: 0)
+        contentController.setTrashMode(active: false, itemCount: 0)
+        contentController.setApplicationsMode(active: false)
+        hideActivityMonitorTabIfNeeded()
+        contentController.view.isHidden = true
+        temperatureController.view.isHidden = false
+        temperatureController.activate()
+        window?.title = "温度"
+        statusLabel.stringValue = "温度"
+        updatePathBarCoverage()
+        refreshTabBar()
+    }
+
+    private func hideActivityMonitorTabIfNeeded() {
+        guard !activityMonitorController.view.isHidden else { return }
+        activityMonitorController.deactivate()
+        activityMonitorController.view.isHidden = true
+    }
+
+    private func hideTemperatureTabIfNeeded() {
+        guard !temperatureController.view.isHidden else { return }
+        temperatureController.deactivate()
+        temperatureController.view.isHidden = true
+    }
+
+    private func hideSpecialContentTabsIfNeeded() {
+        hideActivityMonitorTabIfNeeded()
+        hideTemperatureTabIfNeeded()
+        contentController.view.isHidden = false
     }
 
     private func closeTab(_ id: UUID) {
@@ -523,14 +1336,37 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             NSSound.beep()
             return
         }
+        if activeTab.isActivityMonitorTab {
+            hideSpecialContentTabsIfNeeded()
+            activeTab.isActivityMonitorTab = false
+        } else if activeTab.isTemperatureTab {
+            hideSpecialContentTabsIfNeeded()
+            activeTab.isTemperatureTab = false
+        } else {
+            hideSpecialContentTabsIfNeeded()
+        }
         let standardized = url.standardizedFileURL
         currentDirectory = standardized
         if recordHistory {
             history.navigate(to: standardized)
         }
-        window?.title = standardized.lastPathComponent.isEmpty ? standardized.path : standardized.lastPathComponent
+        window?.title = FileOperations.isTrashDirectory(standardized)
+            ? "废纸篓"
+            : FileOperations.isApplicationsDirectory(standardized)
+            ? "应用程序"
+            : (standardized.lastPathComponent.isEmpty ? standardized.path : standardized.lastPathComponent)
         updatePathChrome()
         searchField.stringValue = ""
+        contentController.setSearchResultsMode(query: nil, scopeName: "", resultCount: 0)
+        contentController.setHistoryMode(active: false, itemCount: 0)
+        syncHistoryButtonAppearance(active: false)
+        if !FileOperations.isTrashDirectory(standardized) {
+            contentController.setTrashMode(active: false, itemCount: 0)
+        }
+        if !FileOperations.isApplicationsDirectory(standardized) {
+            contentController.setApplicationsMode(active: false)
+        }
+        updatePathBarCoverage()
         hideAutocomplete()
         // Always reload the file list so address/tab and table contents stay in sync.
         watchDirectory(standardized)
@@ -557,6 +1393,23 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     private func reloadContents(preservingOutline: Bool = false) {
         pendingReloadWorkItem?.cancel()
         pendingReloadWorkItem = nil
+        packageSizeWorkItem?.cancel()
+        packageSizeWorkItem = nil
+
+        // Keep the in-window history page until the user navigates away / toggles it off.
+        if contentController.isShowingHistory {
+            refreshHistoryPage()
+            return
+        }
+
+        if activeTab.isActivityMonitorTab {
+            showActivityMonitorTab()
+            return
+        }
+        if activeTab.isTemperatureTab {
+            showTemperatureTab()
+            return
+        }
 
         contentLoadGeneration += 1
         let generation = contentLoadGeneration
@@ -592,11 +1445,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         let keepOutline = preservingOutline
         let pendingSelect = pendingSelectURLs
         let pendingRename = pendingRenameURL
+        let inTrash = FileOperations.isTrashDirectory(directory)
         pendingSelectURLs = []
         pendingRenameURL = nil
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let items = FileOperations.listDirectory(directory, showHidden: showHidden)
+            // Trash items may be marked hidden; always list them in trash mode.
+            var items = FileOperations.listDirectory(directory, showHidden: showHidden || inTrash)
+            if inTrash {
+                items = items.filter { $0.name != ".DS_Store" }
+            }
             DispatchQueue.main.async {
                 guard let self else { return }
                 guard generation == self.contentLoadGeneration else { return }
@@ -610,22 +1468,119 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
                         beginRename: pendingRename
                     )
                 } else {
-                    self.contentController.setItems(items, alreadySortedByName: true)
-                    if !pendingSelect.isEmpty {
-                        self.contentController.select(urls: pendingSelect)
-                    }
+                    self.contentController.setItems(
+                        items,
+                        alreadySortedByName: true,
+                        select: pendingSelect
+                    )
                     if let renameURL = pendingRename,
                        let item = self.contentController.items.first(where: {
-                           $0.url.standardizedFileURL == renameURL.standardizedFileURL
+                           $0.url.standardizedFileURL.path == renameURL.standardizedFileURL.path
                        }) {
                         DispatchQueue.main.async {
                             self.contentController.beginInlineRename(item)
                         }
                     }
                 }
-                self.updateStatus(selection: self.contentController.selectedItems)
+                // Directory refresh must not wipe an active search with the raw folder listing.
+                let query = self.searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !query.isEmpty, !inTrash {
+                    self.applySearch(query: query)
+                } else {
+                    self.contentController.setSearchResultsMode(query: nil, scopeName: "", resultCount: 0)
+                    self.contentController.setTrashMode(active: inTrash, itemCount: items.count)
+                    self.contentController.setApplicationsMode(
+                        active: !inTrash && FileOperations.isApplicationsDirectory(directory)
+                    )
+                    self.updatePathBarCoverage()
+                    // Re-apply selection after search mode clears / layout settles.
+                    if !pendingSelect.isEmpty {
+                        self.contentController.select(urls: pendingSelect)
+                        DispatchQueue.main.async {
+                            self.contentController.select(urls: pendingSelect)
+                        }
+                    }
+                    self.updateStatus(selection: self.contentController.selectedItems)
+                }
+                self.schedulePackageSizeFill(items: items, generation: generation)
             }
         }
+    }
+
+    /// Compute .app / package sizes in the background and patch the table progressively.
+    private func schedulePackageSizeFill(items: [FileItem], generation: Int) {
+        packageSizeWorkItem?.cancel()
+        let packages = items.filter { $0.isPackage && $0.fileSize == nil }
+        guard !packages.isEmpty else { return }
+
+        var work: DispatchWorkItem!
+        work = DispatchWorkItem { [weak self] in
+            let lock = NSLock()
+            var batch: [URL: Int64] = [:]
+            let pool = DispatchQueue(label: "com.zhangjing.NewFinder.packageSize", attributes: .concurrent)
+            let group = DispatchGroup()
+            let limit = DispatchSemaphore(value: 3)
+
+            func flush(force: Bool) {
+                lock.lock()
+                let shouldFlush = force ? !batch.isEmpty : batch.count >= 4
+                guard shouldFlush else {
+                    lock.unlock()
+                    return
+                }
+                let snapshot = batch
+                batch.removeAll(keepingCapacity: true)
+                lock.unlock()
+                DispatchQueue.main.async {
+                    guard let self, generation == self.contentLoadGeneration else { return }
+                    self.contentController.applyFileSizes(snapshot)
+                    self.updateStatus(selection: self.contentController.selectedItems)
+                }
+            }
+
+            for item in packages {
+                group.enter()
+                pool.async {
+                    defer { group.leave() }
+                    limit.wait()
+                    defer { limit.signal() }
+                    if work.isCancelled { return }
+                    let size = FileOperations.cachedPackageByteSize(
+                        at: item.url,
+                        modificationDate: item.modificationDate
+                    )
+                    if work.isCancelled { return }
+                    lock.lock()
+                    batch[item.url.standardizedFileURL] = size
+                    lock.unlock()
+                    flush(force: false)
+                }
+            }
+
+            group.wait()
+            guard !work.isCancelled else { return }
+            flush(force: true)
+        }
+        packageSizeWorkItem = work
+        DispatchQueue.global(qos: .utility).async(execute: work)
+    }
+
+    private func applySearch(query: String) {
+        contentController.setHistoryMode(active: false, itemCount: 0)
+        syncHistoryButtonAppearance(active: false)
+        updatePathBarCoverage()
+        let urls = FileOperations.search(in: currentDirectory, query: query)
+        let items = urls.compactMap(FileItem.from)
+        let scope = currentDirectory.path == "/" ? "Macintosh HD" : currentDirectory.lastPathComponent
+        // Enable search mode before setItems so name-column sort uses full paths.
+        contentController.setSearchResultsMode(
+            query: query,
+            scopeName: scope,
+            resultCount: items.count,
+            searchRoot: currentDirectory
+        )
+        contentController.setItems(items, alreadySortedByName: true)
+        updateStatus(selection: [])
     }
 
     /// Mutations that should keep outline expansion (rename / trash / paste / New in root).
@@ -651,6 +1606,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     private func updatePathChrome() {
+        if contentController.isShowingHistory {
+            updateHistoryPathChrome()
+            return
+        }
         if let archive = activeTab.archiveURL {
             let internalPath = activeTab.archiveInternalPath
             pathField.stringValue = internalPath.isEmpty
@@ -686,12 +1645,37 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             breadcrumbClip.isHidden = isEditingPath
             pathField.isHidden = !isEditingPath
             breadcrumbClip.refreshLayout()
+            refreshBookmarkUI()
             return
         }
 
         pathBookmarkButton.isHidden = false
         pathField.stringValue = currentDirectory.path
         breadcrumbStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+
+        if FileOperations.isTrashDirectory(currentDirectory) {
+            let button = BreadcrumbButton(title: "废纸篓", target: self, action: #selector(breadcrumbClicked(_:)))
+            button.identifier = NSUserInterfaceItemIdentifier(currentDirectory.path)
+            breadcrumbStack.addArrangedSubview(button)
+            pathBookmarkButton.isHidden = true
+            breadcrumbClip.isHidden = isEditingPath
+            pathField.isHidden = !isEditingPath
+            breadcrumbClip.refreshLayout()
+            refreshBookmarkUI()
+            return
+        }
+
+        if FileOperations.isApplicationsDirectory(currentDirectory) {
+            let button = BreadcrumbButton(title: "应用程序", target: self, action: #selector(breadcrumbClicked(_:)))
+            button.identifier = NSUserInterfaceItemIdentifier(currentDirectory.path)
+            breadcrumbStack.addArrangedSubview(button)
+            pathBookmarkButton.isHidden = false
+            breadcrumbClip.isHidden = isEditingPath
+            pathField.isHidden = !isEditingPath
+            breadcrumbClip.refreshLayout()
+            refreshBookmarkUI()
+            return
+        }
 
         let components = currentDirectory.pathComponents
         var built = ""
@@ -746,11 +1730,17 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
 
     private func refreshBookmarkUI() {
         let path = currentDirectory.standardizedFileURL.path
-        let isBookmarked = settings.bookmarks.contains {
+        let isBookmarked = settings.bookmarks(in: .left).contains {
             URL(fileURLWithPath: $0.path).standardizedFileURL.path == path
         }
         updatePathBookmarkButton(isBookmarked: isBookmarked)
-        rebuildBookmarkFolderButtons()
+        // Navigating must not rebuild/re-expand the sidebar — only update selection.
+        favoritesSidebar?.setCurrentPath(path)
+    }
+
+    private func reloadFavoritesSidebar() {
+        favoritesSidebar?.reload(highlighting: currentDirectory.standardizedFileURL.path)
+        applyFavoritesLayout(animated: true)
     }
 
     private func updatePathBookmarkButton(isBookmarked: Bool) {
@@ -763,87 +1753,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     private func orderedBookmarkFolders() -> [String] {
-        let allFolders = Array(Set(settings.bookmarks.map(\.folder)))
-        let available = Set(allFolders)
-        let stored = settings.bookmarkFolderOrder.filter { available.contains($0) }
-        let newer = allFolders
-            .filter { !stored.contains($0) }
-            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
-        return stored + newer
-    }
-
-    private func rebuildBookmarkFolderButtons() {
-        let stack = chromeHeader.bookmarkFoldersContainer
-        stack.arrangedSubviews.forEach {
-            stack.removeArrangedSubview($0)
-            $0.removeFromSuperview()
-        }
-
-        for folder in orderedBookmarkFolders() {
-            let button = BookmarkFolderButton(title: folder, target: nil, action: nil)
-            button.folderName = folder
-            button.attributedTitle = NSAttributedString(
-                string: folder,
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: 13),
-                    .foregroundColor: NSColor(calibratedWhite: 0.32, alpha: 1)
-                ]
-            )
-            button.toolTip = "打开收藏夹「\(folder)」（拖动排序，右键重命名）"
-            button.onClick = { [weak self, weak button] in
-                guard let self, let button else { return }
-                DispatchQueue.main.async {
-                    self.showBookmarkFolderMenu(folder, from: button)
-                }
-            }
-            button.onRightClick = { [weak self] in
-                self?.showBookmarkFolderEditor(folder)
-            }
-            button.onOrderChanged = { [weak self] in
-                self?.persistBookmarkFolderOrderFromStack()
-            }
-            stack.addArrangedSubview(button)
-        }
-    }
-
-    private func persistBookmarkFolderOrderFromStack() {
-        let stack = chromeHeader.bookmarkFoldersContainer
-        let order = stack.arrangedSubviews.compactMap { ($0 as? BookmarkFolderButton)?.folderName }
-        guard !order.isEmpty else { return }
-        settings.bookmarkFolderOrder = order
-    }
-
-    private func showBookmarkFolderMenu(_ folder: String, from sourceButton: NSButton) {
-        let folderBookmarks = settings.bookmarks
-            .filter { $0.folder == folder }
-            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-        guard !folderBookmarks.isEmpty else { return }
-
-        let menu = NSMenu(title: folder)
-        let itemFont = NSFont.systemFont(ofSize: 13)
-        let rowWidth = max(
-            72,
-            ceil((folderBookmarks.map { ($0.name as NSString).size(withAttributes: [.font: itemFont]).width }.max() ?? 0) + 24)
-        )
-        for bookmark in folderBookmarks {
-            let item = NSMenuItem(title: bookmark.name, action: nil, keyEquivalent: "")
-            let row = BookmarkMenuRowView(title: bookmark.name, path: bookmark.path, font: itemFont, width: rowWidth)
-            row.onOpen = { [weak self, weak menu] in
-                menu?.cancelTracking()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    self?.navigate(to: URL(fileURLWithPath: bookmark.path))
-                }
-            }
-            row.onEdit = { [weak self, weak menu] in
-                menu?.cancelTracking()
-                DispatchQueue.main.async {
-                    self?.presentBookmarkEditor(for: bookmark)
-                }
-            }
-            item.view = row
-            menu.addItem(item)
-        }
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sourceButton.bounds.height + 4), in: sourceButton)
+        settings.orderedBookmarkFolders()
     }
 
     @objc private func breadcrumbClicked(_ sender: Any?) {
@@ -899,10 +1809,122 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     @objc private func showHistoryMenu(_ sender: NSButton) {
+        popOpenHistoryMenu(from: sender, visits: history.recentVisits, allowClear: false)
+    }
+
+    @objc private func toggleHistoryPage(_ sender: Any?) {
+        if contentController.isShowingHistory {
+            closeHistoryPage()
+        } else {
+            openHistoryPage()
+        }
+    }
+
+    private func openHistoryPage() {
+        refreshHistoryPage()
+    }
+
+    private func refreshHistoryPage() {
+        // History overlays the file list; pause special tabs while it is open.
+        if !activityMonitorController.view.isHidden || !temperatureController.view.isHidden {
+            hideSpecialContentTabsIfNeeded()
+        }
+
+        searchField.stringValue = ""
+        contentController.setSearchResultsMode(query: nil, scopeName: "", resultCount: 0)
+        contentController.setTrashMode(active: false, itemCount: 0)
+        contentController.setApplicationsMode(active: false)
+
+        let visits = AppSettings.shared.recentOpenHistory
+        let items = visits.map(Self.fileItem(forHistoryVisit:))
+        contentController.setHistoryMode(active: true, itemCount: items.count)
+        contentController.setItems(items, alreadySortedByName: true)
+        window?.title = "最近打开"
+        statusLabel.stringValue = items.isEmpty
+            ? "暂无打开历史"
+            : "最近打开 \(items.count) 项"
+        updateHistoryPathChrome()
+        syncHistoryButtonAppearance(active: true)
+        updatePathBarCoverage()
+    }
+
+    private func closeHistoryPage() {
+        guard contentController.isShowingHistory else { return }
+        contentController.setHistoryMode(active: false, itemCount: 0)
+        syncHistoryButtonAppearance(active: false)
+        updatePathBarCoverage()
+        updatePathChrome()
+        reloadContents()
+        window?.title = FileOperations.isTrashDirectory(currentDirectory)
+            ? "废纸篓"
+            : FileOperations.isApplicationsDirectory(currentDirectory)
+            ? "应用程序"
+            : (currentDirectory.lastPathComponent.isEmpty ? currentDirectory.path : currentDirectory.lastPathComponent)
+    }
+
+    /// Hide the address bar while history / Applications / Activity Monitor covers that space.
+    private func updatePathBarCoverage() {
+        let covered = contentController.isShowingHistory
+            || contentController.isShowingApplications
+            || activeTab.isActivityMonitorTab
+            || activeTab.isTemperatureTab
+        if covered {
+            pathBarContainer.isHidden = true
+            pathBarHeightConstraint.constant = 0
+        } else {
+            pathBarContainer.isHidden = !pathBarVisible
+            pathBarHeightConstraint.constant = pathBarVisible ? 29 : 0
+        }
+        window?.contentView?.layoutSubtreeIfNeeded()
+    }
+
+    private func syncHistoryButtonAppearance(active: Bool) {
+        recentHistoryButton.contentTintColor = active ? .controlAccentColor : .labelColor
+    }
+
+    private func updateHistoryPathChrome() {
+        // Address bar is hidden while history covers it; keep chrome ready for restore.
+        breadcrumbStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        let button = BreadcrumbButton(title: "最近打开", target: nil, action: nil)
+        button.isEnabled = false
+        breadcrumbStack.addArrangedSubview(button)
+        pathField.isHidden = true
+        breadcrumbClip?.isHidden = false
+    }
+
+    private static func fileItem(forHistoryVisit visit: VisitRecord) -> FileItem {
+        if let item = FileItem.from(url: visit.url) {
+            return FileItem(
+                url: item.url,
+                name: item.name,
+                isDirectory: item.isDirectory,
+                isPackage: item.isPackage,
+                isHidden: item.isHidden,
+                fileSize: item.fileSize,
+                modificationDate: visit.visitedAt,
+                creationDate: item.creationDate,
+                archiveEntryPath: nil
+            )
+        }
+        let name = visit.url.lastPathComponent
+        let isPackage = visit.url.pathExtension.lowercased() == "app"
+        return FileItem(
+            url: visit.url.standardizedFileURL,
+            name: name.isEmpty ? visit.url.path : name,
+            isDirectory: false,
+            isPackage: isPackage,
+            isHidden: name.hasPrefix("."),
+            fileSize: nil,
+            modificationDate: visit.visitedAt,
+            creationDate: nil,
+            archiveEntryPath: nil
+        )
+    }
+
+    private func popOpenHistoryMenu(from sender: NSButton, visits: [VisitRecord], allowClear: Bool) {
         let menu = NSMenu()
         menu.autoenablesItems = false
 
-        let visits = history.recentVisits
         if visits.isEmpty {
             let empty = NSMenuItem(title: "暂无历史记录", action: nil, keyEquivalent: "")
             empty.isEnabled = false
@@ -912,7 +1934,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             timeFormatter.locale = Locale(identifier: "zh_CN")
             timeFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
 
-            // Measure widest path + time so columns align.
             let pathFont = NSFont.systemFont(ofSize: 13)
             let timeFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
             var maxPathWidth: CGFloat = 120
@@ -947,13 +1968,43 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             }
         }
 
+        if allowClear, !visits.isEmpty {
+            menu.addItem(.separator())
+            let clear = NSMenuItem(title: "清除历史记录", action: #selector(clearRecentOpenHistory(_:)), keyEquivalent: "")
+            clear.target = self
+            menu.addItem(clear)
+        }
+
         let point = NSPoint(x: 0, y: sender.bounds.height + 2)
         menu.popUp(positioning: nil, at: point, in: sender)
     }
 
+    @objc private func clearRecentOpenHistory(_ sender: Any?) {
+        AppSettings.shared.clearOpenHistory()
+        if contentController.isShowingHistory {
+            refreshHistoryPage()
+        }
+    }
+
     @objc private func historyMenuItemClicked(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
-        navigate(to: url)
+        openHistoryURL(url)
+    }
+
+    private func openHistoryURL(_ url: URL) {
+        var isDir: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+        guard exists else {
+            NSSound.beep()
+            return
+        }
+        if isDir.boolValue {
+            navigate(to: url)
+        } else {
+            navigate(to: url.deletingLastPathComponent())
+            selectAfterNavigate([url])
+            AppSettings.shared.recordOpenHistory(url)
+        }
     }
 
     private func openItem(_ item: FileItem) {
@@ -962,16 +2013,19 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             return
         }
         if !item.isDirectory, DMGInstallSupport.isDiskImage(item.url) {
+            AppSettings.shared.recordOpenHistory(item.url)
             _ = AppDelegate.shared.openDiskImage(item.url)
             return
         }
         if !item.isDirectory, ArchiveSupport.looksLikeArchive(item.url) {
+            AppSettings.shared.recordOpenHistory(item.url)
             openArchiveInTab(item.url)
             return
         }
         if item.isDirectory {
             navigate(to: item.url)
         } else {
+            AppSettings.shared.recordOpenHistory(item.url)
             NSWorkspace.shared.open(item.url)
         }
     }
@@ -1043,7 +2097,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         let totalSize = formattedTotalSize(of: items)
         let selectedCount = selection.count
         let selectedSize = formattedTotalSize(of: selection)
-        statusLabel.stringValue = "\(total) 个项目，\(totalSize)，已选中 \(selectedCount) 个，\(selectedSize)"
+        let query = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if contentController.isShowingHistory {
+            statusLabel.stringValue = items.isEmpty
+                ? "暂无打开历史"
+                : "最近打开 \(total) 项，已选中 \(selectedCount) 个"
+        } else if !query.isEmpty {
+            statusLabel.stringValue = "搜索到 \(total) 个结果，\(totalSize)，已选中 \(selectedCount) 个，\(selectedSize) · 「\(query)」"
+        } else {
+            statusLabel.stringValue = "\(total) 个项目，\(totalSize)，已选中 \(selectedCount) 个，\(selectedSize)"
+        }
     }
 
     private func formattedTotalSize(of items: [FileItem]) -> String {
@@ -1113,6 +2176,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             }
             return
         }
+        if FileOperations.isTrashDirectory(currentDirectory) {
+            goHome(nil)
+            return
+        }
         let parent = currentDirectory.deletingLastPathComponent()
         guard parent.path != currentDirectory.path else { return }
         let left = currentDirectory
@@ -1146,12 +2213,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
 
     @objc func togglePathBar(_ sender: Any?) {
         pathBarVisible.toggle()
-        pathBarContainer.isHidden = !pathBarVisible
+        updatePathBarCoverage()
     }
 
     @objc func toggleHiddenFiles(_ sender: Any?) {
         settings.showHiddenFiles.toggle()
-        chromeHeader.syncShowHiddenFilesButton(settings.showHiddenFiles)
+        syncShowHiddenFilesButton(settings.showHiddenFiles)
         reloadContents(preservingOutline: true)
     }
 
@@ -1222,7 +2289,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             return
         }
         contentController.beginInlineRename(item)
-        chromeHeader.flashFileActionSuccess(.rename)
     }
 
     private func commitRename(_ item: FileItem, to newName: String) {
@@ -1234,7 +2300,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
                 contentController.markExpanded(dest)
             }
             reloadAfterMutation(select: [dest.standardizedFileURL])
-            chromeHeader.flashFileActionSuccess(.rename)
         } catch {
             showError(error)
             reloadAfterMutation(select: [item.url.standardizedFileURL])
@@ -1246,7 +2311,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         guard !urls.isEmpty else { NSSound.beep(); return }
         FileOperations.copyURLs(urls)
         contentController.refreshCutAppearance()
-        chromeHeader.flashFileActionSuccess(.copy)
     }
 
     @objc func cut(_ sender: Any?) {
@@ -1254,7 +2318,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         guard !urls.isEmpty else { NSSound.beep(); return }
         FileOperations.cutURLs(urls)
         contentController.refreshCutAppearance()
-        chromeHeader.flashFileActionSuccess(.cut)
     }
 
     @objc func paste(_ sender: Any?) {
@@ -1266,7 +2329,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             }
             reloadAfterMutation(select: urls)
             contentController.refreshCutAppearance()
-            chromeHeader.flashFileActionSuccess(.paste)
         } catch {
             NSSound.beep()
         }
@@ -1279,6 +2341,14 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     @objc func moveToTrash(_ sender: Any?) {
+        if FileOperations.isTrashDirectory(currentDirectory) {
+            deleteForeverFromTrash(sender)
+            return
+        }
+        if FileOperations.isApplicationsDirectory(currentDirectory) {
+            uninstallSelectedApps(sender)
+            return
+        }
         let urls = contentController.selectedItems.map(\.url)
         guard !urls.isEmpty else { NSSound.beep(); return }
         let nextURL = contentController.selectionURLAfterRemovingSelected()
@@ -1286,7 +2356,120 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             try FileOperations.moveToTrash(urls)
             contentController.noteRemovedURLs(urls)
             reloadAfterMutation(select: nextURL.map { [$0] } ?? [])
-            chromeHeader.flashFileActionSuccess(.trash)
+        } catch {
+            showError(error)
+        }
+    }
+
+    @objc func uninstallSelectedApps(_ sender: Any?) {
+        guard FileOperations.isApplicationsDirectory(currentDirectory) else { return }
+        let apps = contentController.packagesForUninstall
+        guard !apps.isEmpty else {
+            NSSound.beep()
+            return
+        }
+
+        statusLabel.stringValue = "正在扫描关联文件…"
+        let appURLs = apps.map(\.url.standardizedFileURL)
+        let nextURL = contentController.selectionURLAfterRemovingSelected()
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let plans = AppUninstallSupport.buildPlans(for: appURLs)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.updateStatus(selection: self.contentController.selectedItems)
+
+                let removable = plans.filter { !$0.isProtectedSystemApp }
+                if removable.isEmpty {
+                    let alert = NSAlert()
+                    alert.messageText = "无法卸载"
+                    alert.informativeText = "所选项目均为系统应用，或没有可移除的内容。"
+                    alert.runModal()
+                    return
+                }
+
+                let alert = NSAlert()
+                alert.messageText = removable.count == 1
+                    ? "彻底卸载「\(removable[0].displayName)」？"
+                    : "彻底卸载 \(removable.count) 个项目？"
+                alert.informativeText = AppUninstallSupport.summaryText(for: plans)
+                alert.alertStyle = .critical
+                alert.addButton(withTitle: "卸载")
+                alert.addButton(withTitle: "取消")
+                guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+                self.statusLabel.stringValue = "正在彻底卸载…"
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    do {
+                        let result = try AppUninstallSupport.performUninstall(plans)
+                        DispatchQueue.main.async {
+                            guard let self else { return }
+                            self.contentController.clearUninstallChecks(for: appURLs)
+                            self.contentController.noteRemovedURLs(appURLs)
+                            self.reloadAfterMutation(select: nextURL.map { [$0] } ?? [])
+                            if result.failures.isEmpty {
+                                self.statusLabel.stringValue = "已彻底卸载，删除 \(result.removed) 项"
+                            } else {
+                                let detail = result.failures.prefix(6).map {
+                                    "\($0.0.lastPathComponent)：\($0.1)"
+                                }.joined(separator: "\n")
+                                let failAlert = NSAlert()
+                                failAlert.messageText = "部分项目未能删除"
+                                failAlert.informativeText =
+                                    "已删除 \(result.removed) 项。失败 \(result.failures.count) 项（可能需要管理员权限）：\n\(detail)"
+                                failAlert.runModal()
+                                self.updateStatus(selection: self.contentController.selectedItems)
+                            }
+                        }
+                    } catch {
+                        DispatchQueue.main.async {
+                            self?.showError(error)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @objc func putBackFromTrash(_ sender: Any?) {
+        guard FileOperations.isTrashDirectory(currentDirectory) else { return }
+        let urls = contentController.selectedItems.map(\.url.standardizedFileURL)
+        guard !urls.isEmpty else { NSSound.beep(); return }
+        let nextURL = contentController.selectionURLAfterRemovingSelected()
+        FileOperations.putBackFromTrash(urls)
+        contentController.noteRemovedURLs(urls)
+        // Finder Put Away can be slightly async; refresh shortly after.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.reloadAfterMutation(select: nextURL.map { [$0] } ?? [])
+        }
+    }
+
+    @objc func deleteForeverFromTrash(_ sender: Any?) {
+        guard FileOperations.isTrashDirectory(currentDirectory) else { return }
+        let urls = contentController.selectedItems.map(\.url.standardizedFileURL)
+        guard !urls.isEmpty else { NSSound.beep(); return }
+        let nextURL = contentController.selectionURLAfterRemovingSelected()
+        do {
+            try FileOperations.permanentlyDelete(urls)
+            contentController.noteRemovedURLs(urls)
+            reloadAfterMutation(select: nextURL.map { [$0] } ?? [])
+        } catch {
+            showError(error)
+        }
+    }
+
+    @objc func emptyTrash(_ sender: Any?) {
+        guard FileOperations.isTrashDirectory(currentDirectory) else { return }
+        let alert = NSAlert()
+        alert.messageText = "确定清空废纸篓？"
+        alert.informativeText = "废纸篓中的所有项目将被永久删除，此操作无法撤销。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "清空废纸篓")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        do {
+            try FileOperations.emptyTrash(at: currentDirectory)
+            reloadAfterMutation()
         } catch {
             showError(error)
         }
@@ -1380,13 +2563,14 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
 
     @objc func showBookmarkEditor(_ sender: Any?) {
         let path = currentDirectory.standardizedFileURL.path
-        let existing = settings.bookmarks.first {
+        // Path-bar star edits / adds the left-sidebar favorite only.
+        let existing = settings.bookmarks(in: .left).first {
             URL(fileURLWithPath: $0.path).standardizedFileURL.path == path
         }
-        presentBookmarkEditor(for: existing)
+        presentBookmarkEditor(for: existing, preferredPlacement: .left)
     }
 
-    private func presentBookmarkEditor(for existingBookmark: Bookmark?) {
+    private func presentBookmarkEditor(for existingBookmark: Bookmark?, preferredPlacement: FavoritesPlacement) {
         let path = existingBookmark?.path ?? currentDirectory.standardizedFileURL.path
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
@@ -1396,39 +2580,36 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             return
         }
 
-        let existing = existingBookmark ?? settings.bookmarks.first {
+        let placement = existingBookmark?.placement ?? preferredPlacement
+        let existing = existingBookmark ?? settings.bookmarks(in: placement).first {
             URL(fileURLWithPath: $0.path).standardizedFileURL.path == path
         }
-        let resumeID = existing?.id
         cancelBookmarkEditor()
-        editingBookmarkID = resumeID
+        editingBookmarkID = existing?.id
+        editingBookmarkPlacement = existing?.placement ?? preferredPlacement
 
         let editor = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 470, height: 250),
+            contentRect: NSRect(x: 0, y: 0, width: 470, height: 300),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
         )
-        editor.title = "编辑收藏"
+        editor.title = existing == nil ? "添加收藏" : "编辑收藏"
         editor.isReleasedWhenClosed = false
         editor.isFloatingPanel = true
         editor.level = .floating
 
         let content = NSView()
-        let defaultFolder = existing?.folder ?? "收藏夹"
+        let defaultFolder = Self.normalizedFavoritesFolderDisplay(existing?.folder)
         let folderField = NSTextField(string: defaultFolder)
         let folderPicker = NSPopUpButton(frame: .zero, pullsDown: false)
-        folderPicker.addItem(withTitle: "选择已有文件夹")
-        let existingFolders = Array(Set(settings.bookmarks.map(\.folder))).sorted {
-            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
-        }
-        for folder in existingFolders {
-            folderPicker.addItem(withTitle: folder)
-        }
-        folderPicker.selectItem(at: 0)
-        folderPicker.isEnabled = !existingFolders.isEmpty
         folderPicker.target = self
         folderPicker.action = #selector(bookmarkFolderPickerChanged(_:))
+        Self.populateFavoritesFolderPicker(
+            folderPicker,
+            folders: settings.orderedBookmarkFolders(for: editingBookmarkPlacement),
+            selected: defaultFolder
+        )
 
         let defaultName: String = {
             if let existing { return existing.name }
@@ -1440,13 +2621,29 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         let pathField = NSTextField(string: existing?.path ?? path)
         [folderField, folderPicker, nameField, pathField].forEach { $0.translatesAutoresizingMaskIntoConstraints = false }
 
-        let folderLabel = NSTextField(labelWithString: "放置的文件夹名称")
+        let folderLabel = NSTextField(labelWithString: "放置的文件夹")
         let nameLabel = NSTextField(labelWithString: "收藏的地址名字")
         let pathLabel = NSTextField(labelWithString: "收藏的地址")
-        [folderLabel, nameLabel, pathLabel].forEach {
+        let placementLabel = NSTextField(labelWithString: "收藏夹位置")
+        [folderLabel, nameLabel, pathLabel, placementLabel].forEach {
             $0.font = .systemFont(ofSize: 13, weight: .medium)
             $0.translatesAutoresizingMaskIntoConstraints = false
         }
+
+        let placementControl = NSSegmentedControl(
+            labels: ["左侧", "顶部"],
+            trackingMode: .selectOne,
+            target: self,
+            action: #selector(bookmarkPlacementChanged(_:))
+        )
+        placementControl.segmentStyle = .rounded
+        placementControl.selectedSegment = editingBookmarkPlacement == .top ? 1 : 0
+        placementControl.translatesAutoresizingMaskIntoConstraints = false
+        placementControl.toolTip = "左侧与顶部是两套独立收藏，互不影响"
+
+        folderField.placeholderString = Self.favoritesBarFolderName
+        folderField.toolTip = "选「收藏栏」时地址会直接出现在顶栏/侧栏（类似 Chrome），不会新建文件夹"
+        folderPicker.toolTip = "第一项「收藏栏」= 直接放在栏上；其余为子文件夹"
 
         let cancelButton = NSButton(title: "取消", target: self, action: #selector(cancelBookmarkEditor))
         let saveButton = NSButton(title: "保存", target: self, action: #selector(saveBookmarkEditor))
@@ -1461,6 +2658,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         removeButton?.translatesAutoresizingMaskIntoConstraints = false
         removeButton?.contentTintColor = .systemRed
 
+        content.addSubview(placementLabel)
+        content.addSubview(placementControl)
         content.addSubview(folderLabel)
         content.addSubview(folderField)
         content.addSubview(folderPicker)
@@ -1476,10 +2675,17 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         editor.contentView = content
 
         NSLayoutConstraint.activate([
-            folderLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            folderLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 22),
-            folderLabel.widthAnchor.constraint(equalToConstant: 112),
-            folderField.leadingAnchor.constraint(equalTo: folderLabel.trailingAnchor, constant: 12),
+            placementLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            placementLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 22),
+            placementLabel.widthAnchor.constraint(equalToConstant: 112),
+            placementControl.leadingAnchor.constraint(equalTo: placementLabel.trailingAnchor, constant: 12),
+            placementControl.centerYAnchor.constraint(equalTo: placementLabel.centerYAnchor),
+            placementControl.widthAnchor.constraint(equalToConstant: 160),
+
+            folderLabel.leadingAnchor.constraint(equalTo: placementLabel.leadingAnchor),
+            folderLabel.topAnchor.constraint(equalTo: placementLabel.bottomAnchor, constant: 18),
+            folderLabel.widthAnchor.constraint(equalTo: placementLabel.widthAnchor),
+            folderField.leadingAnchor.constraint(equalTo: placementControl.leadingAnchor),
             folderField.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
             folderField.centerYAnchor.constraint(equalTo: folderLabel.centerYAnchor),
 
@@ -1501,6 +2707,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             pathField.trailingAnchor.constraint(equalTo: folderField.trailingAnchor),
             pathField.centerYAnchor.constraint(equalTo: pathLabel.centerYAnchor),
 
+            pathLabel.bottomAnchor.constraint(lessThanOrEqualTo: saveButton.topAnchor, constant: -16),
+
             saveButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
             saveButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -18),
             cancelButton.trailingAnchor.constraint(equalTo: saveButton.leadingAnchor, constant: -10),
@@ -1518,6 +2726,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         bookmarkFolderPicker = folderPicker
         bookmarkNameField = nameField
         bookmarkPathField = pathField
+        bookmarkPlacementControl = placementControl
         if let host = window {
             let frame = editor.frame
             editor.setFrameOrigin(NSPoint(
@@ -1531,24 +2740,92 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         editor.makeFirstResponder(nameField)
     }
 
+    /// Default UI label for bar placement (stored as empty folder string).
+    private static let favoritesBarFolderName = "收藏栏"
+
+    private static func normalizedFavoritesFolderDisplay(_ raw: String?) -> String {
+        let name = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if AppSettings.isFavoritesBarFolder(name) {
+            return favoritesBarFolderName
+        }
+        return name
+    }
+
+    /// Persist empty folder for「收藏栏」so the address sits on the bar, not in a folder chip.
+    private static func storageFolder(fromDisplay raw: String?) -> String {
+        let display = normalizedFavoritesFolderDisplay(raw)
+        return display == favoritesBarFolderName ? "" : display
+    }
+
+    private static func populateFavoritesFolderPicker(
+        _ picker: NSPopUpButton,
+        folders: [String],
+        selected: String
+    ) {
+        picker.removeAllItems()
+        picker.addItem(withTitle: favoritesBarFolderName)
+        picker.item(at: 0)?.toolTip = "直接显示在收藏栏上（类似 Chrome），不放进文件夹"
+
+        var seen = Set([favoritesBarFolderName])
+        for folder in folders {
+            let name = folder.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty, !AppSettings.isFavoritesBarFolder(name), !seen.contains(name) else { continue }
+            picker.addItem(withTitle: name)
+            seen.insert(name)
+        }
+
+        let target = normalizedFavoritesFolderDisplay(selected)
+        if let index = picker.itemTitles.firstIndex(of: target) {
+            picker.selectItem(at: index)
+        } else if !AppSettings.isFavoritesBarFolder(target) {
+            picker.addItem(withTitle: target)
+            picker.selectItem(withTitle: target)
+        } else {
+            picker.selectItem(at: 0)
+        }
+        picker.isEnabled = true
+    }
+
+    @objc private func bookmarkPlacementChanged(_ sender: NSSegmentedControl) {
+        editingBookmarkPlacement = sender.selectedSegment == 1 ? .top : .left
+        refreshBookmarkFolderPicker(for: editingBookmarkPlacement)
+    }
+
+    private func refreshBookmarkFolderPicker(for placement: FavoritesPlacement) {
+        guard let folderPicker = bookmarkFolderPicker else { return }
+        let current = Self.normalizedFavoritesFolderDisplay(bookmarkFolderField?.stringValue)
+        let keepCustom = editingBookmarkID != nil
+            && current != Self.favoritesBarFolderName
+            && !settings.orderedBookmarkFolders(for: placement).contains(current)
+        let selected = keepCustom ? current : Self.favoritesBarFolderName
+        Self.populateFavoritesFolderPicker(
+            folderPicker,
+            folders: settings.orderedBookmarkFolders(for: placement),
+            selected: selected
+        )
+        bookmarkFolderField?.stringValue = folderPicker.titleOfSelectedItem ?? Self.favoritesBarFolderName
+    }
+
     @objc private func cancelBookmarkEditor() {
         bookmarkEditorPanel?.orderOut(nil)
         bookmarkEditorPanel = nil
         editingBookmarkID = nil
+        editingBookmarkPlacement = .left
     }
 
     @objc private func bookmarkFolderPickerChanged(_ sender: NSPopUpButton) {
-        guard sender.indexOfSelectedItem > 0 else { return }
-        bookmarkFolderField?.stringValue = sender.titleOfSelectedItem ?? ""
+        guard let title = sender.titleOfSelectedItem, !title.isEmpty else { return }
+        bookmarkFolderField?.stringValue = title
     }
 
     @objc private func saveBookmarkEditor() {
-        let folder = bookmarkFolderField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let folder = Self.storageFolder(fromDisplay: bookmarkFolderField?.stringValue)
         let name = bookmarkNameField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let rawPath = bookmarkPathField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let path = (rawPath as NSString).expandingTildeInPath
         var isDirectory: ObjCBool = false
-        guard !folder.isEmpty, !name.isEmpty, !path.isEmpty,
+        // folder may be empty when saving to the bar itself
+        guard !name.isEmpty, !path.isEmpty,
               FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
               isDirectory.boolValue else {
             NSSound.beep()
@@ -1556,25 +2833,36 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             return
         }
 
+        let placement: FavoritesPlacement =
+            bookmarkPlacementControl?.selectedSegment == 1 ? .top : .left
+        editingBookmarkPlacement = placement
+
         var updated = settings.bookmarks
+        // Keep left/top independent: same path may exist once per surface.
         let bookmarkID = editingBookmarkID
             ?? updated.first(where: {
-                URL(fileURLWithPath: $0.path).standardizedFileURL.path
+                $0.placement == placement
+                    && URL(fileURLWithPath: $0.path).standardizedFileURL.path
                     == URL(fileURLWithPath: path).standardizedFileURL.path
             })?.id
             ?? UUID()
-        let bookmark = Bookmark(id: bookmarkID, name: name, path: path, folder: folder)
+        let bookmark = Bookmark(
+            id: bookmarkID,
+            name: name,
+            path: path,
+            folder: folder,
+            placement: placement
+        )
         if let index = updated.firstIndex(where: { $0.id == bookmarkID }) {
             updated[index] = bookmark
         } else {
             updated.append(bookmark)
         }
         settings.bookmarks = updated
-        if !settings.bookmarkFolderOrder.contains(folder) {
-            settings.bookmarkFolderOrder = settings.bookmarkFolderOrder + [folder]
-        }
-        refreshBookmarkUI()
-        statusLabel.stringValue = "收藏已保存"
+        appendFolder(folder, to: placement)
+        applyFavoritesLayout(animated: true)
+        reloadFavoritesSidebar()
+        statusLabel.stringValue = placement == .top ? "已收藏到顶部" : "已收藏到左侧"
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
             guard let self else { return }
             self.updateStatus(selection: self.contentController.selectedItems)
@@ -1582,12 +2870,21 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         cancelBookmarkEditor()
     }
 
+    private func appendFolder(_ folder: String, to placement: FavoritesPlacement) {
+        let name = folder.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !AppSettings.isFavoritesBarFolder(name) else { return }
+        if placement == .top {
+            if !settings.topBookmarkFolderOrder.contains(name) {
+                settings.topBookmarkFolderOrder = settings.topBookmarkFolderOrder + [name]
+            }
+        } else if !settings.bookmarkFolderOrder.contains(name) {
+            settings.bookmarkFolderOrder = settings.bookmarkFolderOrder + [name]
+        }
+    }
+
     @objc private func removeBookmarkFromEditor() {
         guard let editingBookmarkID else { return }
-        var bookmarks = settings.bookmarks
-        bookmarks.removeAll { $0.id == editingBookmarkID }
-        settings.bookmarks = bookmarks
-        refreshBookmarkUI()
+        removeBookmark(id: editingBookmarkID)
         statusLabel.stringValue = "已取消收藏"
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
             guard let self else { return }
@@ -1596,10 +2893,99 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         cancelBookmarkEditor()
     }
 
-    private func showBookmarkFolderEditor(_ folder: String) {
+    private func removeBookmark(id: UUID) {
+        var bookmarks = settings.bookmarks
+        bookmarks.removeAll { $0.id == id }
+        settings.bookmarks = bookmarks
+        reloadFavoritesSidebar()
+    }
+
+    private func deleteBookmarkFolder(_ folder: String, placement: FavoritesPlacement) {
+        let alert = NSAlert()
+        alert.messageText = "删除收藏夹"
+        let side = placement == .top ? "顶部" : "左侧"
+        alert.informativeText = "将删除\(side)「\(folder)」及其全部收藏，不会影响另一侧。此操作不可撤销。"
+        alert.addButton(withTitle: "删除")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        var bookmarks = settings.bookmarks
+        bookmarks.removeAll { $0.folder == folder && $0.placement == placement }
+        settings.bookmarks = bookmarks
+        if placement == .top {
+            settings.topBookmarkFolderOrder = settings.topBookmarkFolderOrder.filter { $0 != folder }
+        } else {
+            settings.bookmarkFolderOrder = settings.bookmarkFolderOrder.filter { $0 != folder }
+        }
+        reloadFavoritesSidebar()
+    }
+
+    private func addCurrentDirectoryToFolder(_ folder: String, placement: FavoritesPlacement) {
+        let path = currentDirectory.standardizedFileURL.path
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            NSSound.beep()
+            return
+        }
+        var bookmarks = settings.bookmarks
+        if let index = bookmarks.firstIndex(where: {
+            $0.placement == placement
+                && URL(fileURLWithPath: $0.path).standardizedFileURL.path == path
+        }) {
+            bookmarks[index].folder = folder
+            if bookmarks[index].name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                bookmarks[index].name = currentDirectory.lastPathComponent
+            }
+        } else {
+            let name = path == "/" ? "Macintosh HD" : currentDirectory.lastPathComponent
+            bookmarks.append(
+                Bookmark(
+                    name: name.isEmpty ? path : name,
+                    path: path,
+                    folder: folder,
+                    placement: placement
+                )
+            )
+        }
+        settings.bookmarks = bookmarks
+        appendFolder(folder, to: placement)
+        reloadFavoritesSidebar()
+        let side = placement == .top ? "顶部" : "左侧"
+        statusLabel.stringValue = "已加入\(side)「\(folder)」"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+            guard let self else { return }
+            self.updateStatus(selection: self.contentController.selectedItems)
+        }
+    }
+
+    private func createBookmarkFolder(placement: FavoritesPlacement) {
+        let alert = NSAlert()
+        alert.messageText = placement == .top ? "新建顶部收藏夹" : "新建收藏夹"
+        alert.informativeText = "输入收藏夹名称："
+        alert.addButton(withTitle: "创建")
+        alert.addButton(withTitle: "取消")
+        let field = NSTextField(string: "收藏夹")
+        field.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
+        alert.accessoryView = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        appendFolder(name, to: placement)
+        reloadFavoritesSidebar()
+        statusLabel.stringValue = "已创建收藏夹「\(name)」"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+            guard let self else { return }
+            self.updateStatus(selection: self.contentController.selectedItems)
+        }
+    }
+
+    private func showBookmarkFolderEditor(_ folder: String, placement: FavoritesPlacement) {
         let alert = NSAlert()
         alert.messageText = "重命名收藏夹"
-        alert.informativeText = "收藏夹名称："
+        alert.informativeText = placement == .top ? "顶部收藏夹名称：" : "左侧收藏夹名称："
         alert.addButton(withTitle: "保存")
         alert.addButton(withTitle: "删除收藏夹")
         alert.addButton(withTitle: "取消")
@@ -1607,6 +2993,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         field.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
         alert.accessoryView = field
         editingBookmarkFolderName = folder
+        editingBookmarkFolderPlacement = placement
         let response = alert.runModal()
         if response == .alertFirstButtonReturn {
             let newName = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1615,18 +3002,18 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
                 return
             }
             var bookmarks = settings.bookmarks
-            for i in bookmarks.indices where bookmarks[i].folder == folder {
+            for i in bookmarks.indices where bookmarks[i].folder == folder && bookmarks[i].placement == placement {
                 bookmarks[i].folder = newName
             }
             settings.bookmarks = bookmarks
-            settings.bookmarkFolderOrder = settings.bookmarkFolderOrder.map { $0 == folder ? newName : $0 }
-            refreshBookmarkUI()
+            if placement == .top {
+                settings.topBookmarkFolderOrder = settings.topBookmarkFolderOrder.map { $0 == folder ? newName : $0 }
+            } else {
+                settings.bookmarkFolderOrder = settings.bookmarkFolderOrder.map { $0 == folder ? newName : $0 }
+            }
+            reloadFavoritesSidebar()
         } else if response == .alertSecondButtonReturn {
-            var bookmarks = settings.bookmarks
-            bookmarks.removeAll { $0.folder == folder }
-            settings.bookmarks = bookmarks
-            settings.bookmarkFolderOrder = settings.bookmarkFolderOrder.filter { $0 != folder }
-            refreshBookmarkUI()
+            deleteBookmarkFolder(folder, placement: placement)
         }
         editingBookmarkFolderName = nil
     }
@@ -1636,7 +3023,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             NSSound.beep()
             return
         }
-        navigate(to: URL(fileURLWithPath: path))
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
+        navigate(to: url)
     }
 
     @objc func openSettings(_ sender: Any?) {
@@ -1644,21 +3032,20 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     @objc private func settingsChanged() {
-        reloadContents()
+        // New-type /「单独展示」changes only affect the titlebar New cluster.
+        // Avoid reloading favorites / contents — that causes the top favorites bar to flash.
         chromeHeader.rebuildNewItemTypes(settings.newItemTypes)
-        refreshBookmarkUI()
     }
 
     @objc func searchChanged(_ sender: NSSearchField) {
+        if activeTab.isActivityMonitorTab || activeTab.isTemperatureTab { return }
         let query = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if query.isEmpty {
+            contentController.setSearchResultsMode(query: nil, scopeName: "", resultCount: 0)
             reloadContents()
             return
         }
-        let urls = FileOperations.search(in: currentDirectory, query: query)
-        let items = urls.compactMap(FileItem.from)
-        contentController.setItems(items)
-        updateStatus(selection: [])
+        applySearch(query: query)
     }
 
     // MARK: - Path editing
@@ -1868,8 +3255,146 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     func windowWillClose(_ notification: Notification) {
+        activityMonitorController?.deactivate()
+        temperatureController?.deactivate()
         stopWatching()
         hideAutocomplete()
+    }
+}
+
+/// macOS traffic-light close (red disk + × on hover). Drawn ourselves so AppKit cannot
+/// yank the real `.closeButton` back to the leading titlebar.
+final class MacStyleCloseButton: NSControl {
+    private let disk = CALayer()
+    private let mark = CATextLayer()
+    private var hover = false
+    private var pressed = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        focusRingType = .none
+        wantsLayer = true
+        layer?.masksToBounds = false
+        isEnabled = true
+
+        disk.cornerRadius = 6
+        disk.bounds = CGRect(x: 0, y: 0, width: 12, height: 12)
+        layer?.addSublayer(disk)
+
+        mark.string = "×"
+        mark.alignmentMode = .center
+        mark.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+        mark.foregroundColor = NSColor.black.withAlphaComponent(0.55).cgColor
+        mark.frame = CGRect(x: 0, y: -0.5, width: 12, height: 12)
+        mark.isHidden = true
+        // CATextLayer uses UI-style fonts via CFString.
+        mark.font = NSFont.systemFont(ofSize: 9, weight: .bold)
+        mark.fontSize = 9
+        disk.addSublayer(mark)
+
+        updateColors()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 20, height: 20) }
+
+    override func layout() {
+        super.layout()
+        let size: CGFloat = 12
+        disk.bounds = CGRect(x: 0, y: 0, width: size, height: size)
+        disk.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        mark.frame = CGRect(x: 0, y: -0.5, width: size, height: size)
+        mark.contentsScale = window?.backingScaleFactor ?? 2
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.activeInKeyWindow, .mouseEnteredAndExited, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hover = true
+        updateColors()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hover = false
+        pressed = false
+        updateColors()
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        // Track until mouseUp so the click still fires even if AppKit wouldn't
+        // deliver mouseUp after a custom mouseDown (NSButton pitfall).
+        pressed = true
+        updateColors()
+        var keepTracking = true
+        while keepTracking {
+            guard let next = window?.nextEvent(
+                matching: [.leftMouseUp, .leftMouseDragged],
+                until: .distantFuture,
+                inMode: .eventTracking,
+                dequeue: true
+            ) else { break }
+
+            let local = convert(next.locationInWindow, from: nil)
+            let inside = bounds.contains(local)
+            switch next.type {
+            case .leftMouseDragged:
+                pressed = inside
+                updateColors()
+            case .leftMouseUp:
+                pressed = false
+                updateColors()
+                if inside {
+                    sendAction(action, to: target)
+                }
+                keepTracking = false
+            default:
+                keepTracking = false
+            }
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        refreshAppearance()
+    }
+
+    func refreshAppearance() {
+        updateColors()
+    }
+
+    private func updateColors() {
+        let key = window?.isKeyWindow ?? true
+        let fill: NSColor
+        let border: NSColor
+        if !key {
+            fill = NSColor(calibratedRed: 0.75, green: 0.75, blue: 0.75, alpha: 1)
+            border = NSColor(calibratedRed: 0.65, green: 0.65, blue: 0.65, alpha: 1)
+        } else if pressed {
+            fill = NSColor(calibratedRed: 0.75, green: 0.14, blue: 0.11, alpha: 1)
+            border = NSColor(calibratedRed: 0.60, green: 0.10, blue: 0.08, alpha: 1)
+        } else {
+            fill = NSColor(calibratedRed: 1.0, green: 0.373, blue: 0.341, alpha: 1)
+            border = NSColor(calibratedRed: 0.878, green: 0.267, blue: 0.243, alpha: 1)
+        }
+        disk.backgroundColor = fill.cgColor
+        disk.borderColor = border.cgColor
+        disk.borderWidth = 0.5
+        mark.isHidden = !(hover && key)
     }
 }
 
@@ -2263,6 +3788,35 @@ final class BreadcrumbChevronButton: NSView {
             NSBezierPath(roundedRect: bounds.insetBy(dx: 0, dy: 1), xRadius: 3, yRadius: 3).fill()
         }
         super.draw(dirtyRect)
+    }
+}
+
+extension BrowserWindowController: NSSplitViewDelegate {
+    func splitView(_ splitView: NSSplitView, constrainMinCoordinate proposedMinimumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
+        0
+    }
+
+    func splitView(_ splitView: NSSplitView, constrainMaxCoordinate proposedMaximumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
+        max(0, splitView.bounds.width - 120)
+    }
+
+    func splitView(_ splitView: NSSplitView, canCollapseSubview subview: NSView) -> Bool {
+        subview === favoritesSidebar.view
+    }
+
+    func splitView(_ splitView: NSSplitView, shouldHideDividerAt dividerIndex: Int) -> Bool {
+        favoritesSidebar.view.isHidden || !settings.favoritesSidebarVisible
+    }
+
+    func splitViewDidResizeSubviews(_ notification: Notification) {
+        guard !isApplyingFavoritesLayout else { return }
+        guard let split = mainSplitView, split.subviews.count >= 1 else { return }
+        guard settings.favoritesSidebarVisible,
+              !favoritesSidebar.view.isHidden else { return }
+        let width = split.subviews[0].bounds.width
+        // Skip only fully collapsed (e.g. transient layout); any positive width is remembered.
+        guard width > 0 else { return }
+        settings.favoritesSidebarWidth = width
     }
 }
 

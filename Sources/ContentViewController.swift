@@ -11,6 +11,10 @@ final class ContentViewController: NSViewController {
     var onRenameRequest: ((FileItem) -> Void)?
     var onCommitRename: ((FileItem, String) -> Void)?
     var onGoEnclosingFolder: (() -> Void)?
+    var onToggleFavoritesSidebar: (() -> Void)?
+    var onToggleFavoritesTopBar: (() -> Void)?
+    /// Copy selected item path(s), or the current folder path when nothing is selected.
+    var onCopyPathRequest: (() -> Void)?
     /// Called after compress/extract so the browser can reload the folder.
     var onDirectoryNeedsReload: (() -> Void)?
     /// Open one or more archives in Chrome-style tabs.
@@ -20,6 +24,23 @@ final class ContentViewController: NSViewController {
     /// Handle a file drop: sources, destination folder, whether to copy (true) or move (false).
     var onPerformFileDrop: (([URL], URL, Bool) -> Void)?
 
+    /// Clear the active search (called from the search-results banner).
+    var onClearSearch: (() -> Void)?
+    /// Clear recent-open history (history page banner).
+    var onClearOpenHistory: (() -> Void)?
+    /// Dismiss the in-window history page (Esc / toggle).
+    var onDismissHistoryPage: (() -> Void)?
+    /// From search results: open the item's enclosing folder and select it.
+    var onRevealInEnclosingFolder: ((URL) -> Void)?
+    /// Empty the trash folder (NF trash mode).
+    var onEmptyTrash: (() -> Void)?
+    /// Put selected trash items back (Finder Put Away).
+    var onPutBackFromTrash: (() -> Void)?
+    /// Permanently delete selected trash items.
+    var onDeleteFromTrash: (() -> Void)?
+    /// Uninstall selected apps from an Applications folder.
+    var onUninstallApps: (() -> Void)?
+
     private(set) var items: [FileItem] = []
     /// Top-level items for the current folder (tree root).
     private var rootItems: [FileItem] = []
@@ -28,14 +49,39 @@ final class ContentViewController: NSViewController {
     private var childrenCache: [URL: [FileItem]] = [:]
     private var loadingExpandURLs: Set<URL> = []
     private var zoomFactor: CGFloat = 1
+    private var isShowingSearchResults = false
+    private var isShowingTrash = false
+    private(set) var isShowingApplications = false
+    private(set) var isShowingHistory = false
+    private var searchQuery: String = ""
+    /// Local filter for Applications uninstall mode (banner search field).
+    private var applicationsFilterQuery: String = ""
+    /// Apps marked via the list checkboxes for thorough uninstall.
+    private var checkedUninstallURLs: Set<URL> = []
+    /// Trailing-slash path of the search root so results can strip this prefix when displayed.
+    private var searchRootPath: String = ""
 
     private var listScroll: NSScrollView!
     private var listView: NSTableView!
     private var emptyLabel: NSTextField!
+    private var searchBanner: NSView!
+    private var searchBannerLabel: NSTextField!
+    private var applicationsFilterField: NSSearchField!
+    private var searchBannerActionButton: NSButton!
+    private var headerCheckButton: NSButton!
+    private var searchBannerHeight: NSLayoutConstraint!
+    private var listTopToRoot: NSLayoutConstraint!
+    private var listTopToBanner: NSLayoutConstraint!
+    /// Banner layouts: apps = uninstall left + search; other = label left + action right.
+    private var bannerDefaultConstraints: [NSLayoutConstraint] = []
+    private var bannerApplicationsConstraints: [NSLayoutConstraint] = []
     private weak var renamingField: NSTextField?
     private var renamingItem: FileItem?
     private var renamingOriginalName: String?
     private weak var openWithMenuItem: NSMenuItem?
+    private weak var putBackMenuItem: NSMenuItem?
+    private weak var deleteForeverMenuItem: NSMenuItem?
+    private weak var uninstallMenuItem: NSMenuItem?
     /// URLs currently fed to QLPreviewPanel (non-archive files/folders).
     private var previewItems: [URL] = []
 
@@ -58,6 +104,54 @@ final class ContentViewController: NSViewController {
         emptyLabel.isHidden = true
         emptyLabel.translatesAutoresizingMaskIntoConstraints = false
 
+        searchBanner = NSView()
+        searchBanner.translatesAutoresizingMaskIntoConstraints = false
+        searchBanner.wantsLayer = true
+        searchBanner.isHidden = true
+        searchBannerLabel = NSTextField(labelWithString: "")
+        searchBannerLabel.translatesAutoresizingMaskIntoConstraints = false
+        searchBannerLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        searchBannerLabel.textColor = .labelColor
+        searchBannerLabel.lineBreakMode = .byTruncatingTail
+        applicationsFilterField = NSSearchField()
+        applicationsFilterField.translatesAutoresizingMaskIntoConstraints = false
+        applicationsFilterField.placeholderString = "搜索应用名称"
+        applicationsFilterField.controlSize = .small
+        applicationsFilterField.font = .systemFont(ofSize: 12)
+        applicationsFilterField.sendsSearchStringImmediately = true
+        applicationsFilterField.sendsWholeSearchString = false
+        applicationsFilterField.target = self
+        applicationsFilterField.action = #selector(applicationsFilterChanged(_:))
+        applicationsFilterField.isHidden = true
+        applicationsFilterField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        applicationsFilterField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let clearSearch = NSButton(title: "清除搜索", target: self, action: #selector(clearSearchClicked))
+        clearSearch.bezelStyle = .recessed
+        clearSearch.controlSize = .small
+        clearSearch.font = .systemFont(ofSize: 11)
+        clearSearch.translatesAutoresizingMaskIntoConstraints = false
+        searchBannerActionButton = clearSearch
+        searchBanner.addSubview(searchBannerLabel)
+        searchBanner.addSubview(applicationsFilterField)
+        searchBanner.addSubview(clearSearch)
+
+        bannerDefaultConstraints = [
+            searchBannerLabel.leadingAnchor.constraint(equalTo: searchBanner.leadingAnchor, constant: 12),
+            searchBannerLabel.centerYAnchor.constraint(equalTo: searchBanner.centerYAnchor),
+            searchBannerLabel.trailingAnchor.constraint(lessThanOrEqualTo: clearSearch.leadingAnchor, constant: -8),
+            clearSearch.trailingAnchor.constraint(equalTo: searchBanner.trailingAnchor, constant: -10),
+            clearSearch.centerYAnchor.constraint(equalTo: searchBanner.centerYAnchor)
+        ]
+        bannerApplicationsConstraints = [
+            clearSearch.leadingAnchor.constraint(equalTo: searchBanner.leadingAnchor, constant: 10),
+            clearSearch.centerYAnchor.constraint(equalTo: searchBanner.centerYAnchor),
+            applicationsFilterField.leadingAnchor.constraint(equalTo: clearSearch.trailingAnchor, constant: 8),
+            applicationsFilterField.centerYAnchor.constraint(equalTo: searchBanner.centerYAnchor),
+            applicationsFilterField.trailingAnchor.constraint(equalTo: searchBanner.trailingAnchor, constant: -10),
+            applicationsFilterField.heightAnchor.constraint(equalToConstant: 22)
+        ]
+        NSLayoutConstraint.activate(bannerDefaultConstraints)
+
         listScroll = NSScrollView()
         listScroll.hasVerticalScroller = true
         listScroll.hasHorizontalScroller = true
@@ -75,6 +169,16 @@ final class ContentViewController: NSViewController {
         table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         table.doubleAction = #selector(listDoubleClicked)
         table.target = self
+        table.headerView = NSTableHeaderView(frame: NSRect(x: 0, y: 0, width: 0, height: 29))
+
+        let checkCol = NSTableColumn(identifier: .init("check"))
+        checkCol.title = ""
+        checkCol.width = 0
+        checkCol.minWidth = 0
+        checkCol.maxWidth = 0
+        checkCol.resizingMask = []
+        checkCol.isHidden = true
+        table.addTableColumn(checkCol)
 
         let nameCol = NSTableColumn(identifier: .init("name"))
         nameCol.title = "名称"
@@ -121,12 +225,31 @@ final class ContentViewController: NSViewController {
         listScroll.documentView = table
         updateSortIndicator()
 
+        headerCheckButton = NSButton(checkboxWithTitle: "", target: self, action: #selector(headerCheckToggled(_:)))
+        headerCheckButton.controlSize = .regular
+        headerCheckButton.focusRingType = .none
+        headerCheckButton.allowsMixedState = true
+        headerCheckButton.isHidden = true
+        headerCheckButton.toolTip = "取消全选"
+        table.headerView?.addSubview(headerCheckButton)
+
+        root.addSubview(searchBanner)
         root.addSubview(listScroll)
         root.addSubview(emptyLabel)
         view = root
 
+        searchBannerHeight = searchBanner.heightAnchor.constraint(equalToConstant: 0)
+        listTopToRoot = listScroll.topAnchor.constraint(equalTo: root.topAnchor)
+        listTopToBanner = listScroll.topAnchor.constraint(equalTo: searchBanner.bottomAnchor)
+        listTopToBanner.isActive = false
+
         NSLayoutConstraint.activate([
-            listScroll.topAnchor.constraint(equalTo: root.topAnchor),
+            searchBanner.topAnchor.constraint(equalTo: root.topAnchor),
+            searchBanner.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            searchBanner.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            searchBannerHeight,
+
+            listTopToRoot,
             listScroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             listScroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             listScroll.bottomAnchor.constraint(equalTo: root.bottomAnchor),
@@ -143,14 +266,25 @@ final class ContentViewController: NSViewController {
         openWith.submenu = NSMenu()
         openWithMenuItem = openWith
         menu.addItem(openWith)
-        menu.addItem(withTitle: "快速查看", action: #selector(contextQuickLook), keyEquivalent: "")
-        menu.addItem(withTitle: "显示简介", action: #selector(contextGetInfo), keyEquivalent: "")
+        menu.addItem(withTitle: "打开所在位置", action: #selector(contextRevealInEnclosingFolder), keyEquivalent: "")
+        menu.addItem(NSMenuItem.separator())
+        let putBack = NSMenuItem(title: "放回原处", action: #selector(contextPutBack), keyEquivalent: "")
+        putBackMenuItem = putBack
+        menu.addItem(putBack)
+        let deleteForever = NSMenuItem(title: "彻底删除", action: #selector(contextDeleteForever), keyEquivalent: "")
+        deleteForeverMenuItem = deleteForever
+        menu.addItem(deleteForever)
+        let uninstall = NSMenuItem(title: "卸载…", action: #selector(contextUninstallApps), keyEquivalent: "")
+        uninstallMenuItem = uninstall
+        menu.addItem(uninstall)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(withTitle: "压缩…", action: #selector(contextCompress), keyEquivalent: "")
         menu.addItem(withTitle: "解压…", action: #selector(contextExtract), keyEquivalent: "")
         menu.addItem(withTitle: "打开压缩包", action: #selector(contextOpenArchive), keyEquivalent: "")
         menu.addItem(NSMenuItem.separator())
         menu.addItem(withTitle: "赋予修改权限", action: #selector(contextMakeWritable), keyEquivalent: "")
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(withTitle: "拷贝当前地址", action: #selector(contextCopyPath), keyEquivalent: "")
         listView.menu = menu
 
         // Keep NSTableView → NSScrollView intact so mouse-wheel scrolling works.
@@ -225,7 +359,9 @@ final class ContentViewController: NSViewController {
     func applyZoomFactor(_ factor: CGFloat) {
         zoomFactor = min(5, max(0.3, factor))
         guard isViewLoaded, listView != nil else { return }
-        listView.rowHeight = max(16, round(22 * zoomFactor))
+        let baseRow: CGFloat = isShowingApplications ? 28 : 22
+        listView.rowHeight = max(16, round(baseRow * zoomFactor))
+        updateApplicationsCheckColumn()
         if let expand = listView.tableColumn(withIdentifier: .init("expand")) {
             let w = max(11, round(15 * zoomFactor))
             expand.width = w
@@ -238,13 +374,461 @@ final class ContentViewController: NSViewController {
         listView.tile()
     }
 
-    func setItems(_ items: [FileItem], alreadySortedByName: Bool = false) {
+    func setItems(_ items: [FileItem], alreadySortedByName: Bool = false, select: [URL]? = nil) {
         replaceRootListing(
             items,
             preservingOutline: false,
             alreadySortedByName: alreadySortedByName,
-            select: selectedItems.map(\.url.standardizedFileURL)
+            select: select ?? selectedItems.map(\.url.standardizedFileURL)
         )
+    }
+
+    /// Patch sizes onto matching rows (used while package sizes fill in after a fast listing).
+    func applyFileSizes(_ sizes: [URL: Int64]) {
+        guard !sizes.isEmpty else { return }
+        let selected = selectedItems.map(\.url.standardizedFileURL)
+        var changed = false
+
+        func patch(_ item: FileItem) -> FileItem {
+            let key = item.url.standardizedFileURL
+            guard let size = sizes[key], item.fileSize != size else { return item }
+            changed = true
+            return item.withFileSize(size)
+        }
+
+        rootItems = rootItems.map(patch)
+        if !childrenCache.isEmpty {
+            var nextCache: [URL: [FileItem]] = [:]
+            for (key, kids) in childrenCache {
+                nextCache[key] = kids.map(patch)
+            }
+            childrenCache = nextCache
+        }
+        guard changed else { return }
+        rebuildVisibleRows(preservingSelection: true, selectedURLs: selected)
+        onSelectionChange?(selectedItems)
+    }
+
+    /// Show or hide the search-results chrome so search mode is visually distinct.
+    func setSearchResultsMode(query: String?, scopeName: String, resultCount: Int, searchRoot: URL? = nil) {
+        let active = !(query?.isEmpty ?? true)
+        if active {
+            isShowingTrash = false
+        }
+        let wasActive = isShowingSearchResults
+        isShowingSearchResults = active
+        searchQuery = query ?? ""
+        if let root = searchRoot?.standardizedFileURL {
+            var path = root.path
+            if path != "/", !path.hasSuffix("/") {
+                path += "/"
+            }
+            searchRootPath = path
+        } else {
+            searchRootPath = ""
+        }
+
+        if active, let query {
+            isShowingApplications = false
+            isShowingHistory = false
+            checkedUninstallURLs.removeAll()
+            applicationsFilterQuery = ""
+            applicationsFilterField.stringValue = ""
+            setBannerPrimaryContent(isApplicationsFilter: false)
+            applyBannerChrome(active: true)
+            let scope = scopeName.isEmpty ? "当前文件夹" : scopeName
+            searchBannerLabel.stringValue = "搜索结果 · 「\(query)」 · \(resultCount) 项 · 在「\(scope)」中"
+            emptyLabel.stringValue = "无匹配结果"
+            searchBannerActionButton.title = "清除搜索"
+            searchBannerActionButton.action = #selector(clearSearchClicked)
+            searchBannerActionButton.target = self
+            searchBannerActionButton.isEnabled = true
+            let tint = NSColor.systemYellow.withAlphaComponent(0.18)
+            searchBanner.layer?.backgroundColor = tint.cgColor
+            view.layer?.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.06).cgColor
+        } else if !isShowingTrash && !isShowingApplications && !isShowingHistory {
+            applyBannerChrome(active: false)
+            emptyLabel.stringValue = "文件夹为空"
+            view.layer?.backgroundColor = NSColor.textBackgroundColor.cgColor
+        }
+        // Avoid reloadData when already leaving search — it clears the table selection.
+        if active || wasActive {
+            listView?.reloadData()
+        }
+        view.needsLayout = true
+    }
+
+    /// Finder-like Trash chrome inside NewFinder.
+    func setTrashMode(active: Bool, itemCount: Int) {
+        let wasActive = isShowingTrash
+        isShowingTrash = active
+        if active {
+            isShowingApplications = false
+            isShowingHistory = false
+            checkedUninstallURLs.removeAll()
+            applicationsFilterQuery = ""
+            applicationsFilterField.stringValue = ""
+            isShowingSearchResults = false
+            searchQuery = ""
+            setBannerPrimaryContent(isApplicationsFilter: false)
+            applyBannerChrome(active: true)
+            searchBannerLabel.stringValue = itemCount == 0
+                ? "废纸篓为空"
+                : "废纸篓 · \(itemCount) 项"
+            emptyLabel.stringValue = "废纸篓为空"
+            searchBannerActionButton.title = "清空废纸篓"
+            searchBannerActionButton.action = #selector(emptyTrashClicked)
+            searchBannerActionButton.target = self
+            searchBannerActionButton.isEnabled = itemCount > 0
+            let tint = NSColor.systemGray.withAlphaComponent(0.22)
+            searchBanner.layer?.backgroundColor = tint.cgColor
+            view.layer?.backgroundColor = NSColor.systemGray.withAlphaComponent(0.06).cgColor
+        } else if !isShowingSearchResults && !isShowingApplications && !isShowingHistory {
+            applyBannerChrome(active: false)
+            emptyLabel.stringValue = "文件夹为空"
+            view.layer?.backgroundColor = NSColor.textBackgroundColor.cgColor
+            searchBannerActionButton.isEnabled = true
+        }
+        if active || wasActive {
+            listView?.reloadData()
+        }
+        view.needsLayout = true
+    }
+
+    /// Applications folder: checkbox multi-select + filter + uninstall chrome.
+    func setApplicationsMode(active: Bool) {
+        let wasActive = isShowingApplications
+        isShowingApplications = active
+        if active {
+            isShowingTrash = false
+            isShowingSearchResults = false
+            isShowingHistory = false
+            searchQuery = ""
+            if !wasActive {
+                applicationsFilterQuery = ""
+                applicationsFilterField.stringValue = ""
+                checkedUninstallURLs.removeAll()
+            }
+            setBannerPrimaryContent(isApplicationsFilter: true)
+            applyBannerChrome(active: true)
+            emptyLabel.stringValue = applicationsFilterQuery.isEmpty ? "没有应用程序" : "无匹配应用"
+            let tint = NSColor.systemBlue.withAlphaComponent(0.12)
+            searchBanner.layer?.backgroundColor = tint.cgColor
+            view.layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.04).cgColor
+            refreshApplicationsBanner()
+        } else {
+            applicationsFilterQuery = ""
+            applicationsFilterField.stringValue = ""
+            checkedUninstallURLs.removeAll()
+            setBannerPrimaryContent(isApplicationsFilter: false)
+            if !isShowingSearchResults && !isShowingTrash && !isShowingHistory {
+                applyBannerChrome(active: false)
+                emptyLabel.stringValue = "文件夹为空"
+                view.layer?.backgroundColor = NSColor.textBackgroundColor.cgColor
+                searchBannerActionButton.isEnabled = true
+            }
+        }
+        if active || wasActive {
+            applyZoomFactor(zoomFactor)
+            updateApplicationsCheckColumn()
+            if !active, wasActive {
+                rebuildVisibleRows(preservingSelection: true)
+            } else {
+                listView?.reloadData()
+            }
+        }
+        view.needsLayout = true
+    }
+
+    func refreshApplicationsBanner() {
+        guard isShowingApplications else { return }
+        setBannerPrimaryContent(isApplicationsFilter: true)
+        let count = checkedUninstallURLs.count
+        if count == 0 {
+            searchBannerActionButton.title = "卸载"
+            searchBannerActionButton.isEnabled = false
+        } else {
+            searchBannerActionButton.title = count == 1 ? "卸载" : "卸载（\(count)）"
+            searchBannerActionButton.isEnabled = true
+        }
+        searchBannerActionButton.action = #selector(uninstallAppsClicked)
+        searchBannerActionButton.target = self
+        updateHeaderCheckButton()
+    }
+
+    /// Recent-open history page chrome (in-window list, not a dropdown).
+    func setHistoryMode(active: Bool, itemCount: Int) {
+        let wasActive = isShowingHistory
+        isShowingHistory = active
+        if active {
+            isShowingTrash = false
+            isShowingSearchResults = false
+            isShowingApplications = false
+            searchQuery = ""
+            checkedUninstallURLs.removeAll()
+            applicationsFilterQuery = ""
+            applicationsFilterField.stringValue = ""
+            setBannerPrimaryContent(isApplicationsFilter: false)
+            applyBannerChrome(active: true)
+            searchBannerLabel.stringValue = itemCount == 0
+                ? "最近打开 · 暂无记录"
+                : "最近打开 · \(itemCount) 项"
+            emptyLabel.stringValue = "暂无打开历史"
+            searchBannerActionButton.title = "清除历史"
+            searchBannerActionButton.action = #selector(clearOpenHistoryClicked)
+            searchBannerActionButton.target = self
+            searchBannerActionButton.isEnabled = itemCount > 0
+            let tint = NSColor.systemPurple.withAlphaComponent(0.14)
+            searchBanner.layer?.backgroundColor = tint.cgColor
+            view.layer?.backgroundColor = NSColor.systemPurple.withAlphaComponent(0.04).cgColor
+            if let dateCol = listView?.tableColumn(withIdentifier: .init("date")) {
+                dateCol.title = "打开时间"
+            }
+        } else {
+            if let dateCol = listView?.tableColumn(withIdentifier: .init("date")) {
+                dateCol.title = "修改日期"
+            }
+            if !isShowingSearchResults && !isShowingTrash && !isShowingApplications {
+                applyBannerChrome(active: false)
+                emptyLabel.stringValue = "文件夹为空"
+                view.layer?.backgroundColor = NSColor.textBackgroundColor.cgColor
+                searchBannerActionButton.isEnabled = true
+            }
+        }
+        updateApplicationsCheckColumn()
+        if active || wasActive {
+            listView?.reloadData()
+        }
+        view.needsLayout = true
+    }
+
+    @objc private func clearOpenHistoryClicked() {
+        onClearOpenHistory?()
+    }
+
+    private func setBannerPrimaryContent(isApplicationsFilter: Bool) {
+        applicationsFilterField.isHidden = !isApplicationsFilter
+        searchBannerLabel.isHidden = isApplicationsFilter
+        if isApplicationsFilter {
+            NSLayoutConstraint.deactivate(bannerDefaultConstraints)
+            NSLayoutConstraint.activate(bannerApplicationsConstraints)
+        } else {
+            NSLayoutConstraint.deactivate(bannerApplicationsConstraints)
+            NSLayoutConstraint.activate(bannerDefaultConstraints)
+        }
+    }
+
+    private func applyBannerChrome(active: Bool) {
+        searchBanner.isHidden = !active
+        searchBannerHeight.constant = active ? 32 : 0
+        listTopToRoot.isActive = !active
+        listTopToBanner.isActive = active
+    }
+
+    private func updateApplicationsCheckColumn() {
+        guard let listView,
+              let col = listView.tableColumn(withIdentifier: .init("check")) else { return }
+        if isShowingApplications {
+            let side = max(24, round(16 * zoomFactor) + 10)
+            col.isHidden = false
+            col.width = side
+            col.minWidth = side
+            col.maxWidth = side
+        } else {
+            col.isHidden = true
+            col.width = 0
+            col.minWidth = 0
+            col.maxWidth = 0
+        }
+        updateHeaderCheckButton()
+    }
+
+    private func visiblePackagesForCheck() -> [FileItem] {
+        items.filter { $0.isPackage || $0.isDirectory || $0.url.pathExtension.lowercased() == "app" }
+    }
+
+    private func updateHeaderCheckButton() {
+        guard isViewLoaded, headerCheckButton != nil, let listView, let header = listView.headerView else { return }
+        let colIndex = listView.column(withIdentifier: .init("check"))
+        guard isShowingApplications, colIndex >= 0,
+              let col = listView.tableColumn(withIdentifier: .init("check")),
+              !col.isHidden else {
+            headerCheckButton.isHidden = true
+            return
+        }
+
+        let rect = header.headerRect(ofColumn: colIndex)
+        let side: CGFloat = 18
+        headerCheckButton.frame = NSRect(
+            x: floor(rect.midX - side / 2),
+            y: floor(rect.midY - side / 2),
+            width: side,
+            height: side
+        )
+        headerCheckButton.isHidden = false
+
+        let packages = visiblePackagesForCheck()
+        let checkedCount = packages.reduce(into: 0) { count, item in
+            if checkedUninstallURLs.contains(item.url.standardizedFileURL) {
+                count += 1
+            }
+        }
+        headerCheckButton.isEnabled = !packages.isEmpty
+        // Setting mixed/on/off while allowsMixedState can fight user clicks; sync carefully.
+        if packages.isEmpty || checkedCount == 0 {
+            headerCheckButton.state = .off
+        } else if checkedCount == packages.count {
+            headerCheckButton.state = .on
+        } else {
+            headerCheckButton.state = .mixed
+        }
+    }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        updateHeaderCheckButton()
+    }
+
+    @objc private func headerCheckToggled(_ sender: NSButton) {
+        guard isShowingApplications else { return }
+        // Header control always clears checks (never select-all).
+        checkedUninstallURLs.removeAll()
+        listView.reloadData()
+        refreshApplicationsBanner()
+        DispatchQueue.main.async { [weak self] in
+            self?.updateHeaderCheckButton()
+        }
+    }
+
+    @objc private func applicationsFilterChanged(_ sender: NSSearchField) {
+        guard isShowingApplications else { return }
+        applicationsFilterQuery = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        rebuildVisibleRows(preservingSelection: true)
+        emptyLabel.isHidden = !items.isEmpty
+        emptyLabel.stringValue = applicationsFilterQuery.isEmpty ? "没有应用程序" : "无匹配应用"
+    }
+
+    @objc private func appCheckToggled(_ sender: NSButton) {
+        let row = sender.tag
+        guard items.indices.contains(row) else { return }
+        let url = items[row].url.standardizedFileURL
+        if sender.state == .on {
+            checkedUninstallURLs.insert(url)
+        } else {
+            checkedUninstallURLs.remove(url)
+        }
+        refreshApplicationsBanner()
+    }
+
+    /// Packages / app folders marked for thorough uninstall (checkboxes preferred, else table selection).
+    var packagesForUninstall: [FileItem] {
+        if !checkedUninstallURLs.isEmpty {
+            return checkedUninstallURLs.compactMap { url -> FileItem? in
+                if let item = rootItems.first(where: { $0.url.standardizedFileURL == url }) {
+                    return item
+                }
+                return FileItem.from(url: url)
+            }.filter { $0.isPackage || $0.isDirectory }
+        }
+        return selectedItems.filter { $0.isPackage || $0.isDirectory }
+    }
+
+    func clearUninstallChecks(for urls: [URL]) {
+        let paths = Set(urls.map { $0.standardizedFileURL.path })
+        checkedUninstallURLs = checkedUninstallURLs.filter { !paths.contains($0.path) }
+        refreshApplicationsBanner()
+        listView?.reloadData()
+    }
+
+    @objc private func clearSearchClicked() {
+        onClearSearch?()
+    }
+
+    @objc private func emptyTrashClicked() {
+        onEmptyTrash?()
+    }
+
+    @objc private func uninstallAppsClicked() {
+        onUninstallApps?()
+    }
+
+    @objc private func contextPutBack() {
+        ensureClickedRowSelected()
+        onPutBackFromTrash?()
+    }
+
+    @objc private func contextDeleteForever() {
+        ensureClickedRowSelected()
+        onDeleteFromTrash?()
+    }
+
+    @objc private func contextUninstallApps() {
+        ensureClickedRowSelected()
+        onUninstallApps?()
+    }
+
+    private func attributedName(for item: FileItem) -> NSAttributedString {
+        let fontSize = max(10, round(13 * zoomFactor))
+        let baseFont = NSFont.systemFont(ofSize: fontSize)
+        let color = nameTextColor(for: item)
+        let display: String
+        if isShowingHistory {
+            display = item.url.path
+        } else if isShowingSearchResults {
+            display = searchResultPath(for: item)
+        } else {
+            display = item.name
+        }
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingMiddle
+        paragraph.lineSpacing = 0
+
+        guard isShowingSearchResults, !searchQuery.isEmpty else {
+            return NSAttributedString(string: display, attributes: [
+                .font: baseFont,
+                .foregroundColor: color,
+                .paragraphStyle: paragraph
+            ])
+        }
+
+        let result = NSMutableAttributedString(string: display, attributes: [
+            .font: baseFont,
+            .foregroundColor: color,
+            .paragraphStyle: paragraph
+        ])
+        let keywords = searchQuery
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init)
+            .filter { !$0.isEmpty }
+        let lower = display.lowercased()
+        for keyword in keywords {
+            let key = keyword.lowercased()
+            var searchStart = lower.startIndex
+            while let range = lower.range(of: key, range: searchStart..<lower.endIndex) {
+                let nsRange = NSRange(range, in: display)
+                if nsRange.location != NSNotFound {
+                    result.addAttributes([
+                        .backgroundColor: NSColor.systemYellow.withAlphaComponent(0.55),
+                        .font: NSFont.systemFont(ofSize: fontSize, weight: .semibold),
+                        .paragraphStyle: paragraph
+                    ], range: nsRange)
+                }
+                searchStart = range.upperBound
+            }
+        }
+        return result
+    }
+
+    /// Path relative to the search root (current folder prefix omitted), e.g. `子文件夹/jing-2.zip`.
+    private func searchResultPath(for item: FileItem) -> String {
+        let absolute = item.url.standardizedFileURL.path
+        guard !searchRootPath.isEmpty else { return absolute }
+        if searchRootPath == "/" {
+            return absolute.hasPrefix("/") ? String(absolute.dropFirst()) : absolute
+        }
+        guard absolute.hasPrefix(searchRootPath) else { return absolute }
+        let relative = String(absolute.dropFirst(searchRootPath.count))
+        return relative.isEmpty ? item.name : relative
     }
 
     /// Keep outline expansion while refreshing listings (after New / rename / trash / paste / watch).
@@ -340,21 +924,32 @@ final class ContentViewController: NSViewController {
     /// Shift+单击：追加次要排序（多列同时排序）；已在排序链中则切换该列方向。
     func tableView(_ tableView: NSTableView, didClick tableColumn: NSTableColumn) {
         let id = tableColumn.identifier.rawValue
-        if id == "expand" { return }
+        if id == "expand" || id == "check" { return }
         let shift = NSApp.currentEvent?.modifierFlags.contains(.shift) == true
+        let preferredAscending = Self.preferredAscending(for: id)
 
         if shift {
             if let index = sortKeys.firstIndex(where: { $0.columnID == id }) {
                 sortKeys[index].ascending.toggle()
             } else {
-                sortKeys.append(SortKey(columnID: id, ascending: true))
+                sortKeys.append(SortKey(columnID: id, ascending: preferredAscending))
             }
         } else if sortKeys.count == 1, sortKeys[0].columnID == id {
             sortKeys[0].ascending.toggle()
         } else {
-            sortKeys = [SortKey(columnID: id, ascending: true)]
+            sortKeys = [SortKey(columnID: id, ascending: preferredAscending)]
         }
         applySort(preservingSelection: true)
+    }
+
+    /// Name / kind default to ascending; date / size default to descending.
+    private static func preferredAscending(for columnID: String) -> Bool {
+        switch columnID {
+        case "date", "size":
+            return false
+        default:
+            return true
+        }
     }
 
     private func applySort(preservingSelection: Bool) {
@@ -410,11 +1005,19 @@ final class ContentViewController: NSViewController {
             }
         }
 
-        walk(rootItems, depth: 0)
+        let roots: [FileItem]
+        if isShowingApplications, !applicationsFilterQuery.isEmpty {
+            let query = applicationsFilterQuery
+            roots = rootItems.filter { $0.name.localizedCaseInsensitiveContains(query) }
+        } else {
+            roots = rootItems
+        }
+        walk(roots, depth: 0)
         items = display
         rowDepths = depths
         listView.reloadData()
         updateSortIndicator()
+        updateHeaderCheckButton()
         if preservingSelection || selectedURLs != nil, !selected.isEmpty {
             select(urls: selected)
         }
@@ -443,15 +1046,16 @@ final class ContentViewController: NSViewController {
             if l == r { return .orderedSame }
             return l < r ? .orderedAscending : .orderedDescending
         case "size":
-            let l = lhs.isDirectory ? Int64.min : (lhs.fileSize ?? 0)
-            let r = rhs.isDirectory ? Int64.min : (rhs.fileSize ?? 0)
+            let l = lhs.fileSize ?? 0
+            let r = rhs.fileSize ?? 0
             if l == r { return .orderedSame }
             return l < r ? .orderedAscending : .orderedDescending
         case "kind":
             return kindString(for: lhs).localizedStandardCompare(kindString(for: rhs))
         default:
-            if lhs.isDirectory != rhs.isDirectory {
-                return lhs.isDirectory ? .orderedAscending : .orderedDescending
+            if isShowingSearchResults {
+                return searchResultPath(for: lhs)
+                    .localizedStandardCompare(searchResultPath(for: rhs))
             }
             return lhs.name.localizedStandardCompare(rhs.name)
         }
@@ -654,9 +1258,10 @@ final class ContentViewController: NSViewController {
     }
 
     func select(urls: [URL]) {
-        let set = Set(urls.map { $0.standardizedFileURL })
+        // Compare by path string — file URL Hashable/equality can miss matches across listing vs search.
+        let paths = Set(urls.map { $0.standardizedFileURL.path })
         var indexes = IndexSet()
-        for (idx, item) in items.enumerated() where set.contains(item.url.standardizedFileURL) {
+        for (idx, item) in items.enumerated() where paths.contains(item.url.standardizedFileURL.path) {
             indexes.insert(idx)
         }
         listView.selectRowIndexes(indexes, byExtendingSelection: false)
@@ -696,7 +1301,8 @@ final class ContentViewController: NSViewController {
         listView.scrollRowToVisible(row)
         listView.layoutSubtreeIfNeeded()
 
-        guard let cell = listView.view(atColumn: 0, row: row, makeIfNecessary: true) as? NSTableCellView,
+        guard let nameColumnIndex = listView.tableColumns.firstIndex(where: { $0.identifier.rawValue == "name" }),
+              let cell = listView.view(atColumn: nameColumnIndex, row: row, makeIfNecessary: true) as? NSTableCellView,
               let field = cell.textField else { return }
 
         endInlineRename(commit: false)
@@ -796,24 +1402,32 @@ final class ContentViewController: NSViewController {
 
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
 
-        // ⌘C / ⌘X / ⌘V / ⌘A
-        if flags == .command,
-           let ch = event.charactersIgnoringModifiers?.lowercased() {
-            switch ch {
-            case "c":
-                onCopyRequest?()
+        // ⌘C / ⌘X / ⌘V / ⌘A / ⌘O (left favorites) / ⌘⇧O (top favorites)
+        if let ch = event.charactersIgnoringModifiers?.lowercased() {
+            if flags == .command {
+                switch ch {
+                case "c":
+                    onCopyRequest?()
+                    return nil
+                case "x":
+                    onCutRequest?()
+                    return nil
+                case "v":
+                    onPasteRequest?()
+                    return nil
+                case "a":
+                    selectAll()
+                    return nil
+                case "o":
+                    onToggleFavoritesSidebar?()
+                    return nil
+                default:
+                    break
+                }
+            }
+            if flags == [.command, .shift], ch == "o" {
+                onToggleFavoritesTopBar?()
                 return nil
-            case "x":
-                onCutRequest?()
-                return nil
-            case "v":
-                onPasteRequest?()
-                return nil
-            case "a":
-                selectAll()
-                return nil
-            default:
-                break
             }
         }
 
@@ -826,6 +1440,12 @@ final class ContentViewController: NSViewController {
                 onGoEnclosingFolder?()
                 return nil
             }
+        }
+
+        // Esc → dismiss history page
+        if event.keyCode == 53, flags.isEmpty, isShowingHistory {
+            onDismissHistoryPage?()
+            return nil
         }
 
         // Space → Quick Look (Finder)
@@ -937,6 +1557,12 @@ final class ContentViewController: NSViewController {
     }
 
     private func openURLs(_ urls: [URL], withApp appURL: URL) {
+        let bid = Bundle(url: appURL)?.bundleIdentifier ?? ""
+        AppSettings.shared.rememberOpenWithApp(
+            bundleID: bid,
+            path: appURL.path,
+            forFile: urls.first
+        )
         let config = NSWorkspace.OpenConfiguration()
         NSWorkspace.shared.open(urls, withApplicationAt: appURL, configuration: config) { _, error in
             if let error {
@@ -963,9 +1589,11 @@ final class ContentViewController: NSViewController {
         }
 
         let sections = OpenWithCatalog.sectionedApps(for: primary)
-        let namePool = ([sections.currentDefault].compactMap { $0 } + sections.history + sections.others)
+        let namePool = [sections.currentDefault].compactMap { $0 }
+            + sections.history
+            + sections.recommended
 
-        func addSection(_ apps: [OpenWithCatalog.AppInfo], defaultURL: URL?) {
+        func addSection(_ apps: [OpenWithCatalog.AppInfo]) {
             for app in apps {
                 let item = NSMenuItem()
                 item.isEnabled = true
@@ -977,54 +1605,34 @@ final class ContentViewController: NSViewController {
                 row.appURL = app.url
                 let title = OpenWithCatalog.disambiguatedName(for: app, among: namePool)
                 let icon = NSWorkspace.shared.icon(forFile: app.url.path)
-                let isDefault = app.url.standardizedFileURL == defaultURL
-                row.configure(name: title, icon: icon, isDefault: isDefault)
+                row.configure(name: title, icon: icon)
                 row.onOpen = { [weak self] in
                     self?.openURLs(urls, withApp: app.url)
-                }
-                row.onSetDefault = { [weak self, weak submenu] in
-                    OpenWithCatalog.setDefaultApp(app.url, for: urls) { error in
-                        if let error {
-                            let alert = NSAlert(error: error)
-                            alert.runModal()
-                            return
-                        }
-                        let newDefault = app.url.standardizedFileURL
-                        submenu?.items.forEach { menuItem in
-                            guard let rowView = menuItem.view as? OpenWithRowView else { return }
-                            rowView.setDefaultChecked(rowView.appURL.standardizedFileURL == newDefault)
-                        }
-                        // Next open will re-section (history moves). Keep menu usable now.
-                        _ = self
-                    }
                 }
                 item.view = row
                 submenu.addItem(item)
             }
         }
 
-        let defaultURL = sections.currentDefault?.url.standardizedFileURL
-            ?? OpenWithCatalog.defaultApp(for: primary)
-
+        var didAddApps = false
         if let current = sections.currentDefault {
-            addSection([current], defaultURL: defaultURL)
+            addSection([current])
+            didAddApps = true
         }
-
         if !sections.history.isEmpty {
-            if sections.currentDefault != nil {
-                submenu.addItem(NSMenuItem.separator())
-            }
-            addSection(sections.history, defaultURL: defaultURL)
+            if didAddApps { submenu.addItem(NSMenuItem.separator()) }
+            addSection(sections.history)
+            didAddApps = true
+        }
+        if !sections.recommended.isEmpty {
+            if didAddApps { submenu.addItem(NSMenuItem.separator()) }
+            addSection(sections.recommended)
+            didAddApps = true
         }
 
-        if !sections.others.isEmpty {
-            if sections.currentDefault != nil || !sections.history.isEmpty {
-                submenu.addItem(NSMenuItem.separator())
-            }
-            addSection(sections.others, defaultURL: defaultURL)
+        if didAddApps {
+            submenu.addItem(NSMenuItem.separator())
         }
-
-        submenu.addItem(NSMenuItem.separator())
         let other = NSMenuItem(
             title: "其他…",
             action: #selector(contextOpenWithOther),
@@ -1145,6 +1753,17 @@ final class ContentViewController: NSViewController {
         onOpenArchives?(urls)
     }
 
+    @objc private func contextCopyPath() {
+        ensureClickedRowSelected()
+        onCopyPathRequest?()
+    }
+
+    @objc private func contextRevealInEnclosingFolder() {
+        ensureClickedRowSelected()
+        guard let item = selectedItems.first(where: { !$0.isArchiveEntry }) else { return }
+        onRevealInEnclosingFolder?(item.url)
+    }
+
     private func presentArchiveError(title: String, error: Error) {
         let alert = NSAlert()
         alert.messageText = title
@@ -1167,11 +1786,34 @@ extension ContentViewController: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         ensureClickedRowSelected()
         let hasSelection = !selectedItems.isEmpty
+
+        if isShowingTrash {
+            for item in menu.items {
+                if item.action == #selector(contextPutBack)
+                    || item.action == #selector(contextDeleteForever) {
+                    item.isHidden = false
+                    item.isEnabled = hasSelection
+                    if item.action == #selector(contextDeleteForever) {
+                        item.title = "彻底删除"
+                    }
+                } else {
+                    item.isHidden = true
+                }
+            }
+            return
+        }
+
         let archives = selectedItems.filter { !$0.isArchiveEntry && ArchiveSupport.looksLikeArchive($0.url) }
         let showExtractOrOpen = !archives.isEmpty
         let showCompress = hasSelection && selectedItems.contains(where: { !$0.isArchiveEntry })
         let showArchiveSection = showCompress || showExtractOrOpen
         let showOpenWith = !openWithTargetURLs().isEmpty
+        let uninstallable = isShowingApplications
+            ? (checkedUninstallURLs.isEmpty
+                ? selectedItems.filter { $0.isPackage || $0.isDirectory }
+                : packagesForUninstall)
+            : selectedItems.filter { $0.isPackage || $0.isDirectory }
+        let showUninstall = isShowingApplications && !uninstallable.isEmpty
 
         openWithMenuItem?.isHidden = !showOpenWith
         openWithMenuItem?.isEnabled = showOpenWith
@@ -1207,13 +1849,9 @@ extension ContentViewController: NSMenuDelegate {
 
         for item in menu.items {
             switch item.action {
-            case #selector(contextOpen),
-                 #selector(contextGetInfo):
+            case #selector(contextOpen):
                 item.isHidden = false
                 item.isEnabled = hasSelection
-            case #selector(contextQuickLook):
-                item.isHidden = false
-                item.isEnabled = !previewableURLs.isEmpty
             case #selector(contextMakeWritable):
                 let targets = selectedItems.filter { !$0.isArchiveEntry }
                 item.isHidden = targets.isEmpty
@@ -1230,6 +1868,23 @@ extension ContentViewController: NSMenuDelegate {
                 item.isHidden = !showExtractOrOpen
                 item.isEnabled = showExtractOrOpen
                 item.title = "打开压缩包"
+            case #selector(contextCopyPath):
+                item.isHidden = false
+                item.isEnabled = true
+            case #selector(contextRevealInEnclosingFolder):
+                let canReveal = (isShowingSearchResults || isShowingHistory)
+                    && selectedItems.contains(where: { !$0.isArchiveEntry })
+                item.isHidden = !(isShowingSearchResults || isShowingHistory)
+                item.isEnabled = canReveal
+            case #selector(contextPutBack),
+                 #selector(contextDeleteForever):
+                item.isHidden = true
+            case #selector(contextUninstallApps):
+                item.isHidden = !showUninstall
+                item.isEnabled = showUninstall
+                item.title = uninstallable.count > 1
+                    ? "彻底卸载（\(uninstallable.count)）…"
+                    : "彻底卸载…"
             default:
                 break
             }
@@ -1253,15 +1908,21 @@ extension ContentViewController: NSTableViewDataSource, NSTableViewDelegate {
             copy.size = NSSize(width: size, height: size)
             return copy
         }
-        let ext = item.url.pathExtension.lowercased()
-        let key = "\(ext.isEmpty ? "._file" : ext)@\(Int(size))"
+        // .app / packages each have their own icon — cache by path, not extension.
+        let key: String
+        if item.isPackage || item.url.pathExtension.lowercased() == "app" {
+            key = "\(item.url.path)@\(Int(size))"
+        } else {
+            let ext = item.url.pathExtension.lowercased()
+            key = "\(ext.isEmpty ? "._file" : ext)@\(Int(size))"
+        }
         if let cached = iconCache[key] {
             return cached
         }
         let image = NSWorkspace.shared.icon(forFile: item.url.path)
         let sized = image.copy() as? NSImage ?? image
         sized.size = NSSize(width: size, height: size)
-        if iconCache.count < 256 {
+        if iconCache.count < 512 {
             iconCache[key] = sized
         }
         return sized
@@ -1283,22 +1944,39 @@ extension ContentViewController: NSTableViewDataSource, NSTableViewDelegate {
             return cell
         }
 
+        if id.rawValue == "check" {
+            let cell = (tableView.makeView(withIdentifier: id, owner: nil) as? NSTableCellView) ?? makeCheckCell()
+            configureCheckColumnCell(cell, item: item, row: row, iconSide: iconSide)
+            return cell
+        }
+
         let cell = (tableView.makeView(withIdentifier: id, owner: nil) as? NSTableCellView) ?? makeListCell(id: id)
         cell.textField?.font = .systemFont(ofSize: fontSize)
         cell.alphaValue = 1
 
         switch id.rawValue {
         case "name":
-            cell.textField?.stringValue = item.name
+            cell.textField?.attributedStringValue = attributedName(for: item)
+            cell.textField?.lineBreakMode = .byTruncatingMiddle
+            cell.textField?.maximumNumberOfLines = 1
+            cell.textField?.usesSingleLineMode = true
+            if let textCell = cell.textField?.cell as? NSTextFieldCell {
+                textCell.wraps = false
+                textCell.lineBreakMode = .byTruncatingMiddle
+                textCell.truncatesLastVisibleLine = true
+            }
             cell.imageView?.image = Self.cachedIcon(for: item, side: iconSide)
             cell.constraints.first(where: { $0.identifier == "iconW" })?.constant = iconSide
             cell.constraints.first(where: { $0.identifier == "iconH" })?.constant = iconSide
             let depth = rowDepths.indices.contains(row) ? rowDepths[row] : 0
+            // Flatten tree indent in search results; show relative path instead.
             let indentStep = max(10, round(14 * zoomFactor))
             cell.constraints.first(where: { $0.identifier == "nameIndent" })?.constant =
-                2 + CGFloat(depth) * indentStep
+                (isShowingSearchResults || isShowingHistory) ? 2 : (2 + CGFloat(depth) * indentStep)
             cell.imageView?.alphaValue = isItemCut(item) ? 0.45 : 1
-            cell.textField?.textColor = nameTextColor(for: item)
+            cell.toolTip = nil
+            cell.textField?.toolTip = nil
+            cell.imageView?.toolTip = nil
         case "date":
             cell.textField?.stringValue = FileOperations.formatDate(item.modificationDate)
             cell.imageView?.image = nil
@@ -1318,6 +1996,9 @@ extension ContentViewController: NSTableViewDataSource, NSTableViewDelegate {
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
+        if !isShowingApplications {
+            refreshApplicationsBanner()
+        }
         onSelectionChange?(selectedItems)
         syncQuickLookIfVisible()
     }
@@ -1553,13 +2234,73 @@ extension ContentViewController: NSTableViewDataSource, NSTableViewDelegate {
         }
     }
 
+    private func configureCheckColumnCell(
+        _ cell: NSTableCellView,
+        item: FileItem,
+        row: Int,
+        iconSide: CGFloat
+    ) {
+        guard let check = cell.subviews.first(where: { $0.identifier?.rawValue == "appCheck" }) as? NSButton else {
+            return
+        }
+        let show = item.isPackage || item.isDirectory
+        check.isHidden = !show
+        check.isEnabled = show
+        let side = max(16, round(iconSide))
+        cell.constraints.first(where: { $0.identifier == "checkW" })?.constant = side
+        cell.constraints.first(where: { $0.identifier == "checkH" })?.constant = side
+        guard show else {
+            check.state = .off
+            return
+        }
+        check.controlSize = .regular
+        check.tag = row
+        check.target = self
+        check.action = #selector(appCheckToggled(_:))
+        check.state = checkedUninstallURLs.contains(item.url.standardizedFileURL) ? .on : .off
+    }
+
+    private func makeCheckCell() -> NSTableCellView {
+        let cell = NSTableCellView()
+        cell.identifier = .init("check")
+        let check = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+        check.identifier = NSUserInterfaceItemIdentifier("appCheck")
+        check.translatesAutoresizingMaskIntoConstraints = false
+        check.controlSize = .regular
+        check.focusRingType = .none
+        check.setContentHuggingPriority(.required, for: .horizontal)
+        check.setContentCompressionResistancePriority(.required, for: .horizontal)
+        cell.addSubview(check)
+        let checkW = check.widthAnchor.constraint(equalToConstant: 18)
+        checkW.identifier = "checkW"
+        let checkH = check.heightAnchor.constraint(equalToConstant: 18)
+        checkH.identifier = "checkH"
+        NSLayoutConstraint.activate([
+            check.centerXAnchor.constraint(equalTo: cell.centerXAnchor),
+            check.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            checkW,
+            checkH
+        ])
+        return cell
+    }
+
     private func makeListCell(id: NSUserInterfaceItemIdentifier) -> NSTableCellView {
         let cell = NSTableCellView()
         cell.identifier = id
         let field = NSTextField(labelWithString: "")
         field.translatesAutoresizingMaskIntoConstraints = false
         field.lineBreakMode = .byTruncatingMiddle
+        field.maximumNumberOfLines = 1
+        field.usesSingleLineMode = true
         field.alignment = .left
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        if let textCell = field.cell as? NSTextFieldCell {
+            textCell.wraps = false
+            textCell.isScrollable = false
+            textCell.lineBreakMode = .byTruncatingMiddle
+            textCell.truncatesLastVisibleLine = true
+        }
         cell.addSubview(field)
         cell.textField = field
 
@@ -1594,11 +2335,11 @@ extension ContentViewController: NSTableViewDataSource, NSTableViewDelegate {
     }
 
     private func kindString(for item: FileItem) -> String {
-        if item.isDirectory { return "文件夹" }
+        if item.isDirectory { return "dir" }
         if item.isPackage { return "应用程序" }
         let ext = item.url.pathExtension
-        if ext.isEmpty { return "文稿" }
-        return ext.lowercased() + " 文稿"
+        if ext.isEmpty { return "文件" }
+        return ext.lowercased()
     }
 }
 

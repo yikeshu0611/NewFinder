@@ -7,12 +7,13 @@ final class DMGInstallWindowController: NSWindowController {
     private var mounted: DMGInstallSupport.MountedImage
     private var apps: [URL]
     private var selectedApp: URL?
+    private var didDetach = false
 
     private var iconView: NSImageView!
     private var nameLabel: NSTextField!
     private var hintLabel: NSTextField!
     private var installButton: NSButton!
-    private var ejectButton: NSButton!
+    private var installAndOpenButton: NSButton!
     private var statusLabel: NSTextField!
     private var appsPopup: NSPopUpButton?
 
@@ -77,7 +78,7 @@ final class DMGInstallWindowController: NSWindowController {
         nameLabel.alignment = .center
         nameLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        hintLabel = NSTextField(labelWithString: "点击「安装到应用程序」完成安装")
+        hintLabel = NSTextField(labelWithString: "安装到「应用程序」后会自动推出磁盘映像")
         hintLabel.font = .systemFont(ofSize: 12)
         hintLabel.textColor = .secondaryLabelColor
         hintLabel.alignment = .center
@@ -89,14 +90,14 @@ final class DMGInstallWindowController: NSWindowController {
         statusLabel.alignment = .center
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        installButton = NSButton(title: "安装到应用程序", target: self, action: #selector(installClicked))
+        installButton = NSButton(title: "安装", target: self, action: #selector(installClicked))
         installButton.bezelStyle = .rounded
-        installButton.keyEquivalent = "\r"
         installButton.translatesAutoresizingMaskIntoConstraints = false
 
-        ejectButton = NSButton(title: "推出", target: self, action: #selector(ejectClicked))
-        ejectButton.bezelStyle = .rounded
-        ejectButton.translatesAutoresizingMaskIntoConstraints = false
+        installAndOpenButton = NSButton(title: "安装并打开", target: self, action: #selector(installAndOpenClicked))
+        installAndOpenButton.bezelStyle = .rounded
+        installAndOpenButton.keyEquivalent = "\r"
+        installAndOpenButton.translatesAutoresizingMaskIntoConstraints = false
 
         root.addSubview(title)
         root.addSubview(iconView)
@@ -106,7 +107,7 @@ final class DMGInstallWindowController: NSWindowController {
         root.addSubview(hintLabel)
         root.addSubview(statusLabel)
         root.addSubview(installButton)
-        root.addSubview(ejectButton)
+        root.addSubview(installAndOpenButton)
 
         var constraints: [NSLayoutConstraint] = [
             title.topAnchor.constraint(equalTo: root.topAnchor, constant: 36),
@@ -140,11 +141,11 @@ final class DMGInstallWindowController: NSWindowController {
             statusLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
             statusLabel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
 
-            ejectButton.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -20),
-            ejectButton.trailingAnchor.constraint(equalTo: root.centerXAnchor, constant: -8),
+            installButton.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -20),
+            installButton.trailingAnchor.constraint(equalTo: root.centerXAnchor, constant: -8),
 
-            installButton.bottomAnchor.constraint(equalTo: ejectButton.bottomAnchor),
-            installButton.leadingAnchor.constraint(equalTo: root.centerXAnchor, constant: 8)
+            installAndOpenButton.bottomAnchor.constraint(equalTo: installButton.bottomAnchor),
+            installAndOpenButton.leadingAnchor.constraint(equalTo: root.centerXAnchor, constant: 8)
         ]
 
         if apps.count > 1 {
@@ -173,6 +174,7 @@ final class DMGInstallWindowController: NSWindowController {
             iconView.image = NSImage(systemSymbolName: "shippingbox", accessibilityDescription: nil)
             nameLabel.stringValue = "未找到可安装的应用程序"
             installButton.isEnabled = false
+            installAndOpenButton.isEnabled = false
             return
         }
         let icon = NSWorkspace.shared.icon(forFile: app.path)
@@ -180,6 +182,7 @@ final class DMGInstallWindowController: NSWindowController {
         iconView.image = icon
         nameLabel.stringValue = app.deletingPathExtension().lastPathComponent
         installButton.isEnabled = true
+        installAndOpenButton.isEnabled = true
     }
 
     @objc private func appSelectionChanged(_ sender: NSPopUpButton) {
@@ -190,8 +193,17 @@ final class DMGInstallWindowController: NSWindowController {
     }
 
     @objc private func installClicked() {
+        runInstall(openAfter: false)
+    }
+
+    @objc private func installAndOpenClicked() {
+        runInstall(openAfter: true)
+    }
+
+    private func runInstall(openAfter: Bool) {
         guard let app = selectedApp else { return }
         installButton.isEnabled = false
+        installAndOpenButton.isEnabled = false
         statusLabel.stringValue = "正在安装…"
         statusLabel.textColor = .secondaryLabelColor
 
@@ -199,29 +211,35 @@ final class DMGInstallWindowController: NSWindowController {
             do {
                 let dest = try DMGInstallSupport.installApp(app, toApplications: true)
                 DispatchQueue.main.async {
-                    self?.statusLabel.textColor = .systemGreen
-                    self?.statusLabel.stringValue = "已安装到 \(dest.path)"
-                    self?.installButton.title = "已安装"
-                    self?.installButton.isEnabled = false
-                    NSWorkspace.shared.activateFileViewerSelecting([dest])
+                    guard let self else { return }
+                    self.statusLabel.textColor = .systemGreen
+                    self.statusLabel.stringValue = "已安装到 \(dest.path)"
+                    if openAfter {
+                        NSWorkspace.shared.open(dest)
+                    }
+                    // Always eject the disk image after a successful install.
+                    self.closeAndEject()
                 }
             } catch {
                 DispatchQueue.main.async {
                     self?.statusLabel.textColor = .systemRed
                     self?.statusLabel.stringValue = error.localizedDescription
                     self?.installButton.isEnabled = true
+                    self?.installAndOpenButton.isEnabled = true
                 }
             }
         }
     }
 
-    @objc private func ejectClicked() {
-        closeAndEject()
-    }
-
     private func closeAndEject() {
         let image = mounted
         window?.close()
+        detachIfNeeded(image)
+    }
+
+    private func detachIfNeeded(_ image: DMGInstallSupport.MountedImage) {
+        guard !didDetach else { return }
+        didDetach = true
         DispatchQueue.global(qos: .utility).async {
             DMGInstallSupport.detach(image)
         }
@@ -230,10 +248,7 @@ final class DMGInstallWindowController: NSWindowController {
 
 extension DMGInstallWindowController: NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
-        let image = mounted
-        DispatchQueue.global(qos: .utility).async {
-            DMGInstallSupport.detach(image)
-        }
+        detachIfNeeded(mounted)
         AppDelegate.shared.dmgInstallWindowDidClose(self)
     }
 }
