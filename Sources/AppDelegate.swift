@@ -176,16 +176,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return true
         }
 
-        do {
-            let mounted = try DMGInstallSupport.attach(dmgURL: standardized)
-            beginLeavingFinderAlone()
-            presentDMGInstaller(mounted: mounted)
-            return true
-        } catch {
-            let alert = NSAlert(error: error)
-            alert.runModal()
-            return false
+        // Show the installer immediately; mount on a background queue (hdiutil was blocking UI).
+        beginLeavingFinderAlone()
+        let controller = DMGInstallWindowController(loadingDMG: standardized)
+        dmgInstallWindows.append(controller)
+        suppressFinderRedirectUntil = Date().addingTimeInterval(1.5)
+        pendingRedirectWorkItem?.cancel()
+        isRedirectingFinder = false
+        controller.showWindow(nil)
+        NSApp.unhide(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        controller.window?.makeKeyAndOrderFront(nil)
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let mounted = try DMGInstallSupport.attach(dmgURL: standardized)
+                DispatchQueue.main.async {
+                    guard let self,
+                          self.dmgInstallWindows.contains(where: { $0 === controller }) else {
+                        DMGInstallSupport.detach(mounted)
+                        return
+                    }
+                    controller.finishMounting(mounted: mounted)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    controller.showMountError(error)
+                }
+            }
         }
+        return true
     }
 
     /// Show installer for an already-mounted volume (e.g. after Finder opened a DMG).
@@ -387,6 +407,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         register(controller)
         controller.showWindow(nil)
         return controller
+    }
+
+    /// Open/focus the in-browser code compare tab for a workspace (比对1…比对10).
+    func openCompareInKeyBrowser(workspace index: Int) {
+        if let browser = keyBrowser() {
+            browser.openCompareInTab(workspace: index)
+            return
+        }
+        let desktop = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop")
+        let browser = openNewWindow(at: desktop)
+        browser.openCompareInTab(workspace: index)
     }
 
     @discardableResult
@@ -1036,6 +1067,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: "o"
         )
         topFavoritesItem.keyEquivalentModifierMask = [.command, .shift]
+        shortcutsMenu.addItem(
+            withTitle: "关闭标签页",
+            action: #selector(BrowserWindowController.closeActiveTabOrWindow(_:)),
+            keyEquivalent: "w"
+        )
         let prefs = shortcutsMenu.addItem(
             withTitle: "设置",
             action: #selector(showPreferences(_:)),

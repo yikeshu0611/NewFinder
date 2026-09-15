@@ -17,6 +17,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     private var contentController: ContentViewController!
     private var activityMonitorController: ActivityMonitorViewController!
     private var temperatureController: TemperatureViewController!
+    private var compareController: CompareViewController!
     private var statusBarView: NSView!
     private var favoritesSidebar: FavoritesSidebarViewController!
     private var mainSplitView: NSSplitView!
@@ -24,19 +25,21 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     private var pathField: NSTextField!
     private var breadcrumbClip: BreadcrumbClipView!
     private var breadcrumbStack: NSStackView!
-    private var historyMenuButton: NSButton!
     private var recentHistoryButton: NSButton!
     private var backButton: NSButton!
     private var forwardButton: NSButton!
     private var upButton: NSButton!
-    private var titlebarLeadingStack: NSStackView!
     private var titlebarNewToolsStack: NSStackView!
     private var titlebarUtilityStack: NSStackView!
     private var showHiddenButton: NSButton!
+    private var columnViewButton: NSButton!
+    /// When Finder column view is on, New/paste target follows the selected column folder.
+    private var columnViewTargetDirectory: URL?
     private var copyPathButton: NSButton!
     private var copyPathFlashToken = 0
     private var pathBookmarkButton: NSButton!
     private var pathTrailingStack: NSStackView!
+    private var favoritesTrailingToolsStack: NSStackView!
     private var pathBarVisible = true
     private var statusLabel: NSTextField!
     private var autocompletePanel: NSPanel?
@@ -56,6 +59,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     private var searchField: NSSearchField!
     private var pathBarTopConstraint: NSLayoutConstraint!
     private var pathBarHeightConstraint: NSLayoutConstraint!
+    private var statusBarHeightConstraint: NSLayoutConstraint!
+    private var compareBottomToStatusConstraint: NSLayoutConstraint!
+    private var compareBottomToColumnConstraint: NSLayoutConstraint!
+    private var contentBottomToStatusConstraint: NSLayoutConstraint!
+    private var amBottomToStatusConstraint: NSLayoutConstraint!
+    private var tempBottomToStatusConstraint: NSLayoutConstraint!
     private var bookmarkEditorPanel: NSPanel?
     private weak var bookmarkFolderField: NSTextField?
     private weak var bookmarkFolderPicker: NSPopUpButton?
@@ -71,6 +80,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     private var editingBookmarkFolderName: String?
     private var editingBookmarkFolderPlacement: FavoritesPlacement = .left
 
+    /// Extra in-window browser columns (primary is always present; count is unlimited).
+    private var columnSplitView: NSSplitView!
+    private var primaryColumnHost: NSView!
+    private var rightColumn: NSView!
+    private var extraPanes: [BrowserPaneController] = []
+    /// 0 = primary column; 1… = `extraPanes[index - 1]`.
+    private var focusedColumnIndex = 0
+    private weak var titlebarAddColumnButton: NSButton?
+    private weak var titlebarCloseColumnButton: NSButton?
     private(set) var currentDirectory: URL {
         get { activeTab.directory }
         set { activeTab.directory = newValue.standardizedFileURL }
@@ -92,6 +110,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.minSize = .zero
+        window.contentMinSize = .zero
         // Keep only close; embed it in the trailing titlebar tools (macOS traffic-light style).
         window.standardWindowButton(.closeButton)?.isHidden = true
         window.standardWindowButton(.miniaturizeButton)?.isHidden = true
@@ -125,6 +144,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             showActivityMonitorTab()
         } else if activeTab.isTemperatureTab {
             showTemperatureTab()
+        } else if activeTab.isCompareTab {
+            showCompareTab()
         } else if activeTab.isArchiveTab {
             updatePathChrome()
             reloadContents()
@@ -135,7 +156,14 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     @objc private func handleContentTrash(_ note: Notification) {
-        guard (note.object as? ContentViewController) === contentController else { return }
+        guard let sender = note.object as? ContentViewController else { return }
+        if sender === contentController {
+            focusedColumnIndex = 0
+        } else if let idx = extraPanes.firstIndex(where: { $0.contentController === sender }) {
+            focusedColumnIndex = idx + 1
+        } else {
+            return
+        }
         moveToTrash(nil)
     }
 
@@ -184,24 +212,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         pathBarContainer.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
         (pathBarContainer as? ClickablePathBarView)?.onBackgroundClick = { [weak self] in
             guard let self else { return }
+            self.focusedColumnIndex = 0
             if self.isEditingPath {
                 self.endPathEditing(commit: false)
             } else {
                 self.beginPathEditing()
             }
         }
-
-        historyMenuButton = NSButton()
-        historyMenuButton.bezelStyle = .inline
-        historyMenuButton.isBordered = false
-        historyMenuButton.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: "访问历史")
-        historyMenuButton.image?.isTemplate = true
-        historyMenuButton.contentTintColor = .secondaryLabelColor
-        historyMenuButton.toolTip = "访问历史"
-        historyMenuButton.target = self
-        historyMenuButton.action = #selector(showHistoryMenu(_:))
-        historyMenuButton.translatesAutoresizingMaskIntoConstraints = false
-        historyMenuButton.focusRingType = .none
 
         backButton = makePathBarNavButton(
             symbol: "chevron.left",
@@ -220,6 +237,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         )
 
         titlebarUtilityStack = makeTitlebarUtilityStack()
+        columnViewButton = makeColumnViewButton()
         titlebarNewToolsStack = NSStackView()
         titlebarNewToolsStack.orientation = .horizontal
         titlebarNewToolsStack.alignment = .centerY
@@ -245,38 +263,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         recentHistoryButton.widthAnchor.constraint(equalToConstant: 20).isActive = true
         recentHistoryButton.heightAnchor.constraint(equalToConstant: 20).isActive = true
 
-        let chromeMenuButton = chromeHeader.makeChromeMenuButton()
-        let titlebarCloseButton = makeTitlebarCloseButton()
-
-        // Trailing titlebar cluster: New… · 隐藏 · 历史 · 设置 · 关闭
-        titlebarLeadingStack = NSStackView(views: [
-            titlebarNewToolsStack,
-            titlebarUtilityStack,
-            recentHistoryButton,
-            chromeMenuButton,
-            titlebarCloseButton
-        ])
-        titlebarLeadingStack.orientation = .horizontal
-        titlebarLeadingStack.alignment = .centerY
-        titlebarLeadingStack.spacing = 4
-        titlebarLeadingStack.translatesAutoresizingMaskIntoConstraints = false
-        titlebarLeadingStack.setContentHuggingPriority(.required, for: .horizontal)
-
-        // Populate New after bind(target:) already ran.
-        chromeHeader.attachNewTools(to: titlebarNewToolsStack)
-
-        copyPathButton = NSButton()
-        copyPathButton.bezelStyle = .inline
-        copyPathButton.isBordered = false
-        copyPathButton.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "复制路径")
-        copyPathButton.image?.isTemplate = true
-        copyPathButton.contentTintColor = .labelColor
-        copyPathButton.toolTip = "复制路径 (⌘⇧C)"
-        copyPathButton.target = self
-        copyPathButton.action = #selector(copyPath(_:))
-        copyPathButton.translatesAutoresizingMaskIntoConstraints = false
-        copyPathButton.focusRingType = .none
-
         pathBookmarkButton = NSButton()
         pathBookmarkButton.bezelStyle = .inline
         pathBookmarkButton.isBordered = false
@@ -297,8 +283,56 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         pathTrailingStack.spacing = 6
         pathTrailingStack.alignment = .centerY
         pathTrailingStack.translatesAutoresizingMaskIntoConstraints = false
-        pathTrailingStack.setContentHuggingPriority(.defaultHigh, for: .horizontal)
-        pathTrailingStack.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        pathTrailingStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        pathTrailingStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let chromeMenuButton = chromeHeader.makeChromeMenuButton()
+        let titlebarCloseButton = makeTitlebarCloseButton()
+        let titlebarAddColumnButton = makeTitlebarAddColumnButton()
+        let titlebarCloseColumnButton = makeTitlebarCloseColumnButton()
+
+        // Favorites bar trailing: New… · 分栏视图 · 隐藏 · 历史 · 设置
+        favoritesTrailingToolsStack = NSStackView(views: [
+            titlebarNewToolsStack,
+            columnViewButton,
+            titlebarUtilityStack,
+            recentHistoryButton,
+            chromeMenuButton
+        ])
+        favoritesTrailingToolsStack.orientation = .horizontal
+        favoritesTrailingToolsStack.alignment = .centerY
+        favoritesTrailingToolsStack.spacing = 4
+        favoritesTrailingToolsStack.translatesAutoresizingMaskIntoConstraints = false
+        favoritesTrailingToolsStack.setContentHuggingPriority(.required, for: .horizontal)
+        favoritesTrailingToolsStack.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        // Tab bar trailing: 新增分栏 · 关闭分栏 · window close
+        let titlebarCloseStack = NSStackView(views: [
+            titlebarAddColumnButton,
+            titlebarCloseColumnButton,
+            titlebarCloseButton
+        ])
+        titlebarCloseStack.orientation = .horizontal
+        titlebarCloseStack.alignment = .centerY
+        titlebarCloseStack.spacing = 4
+        titlebarCloseStack.translatesAutoresizingMaskIntoConstraints = false
+        titlebarCloseStack.setContentHuggingPriority(.required, for: .horizontal)
+
+        // Populate New after bind(target:) already ran.
+        chromeHeader.attachNewTools(to: titlebarNewToolsStack)
+        chromeHeader.attachLeadingTools(titlebarCloseStack)
+
+        copyPathButton = NSButton()
+        copyPathButton.bezelStyle = .inline
+        copyPathButton.isBordered = false
+        copyPathButton.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "复制路径")
+        copyPathButton.image?.isTemplate = true
+        copyPathButton.contentTintColor = .labelColor
+        copyPathButton.toolTip = "复制路径 (⌘⇧C)"
+        copyPathButton.target = self
+        copyPathButton.action = #selector(copyPath(_:))
+        copyPathButton.translatesAutoresizingMaskIntoConstraints = false
+        copyPathButton.focusRingType = .none
 
         breadcrumbStack = PassThroughStackView()
         breadcrumbStack.orientation = .horizontal
@@ -332,7 +366,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         pathBarContainer.addSubview(forwardButton)
         pathBarContainer.addSubview(upButton)
         pathBarContainer.addSubview(copyPathButton)
-        pathBarContainer.addSubview(historyMenuButton)
         pathBarContainer.addSubview(breadcrumbClip)
         pathBarContainer.addSubview(pathField)
         pathBarContainer.addSubview(pathTrailingStack)
@@ -348,7 +381,18 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             }
         }
         contentController.onSelectionChange = { [weak self] items in
+            self?.focusedColumnIndex = 0
             self?.updateStatus(selection: items)
+        }
+        contentController.onViewModeChange = { [weak self] isColumn in
+            self?.syncColumnViewButton(isColumn)
+            if !isColumn {
+                self?.columnViewTargetDirectory = nil
+            }
+        }
+        contentController.onColumnViewDirectoryChange = { [weak self] url in
+            self?.columnViewTargetDirectory = url.standardizedFileURL
+            self?.updateStatus(selection: self?.contentController.selectedItems ?? [])
         }
         contentController.onRenameRequest = { [weak self] item in
             self?.contentController.beginInlineRename(item)
@@ -445,6 +489,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         // Titlebar cluster is hosted on the window root (same row as the close button).
 
         let rightColumn = NSView()
+        self.rightColumn = rightColumn
         // NSSplitView manages child frames; keep autoresizing masks on.
 
         statusLabel = NSTextField(labelWithString: "")
@@ -459,10 +504,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         statusBar.addSubview(statusLabel)
         statusBarView = statusBar
 
-        // Right column: path + files + status (full-width chrome sits above the split).
+        let primaryHost = NSView()
+        primaryColumnHost = primaryHost
+        primaryHost.setContentCompressionResistancePriority(.fittingSizeCompression, for: .horizontal)
+        primaryHost.setContentHuggingPriority(.fittingSizeCompression, for: .horizontal)
+
+        // Primary browser column: path + files + status (chrome + favorites sit above).
         pathBarContainer.translatesAutoresizingMaskIntoConstraints = false
-        rightColumn.addSubview(pathBarContainer)
-        rightColumn.addSubview(contentController.view)
+        primaryHost.addSubview(pathBarContainer)
+        primaryHost.addSubview(contentController.view)
 
         activityMonitorController = ActivityMonitorViewController()
         activityMonitorController.onSummaryChange = { [weak self] text in
@@ -471,7 +521,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         let amView = activityMonitorController.view
         amView.translatesAutoresizingMaskIntoConstraints = false
         amView.isHidden = true
-        rightColumn.addSubview(amView)
+        primaryHost.addSubview(amView)
 
         temperatureController = TemperatureViewController()
         temperatureController.onSummaryChange = { [weak self] text in
@@ -480,17 +530,49 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         let tempView = temperatureController.view
         tempView.translatesAutoresizingMaskIntoConstraints = false
         tempView.isHidden = true
-        rightColumn.addSubview(tempView)
+        primaryHost.addSubview(tempView)
 
-        rightColumn.addSubview(statusBar)
+        compareController = CompareViewController()
+        compareController.onSummaryChange = { [weak self] text in
+            self?.statusLabel.stringValue = text
+        }
+        let compareView = compareController.view
+        compareView.translatesAutoresizingMaskIntoConstraints = false
+        compareView.isHidden = true
+        primaryHost.addSubview(compareView)
 
-        pathBarTopConstraint = pathBarContainer.topAnchor.constraint(equalTo: rightColumn.topAnchor)
+        primaryHost.addSubview(statusBar)
+
+        let columnSplit = NSSplitView()
+        columnSplit.isVertical = true
+        columnSplit.dividerStyle = .thin
+        columnSplit.translatesAutoresizingMaskIntoConstraints = false
+        columnSplit.arrangesAllSubviews = true
+        columnSplit.delegate = self
+        columnSplit.addSubview(primaryHost)
+        columnSplitView = columnSplit
+
+        rightColumn.addSubview(columnSplit)
+
+        pathBarTopConstraint = pathBarContainer.topAnchor.constraint(equalTo: primaryHost.topAnchor)
         pathBarHeightConstraint = pathBarContainer.heightAnchor.constraint(equalToConstant: 29)
+        statusBarHeightConstraint = statusBar.heightAnchor.constraint(equalToConstant: 22)
+        contentBottomToStatusConstraint = contentController.view.bottomAnchor.constraint(equalTo: statusBar.topAnchor)
+        amBottomToStatusConstraint = amView.bottomAnchor.constraint(equalTo: statusBar.topAnchor)
+        tempBottomToStatusConstraint = tempView.bottomAnchor.constraint(equalTo: statusBar.topAnchor)
+        compareBottomToStatusConstraint = compareView.bottomAnchor.constraint(equalTo: statusBar.topAnchor)
+        compareBottomToColumnConstraint = compareView.bottomAnchor.constraint(equalTo: primaryHost.bottomAnchor)
+        compareBottomToColumnConstraint.isActive = false
 
         NSLayoutConstraint.activate([
+            columnSplit.topAnchor.constraint(equalTo: rightColumn.topAnchor),
+            columnSplit.leadingAnchor.constraint(equalTo: rightColumn.leadingAnchor),
+            columnSplit.trailingAnchor.constraint(equalTo: rightColumn.trailingAnchor),
+            columnSplit.bottomAnchor.constraint(equalTo: rightColumn.bottomAnchor),
+
             pathBarTopConstraint,
-            pathBarContainer.leadingAnchor.constraint(equalTo: rightColumn.leadingAnchor),
-            pathBarContainer.trailingAnchor.constraint(equalTo: rightColumn.trailingAnchor),
+            pathBarContainer.leadingAnchor.constraint(equalTo: primaryHost.leadingAnchor),
+            pathBarContainer.trailingAnchor.constraint(equalTo: primaryHost.trailingAnchor),
             pathBarHeightConstraint,
 
             backButton.leadingAnchor.constraint(equalTo: pathBarContainer.leadingAnchor, constant: 6),
@@ -513,17 +595,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             copyPathButton.widthAnchor.constraint(equalToConstant: 22),
             copyPathButton.heightAnchor.constraint(equalToConstant: 22),
 
-            historyMenuButton.leadingAnchor.constraint(equalTo: copyPathButton.trailingAnchor, constant: 2),
-            historyMenuButton.centerYAnchor.constraint(equalTo: pathBarContainer.centerYAnchor),
-            historyMenuButton.widthAnchor.constraint(equalToConstant: 18),
-            historyMenuButton.heightAnchor.constraint(equalToConstant: 18),
-
-            breadcrumbClip.leadingAnchor.constraint(equalTo: historyMenuButton.trailingAnchor, constant: 4),
+            breadcrumbClip.leadingAnchor.constraint(equalTo: copyPathButton.trailingAnchor, constant: 6),
             breadcrumbClip.trailingAnchor.constraint(equalTo: pathTrailingStack.leadingAnchor, constant: -8),
             breadcrumbClip.topAnchor.constraint(equalTo: pathBarContainer.topAnchor),
             breadcrumbClip.bottomAnchor.constraint(equalTo: pathBarContainer.bottomAnchor),
 
-            pathField.leadingAnchor.constraint(equalTo: historyMenuButton.trailingAnchor, constant: 4),
+            pathField.leadingAnchor.constraint(equalTo: copyPathButton.trailingAnchor, constant: 6),
             pathField.trailingAnchor.constraint(equalTo: pathTrailingStack.leadingAnchor, constant: -8),
             pathField.centerYAnchor.constraint(equalTo: pathBarContainer.centerYAnchor),
             pathField.heightAnchor.constraint(equalToConstant: 22),
@@ -533,24 +610,29 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             pathTrailingStack.heightAnchor.constraint(equalToConstant: 22),
 
             contentController.view.topAnchor.constraint(equalTo: pathBarContainer.bottomAnchor),
-            contentController.view.leadingAnchor.constraint(equalTo: rightColumn.leadingAnchor),
-            contentController.view.trailingAnchor.constraint(equalTo: rightColumn.trailingAnchor),
-            contentController.view.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+            contentController.view.leadingAnchor.constraint(equalTo: primaryHost.leadingAnchor),
+            contentController.view.trailingAnchor.constraint(equalTo: primaryHost.trailingAnchor),
+            contentBottomToStatusConstraint,
 
             amView.topAnchor.constraint(equalTo: pathBarContainer.bottomAnchor),
-            amView.leadingAnchor.constraint(equalTo: rightColumn.leadingAnchor),
-            amView.trailingAnchor.constraint(equalTo: rightColumn.trailingAnchor),
-            amView.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+            amView.leadingAnchor.constraint(equalTo: primaryHost.leadingAnchor),
+            amView.trailingAnchor.constraint(equalTo: primaryHost.trailingAnchor),
+            amBottomToStatusConstraint,
 
             tempView.topAnchor.constraint(equalTo: pathBarContainer.bottomAnchor),
-            tempView.leadingAnchor.constraint(equalTo: rightColumn.leadingAnchor),
-            tempView.trailingAnchor.constraint(equalTo: rightColumn.trailingAnchor),
-            tempView.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+            tempView.leadingAnchor.constraint(equalTo: primaryHost.leadingAnchor),
+            tempView.trailingAnchor.constraint(equalTo: primaryHost.trailingAnchor),
+            tempBottomToStatusConstraint,
 
-            statusBar.leadingAnchor.constraint(equalTo: rightColumn.leadingAnchor),
-            statusBar.trailingAnchor.constraint(equalTo: rightColumn.trailingAnchor),
-            statusBar.bottomAnchor.constraint(equalTo: rightColumn.bottomAnchor),
-            statusBar.heightAnchor.constraint(equalToConstant: 22),
+            compareView.topAnchor.constraint(equalTo: primaryHost.topAnchor),
+            compareView.leadingAnchor.constraint(equalTo: primaryHost.leadingAnchor),
+            compareView.trailingAnchor.constraint(equalTo: primaryHost.trailingAnchor),
+            compareBottomToStatusConstraint,
+
+            statusBar.leadingAnchor.constraint(equalTo: primaryHost.leadingAnchor),
+            statusBar.trailingAnchor.constraint(equalTo: primaryHost.trailingAnchor),
+            statusBar.bottomAnchor.constraint(equalTo: primaryHost.bottomAnchor),
+            statusBarHeightConstraint,
 
             statusLabel.leadingAnchor.constraint(equalTo: statusBar.leadingAnchor, constant: 12),
             statusLabel.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor)
@@ -561,23 +643,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         mainSplitView.dividerStyle = .thin
         mainSplitView.translatesAutoresizingMaskIntoConstraints = false
         mainSplitView.delegate = self
-        favoritesSidebar.view.frame = NSRect(x: 0, y: 0, width: settings.favoritesSidebarWidth, height: 700)
-        rightColumn.frame = NSRect(x: 0, y: 0, width: 900, height: 700)
-        mainSplitView.addSubview(favoritesSidebar.view)
-        mainSplitView.addSubview(rightColumn)
-        // Sidebar keeps its width; content column absorbs window resize.
-        mainSplitView.setHoldingPriority(NSLayoutConstraint.Priority(270), forSubviewAt: 0)
-        mainSplitView.setHoldingPriority(NSLayoutConstraint.Priority(249), forSubviewAt: 1)
 
         chromeHeader.translatesAutoresizingMaskIntoConstraints = false
         chromeHeader.attachNewTools(to: titlebarNewToolsStack)
-        chromeHeader.attachLeadingTools(titlebarLeadingStack)
 
         favoritesTopBar = NSView()
         favoritesTopBar.translatesAutoresizingMaskIntoConstraints = false
         favoritesTopBar.wantsLayer = true
-        favoritesTopBar.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
         favoritesTopBar.clipsToBounds = true
+        updateFavoritesTopBarAppearance()
 
         favoritesTopStack = NSStackView()
         favoritesTopStack.orientation = .horizontal
@@ -588,33 +662,62 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         favoritesTopStack.setHuggingPriority(.required, for: .horizontal)
         favoritesTopStack.setContentHuggingPriority(.required, for: .horizontal)
         favoritesTopBar.addSubview(favoritesTopStack)
+        favoritesTopBar.addSubview(favoritesTrailingToolsStack)
 
-        root.addSubview(chromeHeader)
-        root.addSubview(favoritesTopBar)
+        // Right of the window-level sidebar: tabs + favorites bar + browser content.
+        let mainColumn = NSView()
+        rightColumn.translatesAutoresizingMaskIntoConstraints = false
+        mainColumn.addSubview(chromeHeader)
+        mainColumn.addSubview(favoritesTopBar)
+        mainColumn.addSubview(rightColumn)
+
+        favoritesSidebar.view.frame = NSRect(x: 0, y: 0, width: settings.favoritesSidebarWidth, height: 700)
+        mainColumn.frame = NSRect(x: 0, y: 0, width: 900, height: 700)
+        mainSplitView.addSubview(favoritesSidebar.view)
+        mainSplitView.addSubview(mainColumn)
+        // Sidebar keeps its width; content column absorbs window resize.
+        mainSplitView.setHoldingPriority(NSLayoutConstraint.Priority(270), forSubviewAt: 0)
+        mainSplitView.setHoldingPriority(NSLayoutConstraint.Priority(249), forSubviewAt: 1)
+
         root.addSubview(mainSplitView)
 
         favoritesTopBarHeightConstraint = favoritesTopBar.heightAnchor.constraint(equalToConstant: 0)
 
         NSLayoutConstraint.activate([
-            chromeHeader.topAnchor.constraint(equalTo: root.topAnchor),
-            chromeHeader.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            chromeHeader.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            mainSplitView.topAnchor.constraint(equalTo: root.topAnchor),
+            mainSplitView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            mainSplitView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            mainSplitView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+
+            chromeHeader.topAnchor.constraint(equalTo: mainColumn.topAnchor),
+            chromeHeader.leadingAnchor.constraint(equalTo: mainColumn.leadingAnchor),
+            chromeHeader.trailingAnchor.constraint(equalTo: mainColumn.trailingAnchor),
             chromeHeader.heightAnchor.constraint(equalToConstant: 32),
 
             favoritesTopBar.topAnchor.constraint(equalTo: chromeHeader.bottomAnchor),
-            favoritesTopBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            favoritesTopBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            favoritesTopBar.leadingAnchor.constraint(equalTo: mainColumn.leadingAnchor),
+            favoritesTopBar.trailingAnchor.constraint(equalTo: mainColumn.trailingAnchor),
             favoritesTopBarHeightConstraint,
 
             favoritesTopStack.leadingAnchor.constraint(equalTo: favoritesTopBar.leadingAnchor, constant: 8),
-            favoritesTopStack.trailingAnchor.constraint(lessThanOrEqualTo: favoritesTopBar.trailingAnchor, constant: -8),
+            favoritesTopStack.trailingAnchor.constraint(
+                lessThanOrEqualTo: favoritesTrailingToolsStack.leadingAnchor,
+                constant: -8
+            ),
             favoritesTopStack.centerYAnchor.constraint(equalTo: favoritesTopBar.centerYAnchor),
             favoritesTopStack.heightAnchor.constraint(equalTo: favoritesTopBar.heightAnchor),
 
-            mainSplitView.topAnchor.constraint(equalTo: favoritesTopBar.bottomAnchor),
-            mainSplitView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            mainSplitView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            mainSplitView.bottomAnchor.constraint(equalTo: root.bottomAnchor)
+            favoritesTrailingToolsStack.trailingAnchor.constraint(
+                equalTo: favoritesTopBar.trailingAnchor,
+                constant: -10
+            ),
+            favoritesTrailingToolsStack.centerYAnchor.constraint(equalTo: favoritesTopBar.centerYAnchor),
+            favoritesTrailingToolsStack.heightAnchor.constraint(equalToConstant: 24),
+
+            rightColumn.topAnchor.constraint(equalTo: favoritesTopBar.bottomAnchor),
+            rightColumn.leadingAnchor.constraint(equalTo: mainColumn.leadingAnchor),
+            rightColumn.trailingAnchor.constraint(equalTo: mainColumn.trailingAnchor),
+            rightColumn.bottomAnchor.constraint(equalTo: mainColumn.bottomAnchor)
         ])
 
         updatePathChrome()
@@ -634,7 +737,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         installFavoritesKeyMonitor()
     }
 
-    /// Accessory apps don't reliably deliver hidden-menu key equivalents; handle ⌘O / ⌘⇧O directly.
+    /// Accessory apps don't reliably deliver hidden-menu key equivalents; handle ⌘O / ⌘⇧O / ⌘W directly.
     private func installFavoritesKeyMonitor() {
         if let favoritesKeyMonitor {
             NSEvent.removeMonitor(favoritesKeyMonitor)
@@ -643,8 +746,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         favoritesKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, self.window?.isKeyWindow == true else { return event }
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            let isO = event.keyCode == 31
-                || event.charactersIgnoringModifiers?.lowercased() == "o"
+            let chars = event.charactersIgnoringModifiers?.lowercased()
+
+            let isW = event.keyCode == 13 || chars == "w"
+            if isW, flags == .command {
+                self.closeActiveTabOrWindow(nil)
+                return nil
+            }
+
+            let isO = event.keyCode == 31 || chars == "o"
             guard isO else { return event }
             if flags == [.command, .shift] {
                 self.toggleFavoritesTopBar(nil)
@@ -700,6 +810,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             if showTop {
                 self.reloadFavoritesTopBar()
             }
+            self.updateFavoritesTopBarAppearance()
 
             split.adjustSubviews()
             self.window?.contentView?.layoutSubtreeIfNeeded()
@@ -730,6 +841,14 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         applyFavoritesLayout(animated: true)
     }
 
+    /// Favorites bar uses the system window background (pre-tweak look).
+    private func updateFavoritesTopBarAppearance() {
+        guard favoritesTopBar != nil else { return }
+        favoritesTopBar.effectiveAppearance.performAsCurrentDrawingAppearance {
+            favoritesTopBar.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        }
+    }
+
     private var titlebarCloseHost: NSView?
     /// Frame before double-click maximize; restored on the next double-click.
     private var frameBeforeFillScreen: NSRect?
@@ -737,6 +856,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     func windowDidBecomeKey(_ notification: Notification) {
         restoreFavoritesSidebarWidthIfNeeded()
         hideSystemTrafficLights()
+        updateFavoritesTopBarAppearance()
         (titlebarCloseHost as? MacStyleCloseButton)?.refreshAppearance()
     }
 
@@ -836,6 +956,258 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         titlebarCloseHost = button
         hideSystemTrafficLights()
         return button
+    }
+
+    /// 新增分栏 — append another in-window browser column (unlimited).
+    private func makeTitlebarAddColumnButton() -> NSView {
+        let button = makeTitlebarColumnToolButton(
+            symbol: "plus.rectangle.on.rectangle",
+            tip: "新增分栏",
+            action: #selector(addBrowserColumn(_:))
+        )
+        titlebarAddColumnButton = button
+        return button
+    }
+
+    /// 关闭分栏 — remove the focused extra column (or the last one if primary is focused).
+    private func makeTitlebarCloseColumnButton() -> NSView {
+        let button = makeTitlebarColumnToolButton(
+            symbol: "minus.rectangle",
+            tip: "关闭分栏",
+            action: #selector(closeBrowserColumn(_:))
+        )
+        titlebarCloseColumnButton = button
+        updateColumnButtonAppearance()
+        return button
+    }
+
+    private func makeTitlebarColumnToolButton(symbol: String, tip: String, action: Selector) -> NSButton {
+        let button = NSButton()
+        button.bezelStyle = .inline
+        button.isBordered = false
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tip)
+        button.image?.isTemplate = true
+        button.contentTintColor = .secondaryLabelColor
+        button.toolTip = tip
+        button.target = self
+        button.action = action
+        button.focusRingType = .none
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.setContentHuggingPriority(.required, for: .horizontal)
+        button.setContentCompressionResistancePriority(.required, for: .horizontal)
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: 22),
+            button.heightAnchor.constraint(equalToConstant: 20)
+        ])
+        return button
+    }
+
+    @objc private func addBrowserColumn(_ sender: Any?) {
+        if activeTab.isSpecialContentTab {
+            NSSound.beep()
+            return
+        }
+        let seed = directoryForNewBrowserColumn()
+        let pane = BrowserPaneController(directory: seed)
+        wireExtraPane(pane)
+        extraPanes.append(pane)
+        _ = pane.view
+        pane.view.translatesAutoresizingMaskIntoConstraints = true
+        pane.view.setContentCompressionResistancePriority(.fittingSizeCompression, for: .horizontal)
+        pane.view.setContentHuggingPriority(.fittingSizeCompression, for: .horizontal)
+        pane.applyZoom(settings.uiZoomPercent)
+        columnSplitView.addSubview(pane.view)
+        focusedColumnIndex = extraPanes.count
+        updateColumnButtonAppearance()
+        DispatchQueue.main.async { [weak self] in
+            self?.equalizeColumnWidths()
+        }
+    }
+
+    @objc private func closeBrowserColumn(_ sender: Any?) {
+        guard !extraPanes.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        let removeIndex: Int
+        if focusedColumnIndex > 0 {
+            removeIndex = focusedColumnIndex - 1
+        } else {
+            removeIndex = extraPanes.count - 1
+        }
+        guard extraPanes.indices.contains(removeIndex) else {
+            NSSound.beep()
+            return
+        }
+        let pane = extraPanes.remove(at: removeIndex)
+        pane.view.removeFromSuperview()
+        if focusedColumnIndex > removeIndex + 1 {
+            focusedColumnIndex -= 1
+        } else if focusedColumnIndex == removeIndex + 1 {
+            focusedColumnIndex = min(removeIndex, extraPanes.count)
+        }
+        if focusedColumnIndex > extraPanes.count {
+            focusedColumnIndex = extraPanes.count
+        }
+        updateColumnButtonAppearance()
+        DispatchQueue.main.async { [weak self] in
+            self?.equalizeColumnWidths()
+        }
+    }
+
+    /// Used when switching to special tabs that need the primary column full-width.
+    private func clearAllExtraColumns() {
+        guard !extraPanes.isEmpty else {
+            focusedColumnIndex = 0
+            updateColumnButtonAppearance()
+            return
+        }
+        for pane in extraPanes {
+            pane.view.removeFromSuperview()
+        }
+        extraPanes.removeAll()
+        focusedColumnIndex = 0
+        updateColumnButtonAppearance()
+        columnSplitView?.adjustSubviews()
+    }
+
+    private func equalizeColumnWidths() {
+        guard let split = columnSplitView, split.bounds.width > 1 else { return }
+        let n = split.subviews.count
+        guard n >= 2 else {
+            split.adjustSubviews()
+            return
+        }
+        let each = split.bounds.width / CGFloat(n)
+        for i in 0 ..< (n - 1) {
+            split.setPosition(each * CGFloat(i + 1), ofDividerAt: i)
+        }
+        split.adjustSubviews()
+    }
+
+    private func updateColumnButtonAppearance() {
+        let canClose = !extraPanes.isEmpty
+        titlebarCloseColumnButton?.isEnabled = canClose
+        titlebarCloseColumnButton?.contentTintColor = canClose ? .secondaryLabelColor : .tertiaryLabelColor
+        titlebarAddColumnButton?.contentTintColor = .secondaryLabelColor
+    }
+
+    private func wireExtraPane(_ pane: BrowserPaneController) {
+        pane.onFocus = { [weak self, weak pane] in
+            guard let self, let pane,
+                  let idx = self.extraPanes.firstIndex(where: { $0 === pane }) else { return }
+            self.focusedColumnIndex = idx + 1
+        }
+        pane.onOpenFile = { url in
+            if DMGInstallSupport.isDiskImage(url) {
+                _ = AppDelegate.shared.openDiskImage(url)
+            } else {
+                NSWorkspace.shared.open(url)
+            }
+        }
+        pane.onOpenArchives = { [weak self] urls in
+            self?.focusedColumnIndex = 0
+            self?.openArchivesInTabs(urls)
+        }
+        pane.onCutRequest = { [weak self, weak pane] in
+            self?.focusExtraPane(pane)
+            self?.cut(nil)
+        }
+        pane.onCopyRequest = { [weak self, weak pane] in
+            self?.focusExtraPane(pane)
+            self?.copy(nil)
+        }
+        pane.onPasteRequest = { [weak self, weak pane] in
+            self?.focusExtraPane(pane)
+            self?.paste(nil)
+        }
+        pane.onRenameCommit = { [weak self, weak pane] item, name in
+            self?.focusExtraPane(pane)
+            self?.commitRename(item, to: name)
+        }
+        pane.onDirectoryNeedsReload = { [weak self] in
+            self?.reloadContents(preservingOutline: true)
+            self?.reloadAllExtraPanes()
+        }
+        pane.onPerformFileDrop = { [weak self] urls, destination, copying in
+            self?.handleFileDrop(urls: urls, destination: destination, copying: copying)
+        }
+        pane.onBookmarkDirectory = { [weak self] url in
+            guard let self else { return }
+            let previous = self.currentDirectory
+            self.currentDirectory = url
+            self.showBookmarkEditor(nil)
+            self.currentDirectory = previous
+        }
+        pane.onCopyPath = { [weak self] selected, folder in
+            let urls = selected.isEmpty ? [folder] : selected
+            let text = urls.map(\.path).joined(separator: "\n")
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.setString(text, forType: .string)
+            self?.flashCopyPathSuccess()
+        }
+        pane.onToggleFavoritesSidebar = { [weak self] in self?.toggleFavoritesSidebar(nil) }
+        pane.onToggleFavoritesTopBar = { [weak self] in self?.toggleFavoritesTopBar(nil) }
+    }
+
+    private func focusExtraPane(_ pane: BrowserPaneController?) {
+        guard let pane, let idx = extraPanes.firstIndex(where: { $0 === pane }) else { return }
+        focusedColumnIndex = idx + 1
+    }
+
+    private func directoryForNewBrowserColumn() -> URL {
+        // Prefer the selected folder so “新增分栏” opens into it.
+        if let folder = selectedDirectoryURL(in: activeContentController) {
+            return folder
+        }
+        if let focused = focusedExtraPane() {
+            return focused.directory.standardizedFileURL
+        }
+        let tab = activeTab
+        if tab.isSpecialContentTab {
+            return FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Desktop")
+                .standardizedFileURL
+        }
+        return tab.directory.standardizedFileURL
+    }
+
+    /// First selected real folder (not package / archive entry), if any.
+    private func selectedDirectoryURL(in content: ContentViewController) -> URL? {
+        content.selectedItems.first {
+            $0.isDirectory && !$0.isPackage && !$0.isArchiveEntry
+        }?.url.standardizedFileURL
+    }
+
+    private func focusedExtraPane() -> BrowserPaneController? {
+        guard focusedColumnIndex > 0 else { return nil }
+        let i = focusedColumnIndex - 1
+        guard extraPanes.indices.contains(i) else { return nil }
+        return extraPanes[i]
+    }
+
+    private func reloadAllExtraPanes() {
+        for pane in extraPanes {
+            pane.reloadContents()
+        }
+    }
+
+    /// Content list for the focused column (copy/cut/paste/delete).
+    private var activeContentController: ContentViewController {
+        focusedExtraPane()?.contentController ?? contentController
+    }
+
+    private var activeBrowserDirectory: URL {
+        if focusedColumnIndex == 0,
+           contentController.isColumnView,
+           let target = columnViewTargetDirectory {
+            return target
+        }
+        if let pane = focusedExtraPane() {
+            return pane.directory
+        }
+        return currentDirectory
     }
 
     @objc private func closeWindowFromTitlebar(_ sender: Any?) {
@@ -1019,6 +1391,61 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         return button
     }
 
+    /// Finder column-view toggle (分栏): click folder → next column on the right.
+    private func makeColumnViewButton() -> NSButton {
+        let button = NSButton()
+        button.bezelStyle = .inline
+        button.isBordered = false
+        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+        button.image = NSImage(
+            systemSymbolName: "rectangle.split.3x1",
+            accessibilityDescription: "分栏视图"
+        )?.withSymbolConfiguration(config)
+        button.image?.isTemplate = true
+        button.contentTintColor = .labelColor
+        button.toolTip = "分栏视图（点击文件夹在右侧打开）"
+        button.target = self
+        button.action = #selector(toggleColumnView(_:))
+        button.focusRingType = .none
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.setContentHuggingPriority(.required, for: .horizontal)
+        button.setContentCompressionResistancePriority(.required, for: .horizontal)
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: 22),
+            button.heightAnchor.constraint(equalToConstant: 20)
+        ])
+        return button
+    }
+
+    @objc private func toggleColumnView(_ sender: Any?) {
+        if activeTab.isSpecialContentTab || activeTab.isArchiveTab {
+            NSSound.beep()
+            return
+        }
+
+        if contentController.isColumnView {
+            contentController.setColumnViewEnabled(false)
+            columnViewTargetDirectory = nil
+            return
+        }
+
+        // Keep current directory as the column-view root. Reveal the current selection so a
+        // selected folder opens in the next column (do not navigate into / “open” it).
+        let selected = contentController.selectedItems.first
+        let revealURL = selected.map(\.url.standardizedFileURL)
+        contentController.setColumnViewEnabled(true, reveal: revealURL)
+        if let item = selected, item.isDirectory, !item.isPackage {
+            columnViewTargetDirectory = item.url.standardizedFileURL
+        } else {
+            columnViewTargetDirectory = currentDirectory.standardizedFileURL
+        }
+    }
+
+    private func syncColumnViewButton(_ isColumn: Bool) {
+        columnViewButton?.contentTintColor = isColumn ? .controlAccentColor : .labelColor
+        columnViewButton?.toolTip = isColumn ? "列表视图" : "分栏视图（点击文件夹在右侧打开）"
+    }
+
     private func makeTitlebarUtilityStack() -> NSStackView {
         let stack = NSStackView()
         stack.orientation = .horizontal
@@ -1051,6 +1478,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     private func applyContentZoom(_ percent: Int) {
         let clamped = min(500, max(30, percent))
         contentController.applyZoomFactor(CGFloat(clamped) / 100)
+        for pane in extraPanes {
+            pane.applyZoom(clamped)
+        }
     }
 
     // MARK: - Tabs
@@ -1081,6 +1511,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         if let existing = tabs.first(where: {
             !$0.isActivityMonitorTab
                 && !$0.isTemperatureTab
+                && !$0.isCompareTab
                 && !$0.isArchiveTab
                 && $0.directory.standardizedFileURL == standardized
         }) {
@@ -1127,6 +1558,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
 
     private func selectTab(_ id: UUID) {
         guard let tab = tabs.first(where: { $0.id == id }) else { return }
+        focusedColumnIndex = 0
         activeTabID = id
         refreshTabBar()
 
@@ -1141,6 +1573,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         }
         if tab.isTemperatureTab {
             showTemperatureTab()
+            return
+        }
+        if tab.isCompareTab {
+            showCompareTab()
             return
         }
 
@@ -1191,13 +1627,36 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         window?.makeKeyAndOrderFront(nil)
     }
 
+    /// Open (or focus) code compare workspace as a browser tab.
+    func openCompareInTab(workspace index: Int) {
+        let ws = max(1, min(CompareSession.workspaceCount, index))
+        if let existing = tabs.first(where: { $0.isCompareTab && $0.compareWorkspaceIndex == ws }) {
+            selectTab(existing.id)
+            window?.makeKeyAndOrderFront(nil)
+            compareController.activate(workspace: ws)
+            refreshTabBar()
+            return
+        }
+        let tab = BrowserTab(compareWorkspace: ws)
+        if let index = tabs.firstIndex(where: { $0.id == activeTabID }) {
+            tabs.insert(tab, at: index + 1)
+        } else {
+            tabs.append(tab)
+        }
+        selectTab(tab.id)
+        window?.makeKeyAndOrderFront(nil)
+    }
+
     private func showActivityMonitorTab() {
+        clearAllExtraColumns()
+        contentController.setColumnViewEnabled(false)
         stopWatching()
         searchField.stringValue = ""
         contentController.setSearchResultsMode(query: nil, scopeName: "", resultCount: 0)
         contentController.setTrashMode(active: false, itemCount: 0)
         contentController.setApplicationsMode(active: false)
         hideTemperatureTabIfNeeded()
+        hideCompareTabIfNeeded()
         contentController.view.isHidden = true
         activityMonitorController.view.isHidden = false
         activityMonitorController.activate()
@@ -1208,17 +1667,40 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     private func showTemperatureTab() {
+        clearAllExtraColumns()
+        contentController.setColumnViewEnabled(false)
         stopWatching()
         searchField.stringValue = ""
         contentController.setSearchResultsMode(query: nil, scopeName: "", resultCount: 0)
         contentController.setTrashMode(active: false, itemCount: 0)
         contentController.setApplicationsMode(active: false)
         hideActivityMonitorTabIfNeeded()
+        hideCompareTabIfNeeded()
         contentController.view.isHidden = true
         temperatureController.view.isHidden = false
         temperatureController.activate()
         window?.title = "温度"
         statusLabel.stringValue = "温度"
+        updatePathBarCoverage()
+        refreshTabBar()
+    }
+
+    private func showCompareTab() {
+        clearAllExtraColumns()
+        contentController.setColumnViewEnabled(false)
+        stopWatching()
+        searchField.stringValue = ""
+        contentController.setSearchResultsMode(query: nil, scopeName: "", resultCount: 0)
+        contentController.setTrashMode(active: false, itemCount: 0)
+        contentController.setApplicationsMode(active: false)
+        hideActivityMonitorTabIfNeeded()
+        hideTemperatureTabIfNeeded()
+        contentController.view.isHidden = true
+        compareController.view.isHidden = false
+        let ws = activeTab.compareWorkspaceIndex
+        compareController.activate(workspace: ws)
+        window?.title = "比对\(ws)"
+        statusLabel.stringValue = ""
         updatePathBarCoverage()
         refreshTabBar()
     }
@@ -1235,15 +1717,27 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         temperatureController.view.isHidden = true
     }
 
+    private func hideCompareTabIfNeeded() {
+        guard !compareController.view.isHidden else { return }
+        compareController.deactivate()
+        compareController.view.isHidden = true
+    }
+
     private func hideSpecialContentTabsIfNeeded() {
         hideActivityMonitorTabIfNeeded()
         hideTemperatureTabIfNeeded()
+        hideCompareTabIfNeeded()
         contentController.view.isHidden = false
     }
 
     private func closeTab(_ id: UUID) {
+        if let tab = tabs.first(where: { $0.id == id }), tab.isCompareTab {
+            compareController.deactivate()
+            CompareSession.shared.clearWorkspace(tab.compareWorkspaceIndex)
+        }
         guard tabs.count > 1, let index = tabs.firstIndex(where: { $0.id == id }) else {
-            window?.performClose(nil)
+            // Last tab: dismiss the window (same path as the titlebar red close).
+            closeWindowFromTitlebar(nil)
             return
         }
         let wasActive = id == activeTabID
@@ -1324,7 +1818,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         if tabs.count > 1 {
             closeTab(activeTabID)
         } else {
-            window?.performClose(nil)
+            window?.close()
         }
     }
 
@@ -1342,6 +1836,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         } else if activeTab.isTemperatureTab {
             hideSpecialContentTabsIfNeeded()
             activeTab.isTemperatureTab = false
+        } else if activeTab.isCompareTab {
+            hideSpecialContentTabsIfNeeded()
+            activeTab.isCompareTab = false
         } else {
             hideSpecialContentTabsIfNeeded()
         }
@@ -1408,6 +1905,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         }
         if activeTab.isTemperatureTab {
             showTemperatureTab()
+            return
+        }
+        if activeTab.isCompareTab {
+            showCompareTab()
             return
         }
 
@@ -1591,6 +2092,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         pendingReloadWorkItem?.cancel()
         pendingReloadWorkItem = nil
         reloadContents(preservingOutline: true)
+        reloadAllExtraPanes()
     }
 
     private func scheduleReloadContents() {
@@ -1651,64 +2153,79 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
 
         pathBookmarkButton.isHidden = false
         pathField.stringValue = currentDirectory.path
-        breadcrumbStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
 
-        if FileOperations.isTrashDirectory(currentDirectory) {
-            let button = BreadcrumbButton(title: "废纸篓", target: self, action: #selector(breadcrumbClicked(_:)))
-            button.identifier = NSUserInterfaceItemIdentifier(currentDirectory.path)
-            breadcrumbStack.addArrangedSubview(button)
-            pathBookmarkButton.isHidden = true
-            breadcrumbClip.isHidden = isEditingPath
-            pathField.isHidden = !isEditingPath
-            breadcrumbClip.refreshLayout()
-            refreshBookmarkUI()
-            return
-        }
+        let pathSignature = currentDirectory.standardizedFileURL.path
+        let existingSignature: String = {
+            if let last = breadcrumbStack.arrangedSubviews.last as? BreadcrumbButton {
+                return last.identifier?.rawValue ?? ""
+            }
+            return ""
+        }()
+        let needsRebuild = pathSignature != existingSignature
+            || breadcrumbStack.arrangedSubviews.isEmpty
 
-        if FileOperations.isApplicationsDirectory(currentDirectory) {
-            let button = BreadcrumbButton(title: "应用程序", target: self, action: #selector(breadcrumbClicked(_:)))
-            button.identifier = NSUserInterfaceItemIdentifier(currentDirectory.path)
-            breadcrumbStack.addArrangedSubview(button)
-            pathBookmarkButton.isHidden = false
-            breadcrumbClip.isHidden = isEditingPath
-            pathField.isHidden = !isEditingPath
-            breadcrumbClip.refreshLayout()
-            refreshBookmarkUI()
-            return
-        }
+        if needsRebuild {
+            breadcrumbStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
 
-        let components = currentDirectory.pathComponents
-        var built = ""
-        for (index, component) in components.enumerated() {
-            if index == 0 {
-                built = "/"
-            } else if built == "/" {
-                built += component
-            } else {
-                built += "/" + component
+            if FileOperations.isTrashDirectory(currentDirectory) {
+                let button = BreadcrumbButton(title: "废纸篓", target: self, action: #selector(breadcrumbClicked(_:)))
+                button.identifier = NSUserInterfaceItemIdentifier(currentDirectory.path)
+                breadcrumbStack.addArrangedSubview(button)
+                pathBookmarkButton.isHidden = true
+                breadcrumbClip.isHidden = isEditingPath
+                pathField.isHidden = !isEditingPath
+                breadcrumbClip.refreshLayout()
+                refreshBookmarkUI()
+                return
             }
 
-            let title = index == 0 ? "Macintosh HD" : component
-            let button = BreadcrumbButton(title: title, target: self, action: #selector(breadcrumbClicked(_:)))
-            button.identifier = NSUserInterfaceItemIdentifier(built)
-            breadcrumbStack.addArrangedSubview(button)
+            if FileOperations.isApplicationsDirectory(currentDirectory) {
+                let button = BreadcrumbButton(title: "应用程序", target: self, action: #selector(breadcrumbClicked(_:)))
+                button.identifier = NSUserInterfaceItemIdentifier(currentDirectory.path)
+                breadcrumbStack.addArrangedSubview(button)
+                pathBookmarkButton.isHidden = false
+                breadcrumbClip.isHidden = isEditingPath
+                pathField.isHidden = !isEditingPath
+                breadcrumbClip.refreshLayout()
+                refreshBookmarkUI()
+                return
+            }
 
-            if index < components.count - 1 {
-                let chevron = BreadcrumbChevronButton()
-                chevron.directoryPath = built
-                chevron.onClick = { [weak self, weak chevron] in
-                    guard let self, let chevron else { return }
-                    DispatchQueue.main.async {
-                        self.showBreadcrumbDirectoryMenu(at: built, from: chevron)
-                    }
+            let components = currentDirectory.pathComponents
+            var built = ""
+            for (index, component) in components.enumerated() {
+                if index == 0 {
+                    built = "/"
+                } else if built == "/" {
+                    built += component
+                } else {
+                    built += "/" + component
                 }
-                breadcrumbStack.addArrangedSubview(chevron)
+
+                let title = index == 0 ? "Macintosh HD" : component
+                let button = BreadcrumbButton(title: title, target: self, action: #selector(breadcrumbClicked(_:)))
+                button.identifier = NSUserInterfaceItemIdentifier(built)
+                breadcrumbStack.addArrangedSubview(button)
+
+                if index < components.count - 1 {
+                    let chevron = BreadcrumbChevronButton()
+                    chevron.directoryPath = built
+                    chevron.onClick = { [weak self, weak chevron] in
+                        guard let self, let chevron else { return }
+                        DispatchQueue.main.async {
+                            self.showBreadcrumbDirectoryMenu(at: built, from: chevron)
+                        }
+                    }
+                    breadcrumbStack.addArrangedSubview(chevron)
+                }
             }
         }
 
         breadcrumbClip.isHidden = isEditingPath
         pathField.isHidden = !isEditingPath
-        breadcrumbClip.refreshLayout()
+        if needsRebuild {
+            breadcrumbClip.refreshLayout()
+        }
         refreshBookmarkUI()
     }
 
@@ -1808,10 +2325,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         }
     }
 
-    @objc private func showHistoryMenu(_ sender: NSButton) {
-        popOpenHistoryMenu(from: sender, visits: history.recentVisits, allowClear: false)
-    }
-
     @objc private func toggleHistoryPage(_ sender: Any?) {
         if contentController.isShowingHistory {
             closeHistoryPage()
@@ -1826,7 +2339,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
 
     private func refreshHistoryPage() {
         // History overlays the file list; pause special tabs while it is open.
-        if !activityMonitorController.view.isHidden || !temperatureController.view.isHidden {
+        if !activityMonitorController.view.isHidden
+            || !temperatureController.view.isHidden
+            || !compareController.view.isHidden {
             hideSpecialContentTabsIfNeeded()
         }
 
@@ -1868,12 +2383,25 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             || contentController.isShowingApplications
             || activeTab.isActivityMonitorTab
             || activeTab.isTemperatureTab
+            || activeTab.isCompareTab
         if covered {
             pathBarContainer.isHidden = true
             pathBarHeightConstraint.constant = 0
         } else {
             pathBarContainer.isHidden = !pathBarVisible
             pathBarHeightConstraint.constant = pathBarVisible ? 29 : 0
+        }
+        // Compare: drop the status strip entirely (no 0-height hairline).
+        let hideStatus = activeTab.isCompareTab
+        statusBarView.isHidden = hideStatus
+        statusBarHeightConstraint.constant = hideStatus ? 0 : 22
+        if hideStatus {
+            statusLabel.stringValue = ""
+            compareBottomToStatusConstraint.isActive = false
+            compareBottomToColumnConstraint.isActive = true
+        } else {
+            compareBottomToColumnConstraint.isActive = false
+            compareBottomToStatusConstraint.isActive = true
         }
         window?.contentView?.layoutSubtreeIfNeeded()
     }
@@ -1921,74 +2449,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         )
     }
 
-    private func popOpenHistoryMenu(from sender: NSButton, visits: [VisitRecord], allowClear: Bool) {
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-
-        if visits.isEmpty {
-            let empty = NSMenuItem(title: "暂无历史记录", action: nil, keyEquivalent: "")
-            empty.isEnabled = false
-            menu.addItem(empty)
-        } else {
-            let timeFormatter = DateFormatter()
-            timeFormatter.locale = Locale(identifier: "zh_CN")
-            timeFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-
-            let pathFont = NSFont.systemFont(ofSize: 13)
-            let timeFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-            var maxPathWidth: CGFloat = 120
-            var maxTimeWidth: CGFloat = 120
-            for visit in visits {
-                let path = visit.url.path as NSString
-                let time = timeFormatter.string(from: visit.visitedAt) as NSString
-                maxPathWidth = max(maxPathWidth, path.size(withAttributes: [.font: pathFont]).width)
-                maxTimeWidth = max(maxTimeWidth, time.size(withAttributes: [.font: timeFont]).width)
-            }
-            maxPathWidth = min(maxPathWidth, 480)
-            let rowWidth = 28 + maxPathWidth + 24 + maxTimeWidth + 16
-
-            for visit in visits {
-                let path = visit.url.path
-                let time = timeFormatter.string(from: visit.visitedAt)
-                let item = NSMenuItem(title: "", action: #selector(historyMenuItemClicked(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = visit.url
-                let isCurrent = visit.url.standardizedFileURL == currentDirectory.standardizedFileURL
-                let view = HistoryMenuItemView(
-                    path: path,
-                    time: time,
-                    icon: NSWorkspace.shared.icon(forFile: path),
-                    isCurrent: isCurrent,
-                    pathWidth: maxPathWidth,
-                    timeWidth: maxTimeWidth,
-                    rowWidth: rowWidth
-                )
-                item.view = view
-                menu.addItem(item)
-            }
-        }
-
-        if allowClear, !visits.isEmpty {
-            menu.addItem(.separator())
-            let clear = NSMenuItem(title: "清除历史记录", action: #selector(clearRecentOpenHistory(_:)), keyEquivalent: "")
-            clear.target = self
-            menu.addItem(clear)
-        }
-
-        let point = NSPoint(x: 0, y: sender.bounds.height + 2)
-        menu.popUp(positioning: nil, at: point, in: sender)
-    }
-
     @objc private func clearRecentOpenHistory(_ sender: Any?) {
         AppSettings.shared.clearOpenHistory()
         if contentController.isShowingHistory {
             refreshHistoryPage()
         }
-    }
-
-    @objc private func historyMenuItemClicked(_ sender: NSMenuItem) {
-        guard let url = sender.representedObject as? URL else { return }
-        openHistoryURL(url)
     }
 
     private func openHistoryURL(_ url: URL) {
@@ -2092,6 +2557,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     private func updateStatus(selection: [FileItem]) {
+        guard !activeTab.isCompareTab else {
+            statusLabel.stringValue = ""
+            return
+        }
         let items = contentController.items
         let total = items.count
         let totalSize = formattedTotalSize(of: items)
@@ -2307,28 +2776,29 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     @objc func copy(_ sender: Any?) {
-        let urls = contentController.selectedItems.map(\.url)
+        let urls = activeContentController.selectedItems.map(\.url)
         guard !urls.isEmpty else { NSSound.beep(); return }
         FileOperations.copyURLs(urls)
-        contentController.refreshCutAppearance()
+        activeContentController.refreshCutAppearance()
     }
 
     @objc func cut(_ sender: Any?) {
-        let urls = contentController.selectedItems.map(\.url)
+        let urls = activeContentController.selectedItems.map(\.url)
         guard !urls.isEmpty else { NSSound.beep(); return }
         FileOperations.cutURLs(urls)
-        contentController.refreshCutAppearance()
+        activeContentController.refreshCutAppearance()
     }
 
     @objc func paste(_ sender: Any?) {
-        let targetDir = contentController.createTargetDirectory(fallback: currentDirectory)
+        let dir = activeBrowserDirectory
+        let targetDir = activeContentController.createTargetDirectory(fallback: dir)
         do {
             let urls = try FileOperations.paste(into: targetDir)
-            if targetDir.standardizedFileURL != currentDirectory.standardizedFileURL {
-                contentController.markExpanded(targetDir)
+            if targetDir.standardizedFileURL != dir.standardizedFileURL {
+                activeContentController.markExpanded(targetDir)
             }
             reloadAfterMutation(select: urls)
-            contentController.refreshCutAppearance()
+            activeContentController.refreshCutAppearance()
         } catch {
             NSSound.beep()
         }
@@ -2341,21 +2811,34 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     @objc func moveToTrash(_ sender: Any?) {
-        if FileOperations.isTrashDirectory(currentDirectory) {
+        let dir = activeBrowserDirectory
+        let list = activeContentController
+        if FileOperations.isTrashDirectory(dir) {
             deleteForeverFromTrash(sender)
             return
         }
-        if FileOperations.isApplicationsDirectory(currentDirectory) {
+        if FileOperations.isApplicationsDirectory(dir) {
             uninstallSelectedApps(sender)
             return
         }
-        let urls = contentController.selectedItems.map(\.url)
+        let urls = list.selectedItems.map(\.url)
         guard !urls.isEmpty else { NSSound.beep(); return }
-        let nextURL = contentController.selectionURLAfterRemovingSelected()
+        let nextURL = list.selectionURLAfterRemovingSelected()
         do {
             try FileOperations.moveToTrash(urls)
-            contentController.noteRemovedURLs(urls)
-            reloadAfterMutation(select: nextURL.map { [$0] } ?? [])
+            list.noteRemovedURLs(urls)
+            if let pane = focusedExtraPane() {
+                suppressDirectoryWatchUntil = Date().addingTimeInterval(1.2)
+                reloadContents(preservingOutline: true)
+                reloadAllExtraPanes()
+                if let next = nextURL {
+                    DispatchQueue.main.async { [weak pane] in
+                        pane?.contentController.select(urls: [next])
+                    }
+                }
+            } else {
+                reloadAfterMutation(select: nextURL.map { [$0] } ?? [])
+            }
         } catch {
             showError(error)
         }
@@ -2432,27 +2915,52 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     @objc func putBackFromTrash(_ sender: Any?) {
-        guard FileOperations.isTrashDirectory(currentDirectory) else { return }
-        let urls = contentController.selectedItems.map(\.url.standardizedFileURL)
+        let dir = activeBrowserDirectory
+        let list = activeContentController
+        guard FileOperations.isTrashDirectory(dir) else { return }
+        let urls = list.selectedItems.map(\.url.standardizedFileURL)
         guard !urls.isEmpty else { NSSound.beep(); return }
-        let nextURL = contentController.selectionURLAfterRemovingSelected()
+        let nextURL = list.selectionURLAfterRemovingSelected()
         FileOperations.putBackFromTrash(urls)
-        contentController.noteRemovedURLs(urls)
+        list.noteRemovedURLs(urls)
         // Finder Put Away can be slightly async; refresh shortly after.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            self?.reloadAfterMutation(select: nextURL.map { [$0] } ?? [])
+            guard let self else { return }
+            if let pane = self.focusedExtraPane() {
+                self.suppressDirectoryWatchUntil = Date().addingTimeInterval(1.2)
+                self.reloadContents(preservingOutline: true)
+                self.reloadAllExtraPanes()
+                if let next = nextURL {
+                    pane.contentController.select(urls: [next])
+                }
+            } else {
+                self.reloadAfterMutation(select: nextURL.map { [$0] } ?? [])
+            }
         }
     }
 
     @objc func deleteForeverFromTrash(_ sender: Any?) {
-        guard FileOperations.isTrashDirectory(currentDirectory) else { return }
-        let urls = contentController.selectedItems.map(\.url.standardizedFileURL)
+        let dir = activeBrowserDirectory
+        let list = activeContentController
+        guard FileOperations.isTrashDirectory(dir) else { return }
+        let urls = list.selectedItems.map(\.url.standardizedFileURL)
         guard !urls.isEmpty else { NSSound.beep(); return }
-        let nextURL = contentController.selectionURLAfterRemovingSelected()
+        let nextURL = list.selectionURLAfterRemovingSelected()
         do {
             try FileOperations.permanentlyDelete(urls)
-            contentController.noteRemovedURLs(urls)
-            reloadAfterMutation(select: nextURL.map { [$0] } ?? [])
+            list.noteRemovedURLs(urls)
+            if let pane = focusedExtraPane() {
+                suppressDirectoryWatchUntil = Date().addingTimeInterval(1.2)
+                reloadContents(preservingOutline: true)
+                reloadAllExtraPanes()
+                if let next = nextURL {
+                    DispatchQueue.main.async { [weak pane] in
+                        pane?.contentController.select(urls: [next])
+                    }
+                }
+            } else {
+                reloadAfterMutation(select: nextURL.map { [$0] } ?? [])
+            }
         } catch {
             showError(error)
         }
@@ -2492,7 +3000,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             if destination.standardizedFileURL != currentDirectory.standardizedFileURL {
                 contentController.markExpanded(destination)
             }
-            reloadAfterMutation(select: results)
+            // Prefer revealing dropped items; fall back to destination folder in column view.
+            let select = results.isEmpty ? [destination.standardizedFileURL] : results
+            reloadAfterMutation(select: select)
         } catch {
             showError(error)
         }
@@ -3038,7 +3548,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     @objc func searchChanged(_ sender: NSSearchField) {
-        if activeTab.isActivityMonitorTab || activeTab.isTemperatureTab { return }
+        if activeTab.isActivityMonitorTab || activeTab.isTemperatureTab || activeTab.isCompareTab { return }
         let query = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if query.isEmpty {
             contentController.setSearchResultsMode(query: nil, scopeName: "", resultCount: 0)
@@ -3257,6 +3767,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     func windowWillClose(_ notification: Notification) {
         activityMonitorController?.deactivate()
         temperatureController?.deactivate()
+        compareController?.deactivate()
+        for tab in tabs where tab.isCompareTab {
+            CompareSession.shared.clearWorkspace(tab.compareWorkspaceIndex)
+        }
         stopWatching()
         hideAutocomplete()
     }
@@ -3414,6 +3928,8 @@ final class ClickablePathBarView: NSView {
 /// keeping the trailing (current folder) crumb visible.
 final class BreadcrumbClipView: NSView {
     private weak var stack: NSStackView?
+    private var lastCollapseWidth: CGFloat = -1
+    private var lastArrangedCount = -1
     private let ellipsisLabel: NSTextField = {
         let label = NSTextField(labelWithString: "…")
         label.font = .systemFont(ofSize: 12)
@@ -3433,9 +3949,13 @@ final class BreadcrumbClipView: NSView {
         // Frame-based layout in layout(); avoid Auto Layout fighting the clip.
         stack.translatesAutoresizingMaskIntoConstraints = true
         stack.autoresizingMask = []
+        lastCollapseWidth = -1
+        lastArrangedCount = -1
     }
 
     func refreshLayout() {
+        lastCollapseWidth = -1
+        lastArrangedCount = -1
         needsLayout = true
         layoutSubtreeIfNeeded()
     }
@@ -3445,32 +3965,53 @@ final class BreadcrumbClipView: NSView {
         guard let stack else { return }
 
         let views = stack.arrangedSubviews
-        for view in views {
-            view.isHidden = false
-        }
-        ellipsisLabel.isHidden = true
-
         let available = bounds.width
         let height = max(bounds.height, 20)
 
-        // Hide whole leading crumbs until the trail fits. Never clip mid-label.
-        while true {
-            stack.layoutSubtreeIfNeeded()
-            let width = max(stack.fittingSize.width, 0)
-            if width <= available { break }
+        // Column-view rebuilds can transiently pass a near-zero width; collapsing
+        // crumbs then would flash the whole path. Keep the previous arrangement.
+        guard available > 8 else { return }
 
-            let visibleButtons = views.enumerated().filter {
-                !$0.element.isHidden && $0.element is BreadcrumbButton
-            }
-            guard visibleButtons.count > 1 else { break }
-
-            let idx = visibleButtons[0].offset
-            views[idx].isHidden = true
-            if idx + 1 < views.count, views[idx + 1] is BreadcrumbChevronButton {
-                views[idx + 1].isHidden = true
-            }
+        let widthChanged = abs(available - lastCollapseWidth) > 0.5
+        let countChanged = views.count != lastArrangedCount
+        if widthChanged || countChanged {
+            lastCollapseWidth = available
+            lastArrangedCount = views.count
+            recomputeCollapsedSegments(stack: stack, views: views, available: available)
         }
 
+        positionBreadcrumbStack(stack: stack, views: views, available: available, height: height)
+    }
+
+    private func recomputeCollapsedSegments(stack: NSStackView, views: [NSView], available: CGFloat) {
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0
+            for view in views {
+                view.isHidden = false
+            }
+            ellipsisLabel.isHidden = true
+
+            // Hide whole leading crumbs until the trail fits. Never clip mid-label.
+            while true {
+                stack.layoutSubtreeIfNeeded()
+                let width = max(stack.fittingSize.width, 0)
+                if width <= available { break }
+
+                let visibleButtons = views.enumerated().filter {
+                    !$0.element.isHidden && $0.element is BreadcrumbButton
+                }
+                guard visibleButtons.count > 1 else { break }
+
+                let idx = visibleButtons[0].offset
+                views[idx].isHidden = true
+                if idx + 1 < views.count, views[idx + 1] is BreadcrumbChevronButton {
+                    views[idx + 1].isHidden = true
+                }
+            }
+        }
+    }
+
+    private func positionBreadcrumbStack(stack: NSStackView, views: [NSView], available: CGFloat, height: CGFloat) {
         let collapsed = views.contains(where: \.isHidden)
         var leading: CGFloat = 0
         if collapsed {
@@ -3484,6 +4025,8 @@ final class BreadcrumbClipView: NSView {
                 height: eSize.height
             )
             leading = eSize.width + 4
+        } else {
+            ellipsisLabel.isHidden = true
         }
 
         stack.layoutSubtreeIfNeeded()
@@ -3526,125 +4069,6 @@ final class PassThroughStackView: NSStackView {
         // Natural width for clip positioning; height follows content.
         let size = super.intrinsicContentSize
         return size
-    }
-}
-
-/// Custom history row: path left, gray time right-aligned.
-final class HistoryMenuItemView: NSView {
-    private let iconView = NSImageView()
-    private let pathLabel = NSTextField(labelWithString: "")
-    private let timeLabel = NSTextField(labelWithString: "")
-    private let checkView = NSImageView()
-    private var isHighlighted = false
-    private weak var enclosingItem: NSMenuItem?
-
-    init(path: String, time: String, icon: NSImage?, isCurrent: Bool, pathWidth: CGFloat, timeWidth: CGFloat, rowWidth: CGFloat) {
-        super.init(frame: NSRect(x: 0, y: 0, width: rowWidth, height: 24))
-
-        iconView.image = icon
-        iconView.image?.size = NSSize(width: 16, height: 16)
-        iconView.imageScaling = .scaleProportionallyUpOrDown
-        iconView.translatesAutoresizingMaskIntoConstraints = false
-
-        pathLabel.stringValue = path
-        pathLabel.font = .systemFont(ofSize: 13)
-        pathLabel.lineBreakMode = .byTruncatingMiddle
-        pathLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        timeLabel.stringValue = time
-        timeLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        timeLabel.textColor = .secondaryLabelColor
-        timeLabel.alignment = .right
-        timeLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        checkView.image = isCurrent
-            ? NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)
-            : nil
-        checkView.contentTintColor = .labelColor
-        checkView.translatesAutoresizingMaskIntoConstraints = false
-
-        addSubview(checkView)
-        addSubview(iconView)
-        addSubview(pathLabel)
-        addSubview(timeLabel)
-
-        NSLayoutConstraint.activate([
-            checkView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
-            checkView.centerYAnchor.constraint(equalTo: centerYAnchor),
-            checkView.widthAnchor.constraint(equalToConstant: 12),
-            checkView.heightAnchor.constraint(equalToConstant: 12),
-
-            iconView.leadingAnchor.constraint(equalTo: checkView.trailingAnchor, constant: 4),
-            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
-            iconView.widthAnchor.constraint(equalToConstant: 16),
-            iconView.heightAnchor.constraint(equalToConstant: 16),
-
-            pathLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 6),
-            pathLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
-            pathLabel.widthAnchor.constraint(equalToConstant: pathWidth),
-
-            timeLabel.leadingAnchor.constraint(equalTo: pathLabel.trailingAnchor, constant: 16),
-            timeLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            timeLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
-            timeLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: timeWidth)
-        ])
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func viewDidMoveToSuperview() {
-        super.viewDidMoveToSuperview()
-        enclosingItem = enclosingMenuItem
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        if isHighlighted {
-            NSColor.selectedContentBackgroundColor.setFill()
-            bounds.fill()
-            pathLabel.textColor = .white
-            timeLabel.textColor = NSColor.white.withAlphaComponent(0.75)
-            checkView.contentTintColor = .white
-        } else {
-            pathLabel.textColor = .labelColor
-            timeLabel.textColor = .secondaryLabelColor
-            checkView.contentTintColor = .labelColor
-        }
-        super.draw(dirtyRect)
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        isHighlighted = true
-        needsDisplay = true
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        isHighlighted = false
-        needsDisplay = true
-    }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        trackingAreas.forEach(removeTrackingArea)
-        addTrackingArea(NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        ))
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        guard let item = enclosingMenuItem ?? enclosingItem,
-              let menu = item.menu else { return }
-        menu.cancelTracking()
-        if let action = item.action, let target = item.target {
-            _ = (target as AnyObject).perform(action, with: item)
-        } else if let action = item.action {
-            NSApp.sendAction(action, to: nil, from: item)
-        }
     }
 }
 
@@ -3797,20 +4221,30 @@ extension BrowserWindowController: NSSplitViewDelegate {
     }
 
     func splitView(_ splitView: NSSplitView, constrainMaxCoordinate proposedMaximumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
-        max(0, splitView.bounds.width - 120)
+        // Favorites sidebar: keep a sliver of content. Column split: no floor.
+        if splitView === mainSplitView {
+            return max(0, splitView.bounds.width - 40)
+        }
+        return max(0, splitView.bounds.width)
     }
 
     func splitView(_ splitView: NSSplitView, canCollapseSubview subview: NSView) -> Bool {
-        subview === favoritesSidebar.view
+        if splitView === mainSplitView {
+            return subview === favoritesSidebar.view
+        }
+        // Extra browser columns may shrink to zero; primary stays via max/min of siblings.
+        return subview !== primaryColumnHost
     }
 
     func splitView(_ splitView: NSSplitView, shouldHideDividerAt dividerIndex: Int) -> Bool {
-        favoritesSidebar.view.isHidden || !settings.favoritesSidebarVisible
+        guard splitView === mainSplitView else { return false }
+        return favoritesSidebar.view.isHidden || !settings.favoritesSidebarVisible
     }
 
     func splitViewDidResizeSubviews(_ notification: Notification) {
         guard !isApplyingFavoritesLayout else { return }
-        guard let split = mainSplitView, split.subviews.count >= 1 else { return }
+        guard let split = mainSplitView, split === (notification.object as? NSSplitView) else { return }
+        guard split.subviews.count >= 1 else { return }
         guard settings.favoritesSidebarVisible,
               !favoritesSidebar.view.isHidden else { return }
         let width = split.subviews[0].bounds.width

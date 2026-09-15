@@ -12,9 +12,13 @@ final class BrowserTab {
     var isActivityMonitorTab = false
     /// Virtual tab hosting the temperature monitor.
     var isTemperatureTab = false
+    /// Virtual tab hosting the in-app code compare view.
+    var isCompareTab = false
+    /// 1-based workspace index when `isCompareTab` (比对1…比对10).
+    var compareWorkspaceIndex: Int = 1
 
     var isArchiveTab: Bool { archiveURL != nil }
-    var isSpecialContentTab: Bool { isActivityMonitorTab || isTemperatureTab }
+    var isSpecialContentTab: Bool { isActivityMonitorTab || isTemperatureTab || isCompareTab }
 
     init(directory: URL) {
         self.directory = directory.standardizedFileURL
@@ -39,12 +43,22 @@ final class BrowserTab {
         directory = URL(fileURLWithPath: "/NewFinder/Temperature", isDirectory: true)
     }
 
+    init(compareWorkspace index: Int) {
+        isCompareTab = true
+        compareWorkspaceIndex = max(1, min(CompareSession.workspaceCount, index))
+        directory = URL(fileURLWithPath: "/NewFinder/Compare/\(compareWorkspaceIndex)", isDirectory: true)
+    }
+
     var title: String {
         if isActivityMonitorTab {
             return "活动监视器"
         }
         if isTemperatureTab {
             return "温度"
+        }
+        if isCompareTab {
+            return CompareSession.shared.workspace(at: compareWorkspaceIndex)?.summaryTitle(index: compareWorkspaceIndex)
+                ?? "比对\(compareWorkspaceIndex)"
         }
         if let archiveURL {
             return archiveURL.lastPathComponent
@@ -88,6 +102,7 @@ final class ChromeHeaderView: NSView {
     private weak var actionTarget: AnyObject?
     private weak var externalNewToolsStack: NSStackView?
     private var tabStripTrailingToToolsConstraint: NSLayoutConstraint!
+    private var tabStripTrailingEdgeConstraint: NSLayoutConstraint!
 
     private(set) var tabs: [BrowserTab] = []
     private(set) var activeTabID: UUID?
@@ -139,12 +154,15 @@ final class ChromeHeaderView: NSView {
         rebuildTools()
     }
 
-    /// Places show-hidden + New near the trailing close button.
+    /// Places trailing controls (e.g. window close) on the tab strip's right edge.
     func attachLeadingTools(_ tools: NSView) {
         trailingToolsHost.subviews.forEach { $0.removeFromSuperview() }
         tools.removeFromSuperview()
         tools.translatesAutoresizingMaskIntoConstraints = false
         trailingToolsHost.addSubview(tools)
+        trailingToolsHost.isHidden = false
+        tabStripTrailingEdgeConstraint.isActive = false
+        tabStripTrailingToToolsConstraint.isActive = true
         NSLayoutConstraint.activate([
             tools.leadingAnchor.constraint(equalTo: trailingToolsHost.leadingAnchor),
             tools.trailingAnchor.constraint(equalTo: trailingToolsHost.trailingAnchor),
@@ -192,6 +210,7 @@ final class ChromeHeaderView: NSView {
         trailingToolsHost.translatesAutoresizingMaskIntoConstraints = false
         trailingToolsHost.setContentHuggingPriority(.required, for: .horizontal)
         trailingToolsHost.setContentCompressionResistancePriority(.required, for: .horizontal)
+        trailingToolsHost.isHidden = true
 
         addSubview(tabRow)
         tabRow.addSubview(tabStrip)
@@ -199,6 +218,12 @@ final class ChromeHeaderView: NSView {
 
         tabStripTrailingToToolsConstraint = tabStrip.trailingAnchor.constraint(
             equalTo: trailingToolsHost.leadingAnchor,
+            constant: -6
+        )
+        tabStripTrailingToToolsConstraint.isActive = false
+
+        tabStripTrailingEdgeConstraint = tabStrip.trailingAnchor.constraint(
+            equalTo: tabRow.trailingAnchor,
             constant: -6
         )
 
@@ -209,12 +234,11 @@ final class ChromeHeaderView: NSView {
             tabRow.bottomAnchor.constraint(equalTo: bottomAnchor),
             tabRow.heightAnchor.constraint(equalToConstant: 32),
 
-            tabStrip.leadingAnchor.constraint(equalTo: tabRow.leadingAnchor, constant: 10),
-            tabStrip.topAnchor.constraint(equalTo: tabRow.topAnchor, constant: 2),
+            tabStrip.leadingAnchor.constraint(equalTo: tabRow.leadingAnchor, constant: 0),
+            tabStrip.topAnchor.constraint(equalTo: tabRow.topAnchor, constant: 0),
             tabStrip.bottomAnchor.constraint(equalTo: tabRow.bottomAnchor),
-            tabStripTrailingToToolsConstraint,
+            tabStripTrailingEdgeConstraint,
 
-            // Close button lives inside trailingToolsHost; only a small outer margin.
             trailingToolsHost.trailingAnchor.constraint(equalTo: tabRow.trailingAnchor, constant: -10),
             trailingToolsHost.centerYAnchor.constraint(equalTo: tabRow.centerYAnchor),
             trailingToolsHost.heightAnchor.constraint(equalToConstant: 24)
@@ -228,7 +252,7 @@ final class ChromeHeaderView: NSView {
         let searchWidth = searchField.widthAnchor.constraint(equalToConstant: 140)
         searchWidth.priority = .defaultHigh
         searchWidth.isActive = true
-        searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 72).isActive = true
+        searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 40).isActive = true
         searchWidthConstraint = searchWidth
     }
 
@@ -239,6 +263,8 @@ final class ChromeHeaderView: NSView {
                 icon = NSImage(systemSymbolName: "chart.bar.doc.horizontal", accessibilityDescription: nil)
             } else if tab.isTemperatureTab {
                 icon = NSImage(systemSymbolName: "thermometer.medium", accessibilityDescription: nil)
+            } else if tab.isCompareTab {
+                icon = NSImage(systemSymbolName: "arrow.left.arrow.right", accessibilityDescription: nil)
             } else {
                 icon = NSWorkspace.shared.icon(forFile: tab.directory.path)
             }
@@ -247,7 +273,7 @@ final class ChromeHeaderView: NSView {
                 title: tab.title,
                 icon: icon,
                 isActive: tab.id == activeTabID,
-                canClose: tabs.count > 1
+                canClose: true
             )
         }
         tabStrip.setItems(items)
@@ -264,7 +290,7 @@ final class ChromeHeaderView: NSView {
 
         searchField.target = target
         searchField.action = #selector(BrowserWindowController.searchChanged(_:))
-        // Search lives on the path bar (after the bookmark star); history / gear sit in the titlebar.
+        // Bookmark star + search stay on the path bar; New / tools sit on the favorites bar.
     }
 
     func makeChromeMenuButton() -> NSButton {
@@ -423,13 +449,12 @@ final class TabStripView: NSView {
     private var tabClickTimestamp: TimeInterval = 0
     private let tabClickInterval: TimeInterval = 0.55
 
-    private let tabHeight: CGFloat = 30
-    private let tabMinWidth: CGFloat = 120
-    private let tabMaxWidth: CGFloat = 180
-    private let overlap: CGFloat = 14
-    private let corner: CGFloat = 8
-    private let ear: CGFloat = 8
-    private let plusSize: CGFloat = 22
+    private let tabHeight: CGFloat = 32
+    private let tabFixedWidth: CGFloat = 140
+    private let overlap: CGFloat = 0
+    private let corner: CGFloat = 0
+    private let ear: CGFloat = 0
+    private let plusSize: CGFloat = 20
     private let plusGap: CGFloat = 4
 
     func setItems(_ items: [Item]) {
@@ -458,21 +483,7 @@ final class TabStripView: NSView {
             return
         }
 
-        let count = CGFloat(items.count)
-        // Reserve room for + after last tab
-        let reserved = plusGap + plusSize + 4
-        let available = max(0, bounds.width - reserved)
-
-        var width = tabMaxWidth
-        if count > 1 {
-            let totalIfMax = tabMaxWidth * count - overlap * (count - 1)
-            if totalIfMax > available {
-                width = max(tabMinWidth, (available + overlap * (count - 1)) / count)
-            }
-        } else {
-            width = min(tabMaxWidth, max(tabMinWidth, available))
-        }
-
+        let width = tabFixedWidth
         var x: CGFloat = 0
         let y = bounds.height - tabHeight
         for item in items {
@@ -484,13 +495,13 @@ final class TabStripView: NSView {
                 width: 16,
                 height: 16
             )
-            x += width - overlap
+            x += width
         }
 
-        // + sits immediately to the right of the last tab (Chrome style)
+        // + sits immediately to the right of the last tab
         let lastMaxX = (items.last.flatMap { tabFrames[$0.id]?.maxX }) ?? 0
         let plusY = y + (tabHeight - plusSize) / 2
-        plusFrame = NSRect(x: lastMaxX + plusGap - overlap / 2, y: plusY, width: plusSize, height: plusSize)
+        plusFrame = NSRect(x: lastMaxX + plusGap, y: plusY, width: plusSize, height: plusSize)
         // Keep + inside strip
         if plusFrame.maxX > bounds.width {
             plusFrame.origin.x = max(0, bounds.width - plusSize)
@@ -501,12 +512,8 @@ final class TabStripView: NSView {
         recalculateFrames()
         let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
 
-        let ordered = items.sorted { a, b in
-            if a.isActive != b.isActive { return !a.isActive && b.isActive }
-            return false
-        }
-
-        for item in ordered {
+        // Draw left → right; no overlap, so active tab never covers neighbors.
+        for item in items {
             guard let frame = tabFrames[item.id] else { continue }
             let isHovered = hoveredID == item.id
             let fill: NSColor
@@ -521,6 +528,22 @@ final class TabStripView: NSView {
             let path = chromeTabPath(in: frame, corner: corner, ear: ear)
             fill.setFill()
             path.fill()
+
+            // Hairline only between two inactive tabs — avoid a recessed look around the active tab.
+            if let index = items.firstIndex(where: { $0.id == item.id }), index > 0 {
+                let previous = items[index - 1]
+                if !item.isActive && !previous.isActive {
+                    let divider = dark
+                        ? NSColor(calibratedWhite: 0.12, alpha: 1)
+                        : NSColor(calibratedWhite: 0.72, alpha: 1)
+                    divider.setStroke()
+                    let line = NSBezierPath()
+                    line.move(to: NSPoint(x: frame.minX + 0.5, y: frame.minY + 4))
+                    line.line(to: NSPoint(x: frame.minX + 0.5, y: frame.maxY - 4))
+                    line.lineWidth = 1
+                    line.stroke()
+                }
+            }
 
             let iconRect = NSRect(x: frame.minX + 12, y: frame.midY - 7, width: 14, height: 14)
             if let icon = item.icon {
@@ -537,9 +560,9 @@ final class TabStripView: NSView {
             paragraph.lineBreakMode = .byTruncatingTail
             let titleColor = dark
                 ? NSColor(calibratedWhite: 0.82, alpha: 1)
-                : NSColor(calibratedWhite: 0.32, alpha: 1)
+                : NSColor.black
             let attrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 13, weight: item.isActive ? .medium : .regular),
+                .font: NSFont.systemFont(ofSize: 12, weight: item.isActive ? .medium : .regular),
                 .foregroundColor: titleColor,
                 .paragraphStyle: paragraph
             ]
@@ -624,12 +647,23 @@ final class TabStripView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        recalculateFrames()
         let point = convert(event.locationInWindow, from: nil)
 
         if plusFrame.insetBy(dx: -2, dy: -2).contains(point) {
             resetTabClickSequence()
             onNewTab?()
             return
+        }
+
+        // Prefer close hits before tab selection so the × always works (including the last tab).
+        for item in items {
+            guard item.canClose, let closeRect = closeFrames[item.id] else { continue }
+            if closeRect.insetBy(dx: -4, dy: -4).contains(point) {
+                resetTabClickSequence()
+                onCloseTab?(item.id)
+                return
+            }
         }
 
         var seen = Set<UUID>()
@@ -640,12 +674,6 @@ final class TabStripView: NSView {
             guard let frame = tabFrames[item.id] else { continue }
             let path = chromeTabPath(in: frame, corner: corner, ear: ear)
             guard path.contains(point) else { continue }
-
-            if item.canClose, let closeRect = closeFrames[item.id], closeRect.insetBy(dx: -3, dy: -3).contains(point) {
-                resetTabClickSequence()
-                onCloseTab?(item.id)
-                return
-            }
 
             // Triple-click detaches the tab into a new NewFinder window.
             // ⌘ + triple-click tiles side-by-side (up to 3 windows).
@@ -691,7 +719,7 @@ final class TabStripView: NSView {
 
         let close = menu.addItem(withTitle: "关闭", action: #selector(contextClose), keyEquivalent: "")
         close.target = self
-        close.isEnabled = items.count > 1
+        close.isEnabled = true
 
         let closeLeft = menu.addItem(withTitle: "关闭左侧标签页", action: #selector(contextCloseLeft), keyEquivalent: "")
         closeLeft.target = self
@@ -787,40 +815,8 @@ final class TabStripView: NSView {
     }
 
     private func chromeTabPath(in rect: NSRect, corner: CGFloat, ear: CGFloat) -> NSBezierPath {
-        let r = min(corner, rect.width / 2, rect.height / 2)
-        let e = min(ear, rect.width / 4, rect.height)
-        let path = NSBezierPath()
-
-        path.move(to: NSPoint(x: rect.minX, y: rect.maxY))
-        path.curve(
-            to: NSPoint(x: rect.minX + e, y: rect.maxY - e),
-            controlPoint1: NSPoint(x: rect.minX + e * 0.45, y: rect.maxY),
-            controlPoint2: NSPoint(x: rect.minX + e, y: rect.maxY - e * 0.55)
-        )
-        path.line(to: NSPoint(x: rect.minX + e, y: rect.minY + r))
-        path.appendArc(
-            withCenter: NSPoint(x: rect.minX + e + r, y: rect.minY + r),
-            radius: r,
-            startAngle: 180,
-            endAngle: 270,
-            clockwise: false
-        )
-        path.line(to: NSPoint(x: rect.maxX - e - r, y: rect.minY))
-        path.appendArc(
-            withCenter: NSPoint(x: rect.maxX - e - r, y: rect.minY + r),
-            radius: r,
-            startAngle: 270,
-            endAngle: 0,
-            clockwise: false
-        )
-        path.line(to: NSPoint(x: rect.maxX - e, y: rect.maxY - e))
-        path.curve(
-            to: NSPoint(x: rect.maxX, y: rect.maxY),
-            controlPoint1: NSPoint(x: rect.maxX - e, y: rect.maxY - e * 0.55),
-            controlPoint2: NSPoint(x: rect.maxX - e * 0.45, y: rect.maxY)
-        )
-        path.close()
-        return path
+        // Square tabs — no rounded corners / chrome ears.
+        return NSBezierPath(rect: rect)
     }
 }
 

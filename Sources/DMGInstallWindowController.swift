@@ -3,11 +3,13 @@ import AppKit
 /// NewFinder’s own DMG installer window (avoids the fragile system Finder install sheet).
 final class DMGInstallWindowController: NSWindowController {
     private(set) var mountURL: URL
-    var mountedSourceDMG: URL? { mounted.sourceDMG }
-    private var mounted: DMGInstallSupport.MountedImage
-    private var apps: [URL]
+    var mountedSourceDMG: URL? { mounted?.sourceDMG ?? pendingSourceDMG }
+    private var mounted: DMGInstallSupport.MountedImage?
+    private var pendingSourceDMG: URL?
+    private var apps: [URL] = []
     private var selectedApp: URL?
     private var didDetach = false
+    private var isBusy = false
 
     private var iconView: NSImageView!
     private var nameLabel: NSTextField!
@@ -15,28 +17,62 @@ final class DMGInstallWindowController: NSWindowController {
     private var installButton: NSButton!
     private var installAndOpenButton: NSButton!
     private var statusLabel: NSTextField!
+    private var progressBar: NSProgressIndicator!
     private var appsPopup: NSPopUpButton?
 
-    init(mounted: DMGInstallSupport.MountedImage) {
+    /// Show a window immediately while the DMG mounts in the background.
+    convenience init(loadingDMG dmgURL: URL) {
+        self.init(
+            mounted: nil,
+            sourceDMG: dmgURL.standardizedFileURL,
+            mountTitle: dmgURL.deletingPathExtension().lastPathComponent,
+            apps: []
+        )
+        setBusy(true, status: "正在打开磁盘映像…", indeterminate: true)
+    }
+
+    convenience init(mounted: DMGInstallSupport.MountedImage) {
+        let apps = DMGInstallSupport.findApps(in: mounted.mountURL)
+        self.init(
+            mounted: mounted,
+            sourceDMG: mounted.sourceDMG,
+            mountTitle: mounted.mountURL.lastPathComponent,
+            apps: apps
+        )
+    }
+
+    private init(
+        mounted: DMGInstallSupport.MountedImage?,
+        sourceDMG: URL?,
+        mountTitle: String,
+        apps: [URL]
+    ) {
         self.mounted = mounted
-        self.mountURL = mounted.mountURL.standardizedFileURL
-        self.apps = DMGInstallSupport.findApps(in: mounted.mountURL)
+        self.pendingSourceDMG = sourceDMG
+        self.mountURL = mounted?.mountURL.standardizedFileURL
+            ?? sourceDMG?.standardizedFileURL
+            ?? URL(fileURLWithPath: "/")
+        self.apps = apps
         self.selectedApp = apps.first
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 340),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 360),
             styleMask: [.titled, .closable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
-        window.title = mounted.mountURL.lastPathComponent
+        window.title = mountTitle
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isReleasedWhenClosed = false
         window.center()
         super.init(window: window)
         window.delegate = self
-        configureUI()
+        configureUI(titleText: "安装 \(mountTitle)")
+        if mounted != nil {
+            refreshSelectionUI()
+            setBusy(false, status: "", indeterminate: false)
+        }
     }
 
     @available(*, unavailable)
@@ -44,7 +80,26 @@ final class DMGInstallWindowController: NSWindowController {
         fatalError("init(coder:) has not been implemented")
     }
 
-    private func configureUI() {
+    /// Called after background `hdiutil attach` succeeds.
+    func finishMounting(mounted: DMGInstallSupport.MountedImage) {
+        self.mounted = mounted
+        self.mountURL = mounted.mountURL.standardizedFileURL
+        self.apps = DMGInstallSupport.findApps(in: mounted.mountURL)
+        self.selectedApp = apps.first
+        window?.title = mounted.mountURL.lastPathComponent
+        rebuildAppsPopupIfNeeded()
+        refreshSelectionUI()
+        setBusy(false, status: "", indeterminate: false)
+    }
+
+    func showMountError(_ error: Error) {
+        setBusy(false, status: error.localizedDescription, indeterminate: false)
+        statusLabel.textColor = .systemRed
+        installButton.isEnabled = false
+        installAndOpenButton.isEnabled = false
+    }
+
+    private func configureUI(titleText: String) {
         guard let window, let content = window.contentView else { return }
 
         let root = NSView(frame: content.bounds)
@@ -53,14 +108,16 @@ final class DMGInstallWindowController: NSWindowController {
         root.autoresizingMask = [.width, .height]
         content.addSubview(root)
 
-        let title = NSTextField(labelWithString: "安装 \(mounted.mountURL.lastPathComponent)")
+        let title = NSTextField(labelWithString: titleText)
         title.font = .systemFont(ofSize: 20, weight: .semibold)
         title.alignment = .center
         title.translatesAutoresizingMaskIntoConstraints = false
+        title.tag = 9001
 
         iconView = NSImageView()
         iconView.imageScaling = .scaleProportionallyUpOrDown
         iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.image = NSImage(systemSymbolName: "shippingbox", accessibilityDescription: nil)
 
         let arrow = NSImageView()
         arrow.image = NSImage(systemSymbolName: "arrow.right", accessibilityDescription: nil)
@@ -73,7 +130,7 @@ final class DMGInstallWindowController: NSWindowController {
         appsIcon.imageScaling = .scaleProportionallyUpOrDown
         appsIcon.translatesAutoresizingMaskIntoConstraints = false
 
-        nameLabel = NSTextField(labelWithString: "")
+        nameLabel = NSTextField(labelWithString: "准备中…")
         nameLabel.font = .systemFont(ofSize: 14, weight: .medium)
         nameLabel.alignment = .center
         nameLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -90,14 +147,25 @@ final class DMGInstallWindowController: NSWindowController {
         statusLabel.alignment = .center
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
 
+        progressBar = NSProgressIndicator()
+        progressBar.style = .bar
+        progressBar.isIndeterminate = false
+        progressBar.minValue = 0
+        progressBar.maxValue = 1
+        progressBar.doubleValue = 0
+        progressBar.isHidden = true
+        progressBar.translatesAutoresizingMaskIntoConstraints = false
+
         installButton = NSButton(title: "安装", target: self, action: #selector(installClicked))
         installButton.bezelStyle = .rounded
         installButton.translatesAutoresizingMaskIntoConstraints = false
+        installButton.isEnabled = false
 
         installAndOpenButton = NSButton(title: "安装并打开", target: self, action: #selector(installAndOpenClicked))
         installAndOpenButton.bezelStyle = .rounded
         installAndOpenButton.keyEquivalent = "\r"
         installAndOpenButton.translatesAutoresizingMaskIntoConstraints = false
+        installAndOpenButton.isEnabled = false
 
         root.addSubview(title)
         root.addSubview(iconView)
@@ -106,10 +174,11 @@ final class DMGInstallWindowController: NSWindowController {
         root.addSubview(nameLabel)
         root.addSubview(hintLabel)
         root.addSubview(statusLabel)
+        root.addSubview(progressBar)
         root.addSubview(installButton)
         root.addSubview(installAndOpenButton)
 
-        var constraints: [NSLayoutConstraint] = [
+        NSLayoutConstraint.activate([
             title.topAnchor.constraint(equalTo: root.topAnchor, constant: 36),
             title.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
             title.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
@@ -141,48 +210,100 @@ final class DMGInstallWindowController: NSWindowController {
             statusLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
             statusLabel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
 
+            progressBar.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 8),
+            progressBar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 48),
+            progressBar.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -48),
+            progressBar.heightAnchor.constraint(equalToConstant: 12),
+
             installButton.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -20),
             installButton.trailingAnchor.constraint(equalTo: root.centerXAnchor, constant: -8),
 
             installAndOpenButton.bottomAnchor.constraint(equalTo: installButton.bottomAnchor),
             installAndOpenButton.leadingAnchor.constraint(equalTo: root.centerXAnchor, constant: 8)
-        ]
+        ])
 
-        if apps.count > 1 {
-            let popup = NSPopUpButton(frame: .zero, pullsDown: false)
-            popup.translatesAutoresizingMaskIntoConstraints = false
-            for app in apps {
-                popup.addItem(withTitle: app.deletingPathExtension().lastPathComponent)
-            }
-            popup.target = self
-            popup.action = #selector(appSelectionChanged(_:))
-            root.addSubview(popup)
-            appsPopup = popup
-            constraints.append(contentsOf: [
-                popup.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 8),
-                popup.centerXAnchor.constraint(equalTo: root.centerXAnchor),
-                popup.widthAnchor.constraint(greaterThanOrEqualToConstant: 180)
-            ])
+        rebuildAppsPopupIfNeeded()
+    }
+
+    private func rebuildAppsPopupIfNeeded() {
+        appsPopup?.removeFromSuperview()
+        appsPopup = nil
+        guard apps.count > 1, let root = window?.contentView?.subviews.first else { return }
+
+        let popup = NSPopUpButton(frame: .zero, pullsDown: false)
+        popup.translatesAutoresizingMaskIntoConstraints = false
+        for app in apps {
+            popup.addItem(withTitle: app.deletingPathExtension().lastPathComponent)
         }
-
-        NSLayoutConstraint.activate(constraints)
-        refreshSelectionUI()
+        popup.target = self
+        popup.action = #selector(appSelectionChanged(_:))
+        root.addSubview(popup)
+        appsPopup = popup
+        NSLayoutConstraint.activate([
+            popup.topAnchor.constraint(equalTo: progressBar.bottomAnchor, constant: 8),
+            popup.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+            popup.widthAnchor.constraint(greaterThanOrEqualToConstant: 180)
+        ])
     }
 
     private func refreshSelectionUI() {
         guard let app = selectedApp else {
             iconView.image = NSImage(systemSymbolName: "shippingbox", accessibilityDescription: nil)
-            nameLabel.stringValue = "未找到可安装的应用程序"
+            nameLabel.stringValue = mounted == nil ? "准备中…" : "未找到可安装的应用程序"
             installButton.isEnabled = false
             installAndOpenButton.isEnabled = false
             return
         }
-        let icon = NSWorkspace.shared.icon(forFile: app.path)
-        icon.size = NSSize(width: 96, height: 96)
-        iconView.image = icon
+        // Icon lookup can hitch; keep UI responsive.
         nameLabel.stringValue = app.deletingPathExtension().lastPathComponent
-        installButton.isEnabled = true
-        installAndOpenButton.isEnabled = true
+        let path = app.path
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let icon = NSWorkspace.shared.icon(forFile: path)
+            icon.size = NSSize(width: 96, height: 96)
+            DispatchQueue.main.async {
+                guard let self, self.selectedApp?.path == path else { return }
+                self.iconView.image = icon
+            }
+        }
+        installButton.isEnabled = !isBusy
+        installAndOpenButton.isEnabled = !isBusy
+    }
+
+    private func setBusy(_ busy: Bool, status: String, indeterminate: Bool) {
+        isBusy = busy
+        statusLabel.stringValue = status
+        statusLabel.textColor = .secondaryLabelColor
+        progressBar.isHidden = !busy
+        if busy {
+            if indeterminate {
+                progressBar.isIndeterminate = true
+                progressBar.startAnimation(nil)
+            } else {
+                progressBar.stopAnimation(nil)
+                progressBar.isIndeterminate = false
+                progressBar.doubleValue = 0
+            }
+        } else {
+            progressBar.stopAnimation(nil)
+            progressBar.isIndeterminate = false
+            progressBar.doubleValue = 0
+        }
+        let canInstall = !busy && selectedApp != nil && mounted != nil
+        installButton.isEnabled = canInstall
+        installAndOpenButton.isEnabled = canInstall
+        appsPopup?.isEnabled = !busy
+    }
+
+    private func updateProgress(_ fraction: Double, status: String) {
+        progressBar.isHidden = false
+        statusLabel.stringValue = status
+        statusLabel.textColor = .secondaryLabelColor
+        // Always determinate — never the bouncing indeterminate bar.
+        if progressBar.isIndeterminate {
+            progressBar.stopAnimation(nil)
+            progressBar.isIndeterminate = false
+        }
+        progressBar.doubleValue = min(1, max(0, fraction))
     }
 
     @objc private func appSelectionChanged(_ sender: NSPopUpButton) {
@@ -201,32 +322,51 @@ final class DMGInstallWindowController: NSWindowController {
     }
 
     private func runInstall(openAfter: Bool) {
-        guard let app = selectedApp else { return }
-        installButton.isEnabled = false
-        installAndOpenButton.isEnabled = false
-        statusLabel.stringValue = "正在安装…"
-        statusLabel.textColor = .secondaryLabelColor
+        guard let app = selectedApp, mounted != nil, !isBusy else { return }
+        setBusy(true, status: "正在准备安装…", indeterminate: false)
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
-                let dest = try DMGInstallSupport.installApp(app, toApplications: true)
+                let dest = try DMGInstallSupport.installApp(app, toApplications: true) { fraction, status in
+                    DispatchQueue.main.async {
+                        self?.updateProgress(fraction, status: status)
+                    }
+                }
                 DispatchQueue.main.async {
                     guard let self else { return }
+                    self.progressBar.doubleValue = 1
                     self.statusLabel.textColor = .systemGreen
-                    self.statusLabel.stringValue = "已安装到 \(dest.path)"
-                    if openAfter {
-                        NSWorkspace.shared.open(dest)
-                    }
-                    // Always eject the disk image after a successful install.
-                    self.closeAndEject()
+                    self.statusLabel.stringValue = openAfter
+                        ? "安装完成，正在推出磁盘映像…"
+                        : "已安装到 \(dest.path)"
+                    // Eject the DMG first, then open from /Applications — avoids apps
+                    // detecting a still-mounted image / App Translocation path.
+                    self.closeEjectThenOpen(dest, open: openAfter)
                 }
             } catch {
                 DispatchQueue.main.async {
+                    self?.setBusy(false, status: error.localizedDescription, indeterminate: false)
                     self?.statusLabel.textColor = .systemRed
-                    self?.statusLabel.stringValue = error.localizedDescription
-                    self?.installButton.isEnabled = true
-                    self?.installAndOpenButton.isEnabled = true
                 }
+            }
+        }
+    }
+
+    private func closeEjectThenOpen(_ installedApp: URL, open: Bool) {
+        let image = mounted
+        mounted = nil
+        didDetach = true
+        window?.close()
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            if let image {
+                DMGInstallSupport.detach(image)
+            }
+            guard open else { return }
+            // Give the volume a moment to disappear from the namespace.
+            Thread.sleep(forTimeInterval: 0.25)
+            DispatchQueue.main.async {
+                DMGInstallSupport.openInstalledApp(installedApp)
             }
         }
     }
@@ -234,7 +374,9 @@ final class DMGInstallWindowController: NSWindowController {
     private func closeAndEject() {
         let image = mounted
         window?.close()
-        detachIfNeeded(image)
+        if let image {
+            detachIfNeeded(image)
+        }
     }
 
     private func detachIfNeeded(_ image: DMGInstallSupport.MountedImage) {
@@ -248,7 +390,14 @@ final class DMGInstallWindowController: NSWindowController {
 
 extension DMGInstallWindowController: NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
-        detachIfNeeded(mounted)
+        if let mounted {
+            detachIfNeeded(mounted)
+        }
         AppDelegate.shared.dmgInstallWindowDidClose(self)
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        // Don't allow closing mid-copy; cancel isn't supported cleanly mid-ditto.
+        !isBusy || mounted == nil
     }
 }

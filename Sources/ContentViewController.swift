@@ -63,7 +63,11 @@ final class ContentViewController: NSViewController {
 
     private var listScroll: NSScrollView!
     private var listView: NSTableView!
+    private var columnBrowser: ColumnBrowserView!
     private var emptyLabel: NSTextField!
+    private(set) var isColumnView = false
+    var onColumnViewDirectoryChange: ((URL) -> Void)?
+    var onViewModeChange: ((Bool) -> Void)?
     private var searchBanner: NSView!
     private var searchBannerLabel: NSTextField!
     private var applicationsFilterField: NSSearchField!
@@ -79,6 +83,7 @@ final class ContentViewController: NSViewController {
     private var renamingItem: FileItem?
     private var renamingOriginalName: String?
     private weak var openWithMenuItem: NSMenuItem?
+    private weak var compareMenuItem: NSMenuItem?
     private weak var putBackMenuItem: NSMenuItem?
     private weak var deleteForeverMenuItem: NSMenuItem?
     private weak var uninstallMenuItem: NSMenuItem?
@@ -183,7 +188,7 @@ final class ContentViewController: NSViewController {
         let nameCol = NSTableColumn(identifier: .init("name"))
         nameCol.title = "名称"
         nameCol.width = 320
-        nameCol.minWidth = 140
+        nameCol.minWidth = 0
         nameCol.headerCell.alignment = .left
         table.addTableColumn(nameCol)
 
@@ -191,7 +196,7 @@ final class ContentViewController: NSViewController {
         let expandCol = NSTableColumn(identifier: .init("expand"))
         expandCol.title = ""
         expandCol.width = 15
-        expandCol.minWidth = 15
+        expandCol.minWidth = 0
         expandCol.maxWidth = 15
         expandCol.resizingMask = []
         table.addTableColumn(expandCol)
@@ -201,18 +206,21 @@ final class ContentViewController: NSViewController {
         let dateCol = NSTableColumn(identifier: .init("date"))
         dateCol.title = "修改日期"
         dateCol.width = 160
+        dateCol.minWidth = 0
         dateCol.headerCell.alignment = .left
         table.addTableColumn(dateCol)
 
         let sizeCol = NSTableColumn(identifier: .init("size"))
         sizeCol.title = "大小"
         sizeCol.width = 90
+        sizeCol.minWidth = 0
         sizeCol.headerCell.alignment = .left
         table.addTableColumn(sizeCol)
 
         let kindCol = NSTableColumn(identifier: .init("kind"))
         kindCol.title = "种类"
         kindCol.width = 120
+        kindCol.minWidth = 0
         kindCol.headerCell.alignment = .left
         table.addTableColumn(kindCol)
 
@@ -236,6 +244,27 @@ final class ContentViewController: NSViewController {
         root.addSubview(searchBanner)
         root.addSubview(listScroll)
         root.addSubview(emptyLabel)
+
+        columnBrowser = ColumnBrowserView()
+        columnBrowser.translatesAutoresizingMaskIntoConstraints = false
+        columnBrowser.isHidden = true
+        columnBrowser.onSelectionChange = { [weak self] items in
+            self?.onSelectionChange?(items)
+        }
+        columnBrowser.onOpen = { [weak self] item in
+            self?.onOpen?(item)
+        }
+        columnBrowser.onActivateDirectory = { [weak self] url in
+            self?.onColumnViewDirectoryChange?(url)
+        }
+        columnBrowser.onPerformFileDrop = { [weak self] urls, destination, copying in
+            self?.onPerformFileDrop?(urls, destination, copying)
+        }
+        columnBrowser.onDirectoryNeedsReload = { [weak self] in
+            self?.onDirectoryNeedsReload?()
+        }
+        root.addSubview(columnBrowser)
+
         view = root
 
         searchBannerHeight = searchBanner.heightAnchor.constraint(equalToConstant: 0)
@@ -254,6 +283,11 @@ final class ContentViewController: NSViewController {
             listScroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             listScroll.bottomAnchor.constraint(equalTo: root.bottomAnchor),
 
+            columnBrowser.topAnchor.constraint(equalTo: root.topAnchor),
+            columnBrowser.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            columnBrowser.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            columnBrowser.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+
             emptyLabel.centerXAnchor.constraint(equalTo: root.centerXAnchor),
             emptyLabel.centerYAnchor.constraint(equalTo: root.centerYAnchor)
         ])
@@ -266,6 +300,10 @@ final class ContentViewController: NSViewController {
         openWith.submenu = NSMenu()
         openWithMenuItem = openWith
         menu.addItem(openWith)
+        let compare = NSMenuItem(title: "比对", action: nil, keyEquivalent: "")
+        compare.submenu = NSMenu()
+        compareMenuItem = compare
+        menu.addItem(compare)
         menu.addItem(withTitle: "打开所在位置", action: #selector(contextRevealInEnclosingFolder), keyEquivalent: "")
         menu.addItem(NSMenuItem.separator())
         let putBack = NSMenuItem(title: "放回原处", action: #selector(contextPutBack), keyEquivalent: "")
@@ -431,6 +469,7 @@ final class ContentViewController: NSViewController {
         if active, let query {
             isShowingApplications = false
             isShowingHistory = false
+            if isColumnView { setColumnViewEnabled(false) }
             checkedUninstallURLs.removeAll()
             applicationsFilterQuery = ""
             applicationsFilterField.stringValue = ""
@@ -564,6 +603,7 @@ final class ContentViewController: NSViewController {
             isShowingTrash = false
             isShowingSearchResults = false
             isShowingApplications = false
+            if isColumnView { setColumnViewEnabled(false) }
             searchQuery = ""
             checkedUninstallURLs.removeAll()
             applicationsFilterQuery = ""
@@ -839,10 +879,15 @@ final class ContentViewController: NSViewController {
         select: [URL] = [],
         beginRename: URL? = nil
     ) {
-        emptyLabel.isHidden = !items.isEmpty
+        emptyLabel.isHidden = isColumnView || !items.isEmpty
         let previousSelection = select.isEmpty
             ? selectedItems.map(\.url.standardizedFileURL)
             : select.map(\.standardizedFileURL)
+
+        if isColumnView, let root = directoryForDrop?() {
+            let reveal = (beginRename.map { [$0] } ?? []) + previousSelection
+            columnBrowser.refreshAfterMutation(root: root, select: reveal)
+        }
 
         if !preservingOutline {
             rootItems = items
@@ -1098,22 +1143,22 @@ final class ContentViewController: NSViewController {
         toggleExpand(at: row)
     }
 
-    private func toggleExpand(at row: Int) {
+    /// Expand a folder row in place (no-op if already expanded / not a folder).
+    private func expandFolder(at row: Int) {
         guard items.indices.contains(row) else { return }
         let item = items[row]
         guard item.isDirectory, !item.isArchiveEntry else { return }
         let key = item.url.standardizedFileURL
+        guard !expandedURLs.contains(key) else {
+            select(urls: [key])
+            return
+        }
+        guard !loadingExpandURLs.contains(key) else { return }
 
         let finishSelecting: () -> Void = { [weak self] in
             guard let self else { return }
             self.rebuildVisibleRows(preservingSelection: false)
             self.select(urls: [key])
-        }
-
-        if expandedURLs.contains(key) {
-            collapse(url: key)
-            finishSelecting()
-            return
         }
 
         if childrenCache[key] != nil {
@@ -1122,10 +1167,8 @@ final class ContentViewController: NSViewController {
             return
         }
 
-        guard !loadingExpandURLs.contains(key) else { return }
         loadingExpandURLs.insert(key)
         listView.reloadData(forRowIndexes: IndexSet(integer: row), columnIndexes: IndexSet(integer: 1))
-        // Select immediately while children load.
         select(urls: [key])
 
         let showHidden = AppSettings.shared.showHiddenFiles
@@ -1140,6 +1183,21 @@ final class ContentViewController: NSViewController {
                 finishSelecting()
             }
         }
+    }
+
+    private func toggleExpand(at row: Int) {
+        guard items.indices.contains(row) else { return }
+        let item = items[row]
+        guard item.isDirectory, !item.isArchiveEntry else { return }
+        let key = item.url.standardizedFileURL
+
+        if expandedURLs.contains(key) {
+            collapse(url: key)
+            rebuildVisibleRows(preservingSelection: false)
+            select(urls: [key])
+            return
+        }
+        expandFolder(at: row)
     }
 
     private func collapse(url: URL) {
@@ -1161,12 +1219,22 @@ final class ContentViewController: NSViewController {
     }
 
     /// New / Paste target:
+    /// - column view: selected folder (or parent of selected file)
     /// - selected expanded folder → inside it
     /// - selected nested row → that row's parent folder
     /// - otherwise → current listing directory
     func createTargetDirectory(fallback: URL) -> URL {
         let fallback = fallback.standardizedFileURL
         let selected = selectedItems.filter { !$0.isArchiveEntry }
+
+        if isColumnView {
+            guard let item = selected.first else { return fallback }
+            if item.isDirectory, !item.isPackage {
+                return item.url.standardizedFileURL
+            }
+            return item.url.deletingLastPathComponent().standardizedFileURL
+        }
+
         guard !selected.isEmpty else { return fallback }
 
         if selected.count == 1, let item = selected.first {
@@ -1233,10 +1301,48 @@ final class ContentViewController: NSViewController {
     }
 
     var selectedItems: [FileItem] {
-        listView.selectedRowIndexes.compactMap { idx in
+        if isColumnView {
+            return columnBrowser?.selectedItems ?? []
+        }
+        return listView.selectedRowIndexes.compactMap { idx in
             guard items.indices.contains(idx) else { return nil }
             return items[idx]
         }
+    }
+
+    /// Finder-style horizontal column view (分栏): click folder → next column on the right.
+    /// - Parameter reveal: optional item to select after entering column view (folder opens the next column).
+    func setColumnViewEnabled(_ enabled: Bool, reveal: URL? = nil) {
+        let want = enabled && !isShowingSearchResults && !isShowingHistory
+        guard want != isColumnView else {
+            if want, let reveal {
+                columnBrowser.select(urls: [reveal.standardizedFileURL])
+                onSelectionChange?(selectedItems)
+            }
+            onViewModeChange?(isColumnView)
+            return
+        }
+        isColumnView = want
+        listScroll.isHidden = want
+        columnBrowser.isHidden = !want
+        emptyLabel.isHidden = want || !items.isEmpty
+        if want {
+            // Leave list outline collapsed so switching back is clean.
+            expandedURLs.removeAll()
+            let root = directoryForDrop?() ?? FileManager.default.homeDirectoryForCurrentUser
+            columnBrowser.setRootURL(root)
+            if let reveal {
+                columnBrowser.select(urls: [reveal.standardizedFileURL])
+            }
+        } else {
+            rebuildVisibleRows(preservingSelection: true)
+        }
+        onViewModeChange?(isColumnView)
+        onSelectionChange?(selectedItems)
+    }
+
+    func toggleColumnView() {
+        setColumnViewEnabled(!isColumnView)
     }
 
     /// After deleting the current selection: prefer the next row below, else the previous above.
@@ -1258,6 +1364,11 @@ final class ContentViewController: NSViewController {
     }
 
     func select(urls: [URL]) {
+        if isColumnView {
+            columnBrowser.select(urls: urls)
+            onSelectionChange?(selectedItems)
+            return
+        }
         // Compare by path string — file URL Hashable/equality can miss matches across listing vs search.
         let paths = Set(urls.map { $0.standardizedFileURL.path })
         var indexes = IndexSet()
@@ -1281,6 +1392,10 @@ final class ContentViewController: NSViewController {
     }
 
     func selectAll() {
+        if isColumnView {
+            NSSound.beep()
+            return
+        }
         listView.selectAll(nil)
         onSelectionChange?(selectedItems)
     }
@@ -1454,9 +1569,12 @@ final class ContentViewController: NSViewController {
             return nil
         }
 
-        // Return / keypad Enter → open
+        // Return / keypad Enter → open (column view: folders already open next column)
         if event.keyCode == 36 || event.keyCode == 76, flags.isEmpty {
             guard let item = selectedItems.first else { return event }
+            if isColumnView, item.isDirectory, !item.isPackage {
+                return nil
+            }
             onOpen?(item)
             return nil
         }
@@ -1481,7 +1599,12 @@ final class ContentViewController: NSViewController {
     }
 
     @objc private func contextOpen() {
-        selectedItems.forEach { onOpen?($0) }
+        for item in selectedItems {
+            if isColumnView, item.isDirectory, !item.isPackage {
+                continue
+            }
+            onOpen?(item)
+        }
     }
 
     @objc private func contextQuickLook() {
@@ -1554,6 +1677,49 @@ final class ContentViewController: NSViewController {
         selectedItems
             .filter { !$0.isArchiveEntry }
             .map(\.url)
+    }
+
+    private func compareTargetURLs() -> [URL] {
+        let nonArchive = selectedItems.filter { !$0.isArchiveEntry }
+        guard !nonArchive.isEmpty else { return [] }
+        let urls = nonArchive
+            .filter {
+                !$0.isDirectory
+                    && CompareFileSupport.isComparable($0.url, isDirectory: $0.isDirectory)
+            }
+            .map(\.url)
+        // Any number of comparable text files; selection must be all comparable files.
+        guard !urls.isEmpty, urls.count == nonArchive.count else { return [] }
+        return urls
+    }
+
+    private func rebuildCompareSubmenu() {
+        guard let compareMenuItem else { return }
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+        let session = CompareSession.shared
+        let canAssign = !compareTargetURLs().isEmpty
+        for ws in 1 ... CompareSession.workspaceCount {
+            let item = NSMenuItem(
+                title: session.menuTitle(forWorkspace: ws),
+                action: #selector(contextAssignCompareWorkspace(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.tag = ws
+            item.isEnabled = canAssign
+            submenu.addItem(item)
+        }
+        compareMenuItem.submenu = submenu
+    }
+
+    @objc private func contextAssignCompareWorkspace(_ sender: NSMenuItem) {
+        ensureClickedRowSelected()
+        let urls = compareTargetURLs()
+        guard !urls.isEmpty else { return }
+        let workspace = sender.tag
+        CompareSession.shared.open(urls, inWorkspace: workspace)
+        AppDelegate.shared.openCompareInKeyBrowser(workspace: workspace)
     }
 
     private func openURLs(_ urls: [URL], withApp appURL: URL) {
@@ -1820,6 +1986,11 @@ extension ContentViewController: NSMenuDelegate {
         if showOpenWith {
             rebuildOpenWithSubmenu()
         }
+
+        let canCompare = !compareTargetURLs().isEmpty
+        compareMenuItem?.isHidden = false
+        rebuildCompareSubmenu()
+        compareMenuItem?.isEnabled = canCompare
 
         var sawArchiveItem = false
         var archiveLeadingSeparator: NSMenuItem?
