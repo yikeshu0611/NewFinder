@@ -318,7 +318,7 @@ final class ContentViewController: NSViewController {
         menu.addItem(NSMenuItem.separator())
         menu.addItem(withTitle: "压缩…", action: #selector(contextCompress), keyEquivalent: "")
         menu.addItem(withTitle: "解压…", action: #selector(contextExtract), keyEquivalent: "")
-        menu.addItem(withTitle: "打开压缩包", action: #selector(contextOpenArchive), keyEquivalent: "")
+        menu.addItem(withTitle: "打开压缩包窗口", action: #selector(contextOpenArchive), keyEquivalent: "")
         menu.addItem(NSMenuItem.separator())
         menu.addItem(withTitle: "赋予修改权限", action: #selector(contextMakeWritable), keyEquivalent: "")
         menu.addItem(NSMenuItem.separator())
@@ -2038,7 +2038,7 @@ extension ContentViewController: NSMenuDelegate {
             case #selector(contextOpenArchive):
                 item.isHidden = !showExtractOrOpen
                 item.isEnabled = showExtractOrOpen
-                item.title = "打开压缩包"
+                item.title = "打开压缩包窗口"
             case #selector(contextCopyPath):
                 item.isHidden = false
                 item.isEnabled = true

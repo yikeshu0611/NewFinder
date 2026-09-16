@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var windowControllers: [BrowserWindowController] = []
     private var dmgInstallWindows: [DMGInstallWindowController] = []
+    private var archiveWindows: [ArchiveWindowController] = []
     private var isRedirectingFinder = false
     private var lastFinderRedirectAt: Date?
     /// Ignore Finder activation storms right after we steal focus (policy / close-window churn).
@@ -407,6 +408,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         register(controller)
         controller.showWindow(nil)
         return controller
+    }
+
+    /// Browse a compressed archive in a dedicated WinRAR-style window.
+    @discardableResult
+    func openArchiveWindow(at url: URL) -> ArchiveWindowController {
+        let standardized = url.standardizedFileURL
+        if let existing = archiveWindows.first(where: {
+            $0.archiveURL.standardizedFileURL == standardized
+        }) {
+            existing.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return existing
+        }
+        let controller = ArchiveWindowController(archive: standardized)
+        archiveWindows.append(controller)
+        controller.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        controller.window?.makeKeyAndOrderFront(nil)
+        return controller
+    }
+
+    func archiveWindowDidClose(_ controller: ArchiveWindowController) {
+        archiveWindows.removeAll { $0 === controller }
     }
 
     /// Open/focus the in-browser code compare tab for a workspace (比对1…比对10).
@@ -881,18 +905,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         forceActivateNewFinder()
     }
 
-    /// Open the Trash folder in an existing window, or create one.
+    /// Open the Trash in a new tab (or focus an existing Trash tab) — never replace the current tab.
     func openTrash(at url: URL = FileOperations.userTrashDirectory) {
-        let trash = url.standardizedFileURL
-        if let browser = keyBrowser() {
-            browser.navigate(to: trash)
-            browser.window?.makeKeyAndOrderFront(nil)
-        } else if let browser = windowControllers.first {
-            browser.navigate(to: trash)
-            browser.window?.makeKeyAndOrderFront(nil)
-        } else {
-            openNewWindow(at: trash)
-        }
+        _ = openDirectory(url.standardizedFileURL)
     }
 
     private func forceActivateNewFinder() {

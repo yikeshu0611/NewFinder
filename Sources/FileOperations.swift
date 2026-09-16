@@ -235,8 +235,12 @@ enum FileOperations {
 
     static func moveToTrash(_ urls: [URL]) throws {
         for url in urls {
+            let original = url.standardizedFileURL
             var resulting: NSURL?
-            try FileManager.default.trashItem(at: url, resultingItemURL: &resulting)
+            try FileManager.default.trashItem(at: original, resultingItemURL: &resulting)
+            if let trashed = (resulting as URL?)?.standardizedFileURL {
+                TrashPutBackStore.shared.record(trashed: trashed, original: original)
+            }
         }
     }
 
@@ -283,7 +287,9 @@ enum FileOperations {
     /// Permanently delete items (used inside Trash).
     static func permanentlyDelete(_ urls: [URL]) throws {
         for url in urls {
-            try FileManager.default.removeItem(at: url)
+            let standardized = url.standardizedFileURL
+            try FileManager.default.removeItem(at: standardized)
+            TrashPutBackStore.shared.remove(trashed: standardized)
         }
     }
 
@@ -297,27 +303,79 @@ enum FileOperations {
         )
         for url in urls {
             try? FileManager.default.removeItem(at: url)
+            TrashPutBackStore.shared.remove(trashed: url.standardizedFileURL)
         }
     }
 
-    /// Restore via Finder's Put Away (keeps original-location metadata).
-    static func putBackFromTrash(_ urls: [URL]) {
+    /// Restore trashed items to their original locations.
+    /// Modern macOS removed Finder’s AppleScript `put away`, so NewFinder records
+    /// original paths when it moves items to Trash and restores with `moveItem`.
+    @discardableResult
+    static func putBackFromTrash(_ urls: [URL]) throws -> [URL] {
+        var restored: [URL] = []
+        var failures: [String] = []
+        let fm = FileManager.default
+
         for url in urls {
-            let path = url.path
-                .replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "\"", with: "\\\"")
-            let source = """
-            tell application "Finder"
-              try
-                set theItem to (POSIX file "\(path)") as alias
-                put away theItem
-              end try
-            end tell
-            """
-            var error: NSDictionary?
-            if let script = NSAppleScript(source: source) {
-                _ = script.executeAndReturnError(&error)
+            let trashed = url.standardizedFileURL
+            guard fm.fileExists(atPath: trashed.path) else {
+                TrashPutBackStore.shared.remove(trashed: trashed)
+                continue
             }
+
+            let originalParent: URL
+            let preferredName: String
+            if let original = TrashPutBackStore.shared.originalURL(for: trashed) {
+                originalParent = original.deletingLastPathComponent()
+                preferredName = original.lastPathComponent
+            } else {
+                // Items trashed outside NewFinder (or before this fix) have no record.
+                // Finder AppleScript `put away` is gone — fall back to Desktop.
+                originalParent = FileManager.default.homeDirectoryForCurrentUser
+                    .appendingPathComponent("Desktop", isDirectory: true)
+                preferredName = trashed.lastPathComponent
+            }
+
+            var isDir: ObjCBool = false
+            if !fm.fileExists(atPath: originalParent.path, isDirectory: &isDir) || !isDir.boolValue {
+                failures.append("「\(trashed.lastPathComponent)」的原文件夹不存在：\(originalParent.path)")
+                continue
+            }
+
+            do {
+                let dest = uniquePutBackDestination(in: originalParent, preferredName: preferredName)
+                try fm.moveItem(at: trashed, to: dest)
+                TrashPutBackStore.shared.remove(trashed: trashed)
+                restored.append(dest)
+            } catch {
+                failures.append("「\(trashed.lastPathComponent)」：\(error.localizedDescription)")
+            }
+        }
+
+        if !failures.isEmpty {
+            throw NSError(
+                domain: "NewFinder",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: failures.joined(separator: "\n")]
+            )
+        }
+        return restored
+    }
+
+    private static func uniquePutBackDestination(in directory: URL, preferredName: String) -> URL {
+        let fm = FileManager.default
+        let preferred = directory.appendingPathComponent(preferredName)
+        if !fm.fileExists(atPath: preferred.path) { return preferred }
+
+        let ns = preferredName as NSString
+        let ext = ns.pathExtension
+        let base = ext.isEmpty ? preferredName : ns.deletingPathExtension
+        var index = 2
+        while true {
+            let name = ext.isEmpty ? "\(base) \(index)" : "\(base) \(index).\(ext)"
+            let candidate = directory.appendingPathComponent(name)
+            if !fm.fileExists(atPath: candidate.path) { return candidate }
+            index += 1
         }
     }
 
@@ -618,5 +676,59 @@ enum FileOperations {
         let keys: [URLResourceKey] = [.volumeNameKey, .volumeIsRemovableKey, .volumeIsEjectableKey]
         let urls = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: keys, options: [.skipHiddenVolumes]) ?? []
         return urls.filter { $0.path != "/" }
+    }
+}
+
+// MARK: - Put Back location store
+
+/// Remembers original paths for items NewFinder moves to Trash.
+/// Finder’s AppleScript `put away` was removed on modern macOS.
+private final class TrashPutBackStore {
+    static let shared = TrashPutBackStore()
+
+    private let defaultsKey = "NewFinder.trashPutBackMap"
+    private let lock = NSLock()
+    /// trashed path → original path
+    private var map: [String: String]
+
+    private init() {
+        map = UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: String] ?? [:]
+    }
+
+    func record(trashed: URL, original: URL) {
+        lock.lock()
+        defer { lock.unlock() }
+        map[trashed.standardizedFileURL.path] = original.standardizedFileURL.path
+        persistLocked()
+    }
+
+    func originalURL(for trashed: URL) -> URL? {
+        lock.lock()
+        defer { lock.unlock() }
+        let key = trashed.standardizedFileURL.path
+        if let path = map[key] {
+            return URL(fileURLWithPath: path)
+        }
+        // Trash may rename on conflict; match by basename among still-existing trash keys.
+        let name = trashed.lastPathComponent
+        if let path = map.first(where: {
+            URL(fileURLWithPath: $0.key).lastPathComponent == name
+                && FileManager.default.fileExists(atPath: $0.key)
+        })?.value {
+            return URL(fileURLWithPath: path)
+        }
+        return nil
+    }
+
+    func remove(trashed: URL) {
+        lock.lock()
+        defer { lock.unlock() }
+        map.removeValue(forKey: trashed.standardizedFileURL.path)
+        map = map.filter { FileManager.default.fileExists(atPath: $0.key) }
+        persistLocked()
+    }
+
+    private func persistLocked() {
+        UserDefaults.standard.set(map, forKey: defaultsKey)
     }
 }

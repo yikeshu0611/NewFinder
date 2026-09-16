@@ -2484,7 +2484,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         }
         if !item.isDirectory, ArchiveSupport.looksLikeArchive(item.url) {
             AppSettings.shared.recordOpenHistory(item.url)
-            openArchiveInTab(item.url)
+            openArchiveInWindow(item.url)
             return
         }
         if item.isDirectory {
@@ -2497,23 +2497,23 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
 
     func openArchivesInTabs(_ urls: [URL]) {
         for url in urls {
-            openArchiveInTab(url)
+            openArchiveInWindow(url)
         }
     }
 
+    /// Open / focus an archive in the dedicated archive window.
+    func openArchiveInWindow(_ url: URL) {
+        _ = AppDelegate.shared.openArchiveWindow(at: url.standardizedFileURL)
+    }
+
+    /// Kept for call-site compatibility.
     func openArchiveInTab(_ url: URL) {
-        let standardized = url.standardizedFileURL
-        if let existing = tabs.first(where: { $0.archiveURL?.standardizedFileURL == standardized }) {
-            selectTab(existing.id)
-            return
-        }
-        let tab = BrowserTab(archive: standardized)
-        if let index = tabs.firstIndex(where: { $0.id == activeTabID }) {
-            tabs.insert(tab, at: index + 1)
-        } else {
-            tabs.append(tab)
-        }
-        selectTab(tab.id)
+        openArchiveInWindow(url)
+    }
+
+    func focusArchiveIfOpen(_ url: URL) -> Bool {
+        // Archives no longer live in browser tabs.
+        false
     }
 
     private func openArchiveItem(_ item: FileItem, in tab: BrowserTab) {
@@ -2921,21 +2921,27 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         let urls = list.selectedItems.map(\.url.standardizedFileURL)
         guard !urls.isEmpty else { NSSound.beep(); return }
         let nextURL = list.selectionURLAfterRemovingSelected()
-        FileOperations.putBackFromTrash(urls)
-        list.noteRemovedURLs(urls)
-        // Finder Put Away can be slightly async; refresh shortly after.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard let self else { return }
-            if let pane = self.focusedExtraPane() {
-                self.suppressDirectoryWatchUntil = Date().addingTimeInterval(1.2)
-                self.reloadContents(preservingOutline: true)
-                self.reloadAllExtraPanes()
+        do {
+            let restored = try FileOperations.putBackFromTrash(urls)
+            list.noteRemovedURLs(urls)
+            if let pane = focusedExtraPane() {
+                suppressDirectoryWatchUntil = Date().addingTimeInterval(1.2)
+                reloadContents(preservingOutline: true)
+                reloadAllExtraPanes()
                 if let next = nextURL {
                     pane.contentController.select(urls: [next])
                 }
             } else {
-                self.reloadAfterMutation(select: nextURL.map { [$0] } ?? [])
+                reloadAfterMutation(select: nextURL.map { [$0] } ?? [])
             }
+            if let first = restored.first {
+                // Optionally reveal first restored item’s parent in a new tab is noisy;
+                // status feedback is enough.
+                _ = first
+            }
+        } catch {
+            showError(error)
+            reloadAfterMutation()
         }
     }
 
