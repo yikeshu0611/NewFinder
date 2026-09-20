@@ -57,6 +57,8 @@ SOURCES=(
   "$ROOT_DIR/Sources/ContentViewController.swift"
   "$ROOT_DIR/Sources/ColumnBrowserView.swift"
   "$ROOT_DIR/Sources/SettingsWindowController.swift"
+  "$ROOT_DIR/Sources/WeChatDualOpen.swift"
+  "$ROOT_DIR/Sources/QuitAppsWindowController.swift"
   "$ROOT_DIR/Sources/ActivityMonitorViewController.swift"
   "$ROOT_DIR/Sources/TemperatureSensorReader.swift"
   "$ROOT_DIR/Sources/TemperatureViewController.swift"

@@ -18,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// While a DMG /Volumes window is in use — do not steal at all (prevents Finder↔NF ping-pong).
     private var leaveFinderAloneUntil: Date?
     private var finderWindowPollTimer: Timer?
+    private var windowShortcutMonitor: Any?
     private var pendingRedirectWorkItem: DispatchWorkItem?
     private var didWarnFinderAutomation = false
     /// Last chrome-menu zoom title item (gear / status bar), for live % updates.
@@ -38,6 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         NSApp.mainMenu = buildMainMenu()
+        installWindowShortcutMonitor()
         StatusBarController.shared.install()
         registerAsDefaultFolderViewer()
         applyLaunchAtLoginSetting()
@@ -1099,6 +1101,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return mainMenu
     }
 
+    /// Optionally block ⌘M (minimize) / ⌘H (hide) when enabled in Settings → 快捷键.
+    private func installWindowShortcutMonitor() {
+        if let windowShortcutMonitor {
+            NSEvent.removeMonitor(windowShortcutMonitor)
+            self.windowShortcutMonitor = nil
+        }
+        windowShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard flags == .command else { return event }
+            let chars = event.charactersIgnoringModifiers?.lowercased()
+            // keyCode 46 = M, 4 = H
+            let isM = event.keyCode == 46 || chars == "m"
+            let isH = event.keyCode == 4 || chars == "h"
+            if isM, AppSettings.shared.disableCommandMMinimize {
+                return nil
+            }
+            if isH, AppSettings.shared.disableCommandHHide {
+                return nil
+            }
+            return event
+        }
+    }
+
     /// Shared chrome menu for the toolbar gear and status-item (显示 / 窗口 / 缩放 / 更新 / 设置).
     /// - Parameters:
     ///   - includeShowAndWindows: status-item keeps「显示 / 窗口」; in-window gear omits them.
@@ -1176,6 +1201,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: ""
         )
         temperature.target = self
+        let quitApps = goToMenu.addItem(
+            withTitle: "退出程序",
+            action: #selector(goToQuitApps(_:)),
+            keyEquivalent: ""
+        )
+        quitApps.target = self
         let uninstall = goToMenu.addItem(
             withTitle: "卸载软件",
             action: #selector(goToUninstallSoftware(_:)),
@@ -1229,6 +1260,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func goToTerminal(_ sender: Any?) {
         openSystemApp(at: "/System/Applications/Utilities/Terminal.app")
+    }
+
+    @objc private func goToQuitApps(_ sender: Any?) {
+        suppressFinderRedirectUntil = Date().addingTimeInterval(1.0)
+        QuitAppsWindowController.shared.show()
     }
 
     @objc private func goToUninstallSoftware(_ sender: Any?) {

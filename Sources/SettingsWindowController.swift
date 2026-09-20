@@ -17,6 +17,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private var updateStatusLabel: NSTextField!
     private var checkUpdateButton: NSButton!
     private var downloadUpdateButton: NSButton!
+    private var wechatDualOpenButton: NSButton!
+    private var wechatDualOpenStatusLabel: NSTextField!
+    private var disableCommandMCheckbox: NSButton!
+    private var disableCommandHCheckbox: NSButton!
     private var pendingRelease: UpdateChecker.ReleaseInfo?
 
     private init() {
@@ -74,6 +78,11 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         shortcutsItem.label = "快捷键"
         shortcutsItem.view = makeShortcutsTab()
         tabView.addTabViewItem(shortcutsItem)
+
+        let toolsItem = NSTabViewItem(identifier: "tools")
+        toolsItem.label = "工具"
+        toolsItem.view = makeToolsTab()
+        tabView.addTabViewItem(toolsItem)
 
         NSLayoutConstraint.activate([
             tabView.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
@@ -165,6 +174,45 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         return container
     }
 
+    private func makeToolsTab() -> NSView {
+        let container = NSView()
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(stack)
+
+        let title = NSTextField(labelWithString: "微信双开")
+        title.font = .boldSystemFont(ofSize: 13)
+        stack.addArrangedSubview(title)
+
+        let hint = NSTextField(wrappingLabelWithString: "复制微信为 WeChat2、修改 Bundle ID 并重签名，实现 4.0 后双开。微信升级后请点此重新创建分身。")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        hint.preferredMaxLayoutWidth = 500
+        stack.addArrangedSubview(hint)
+
+        wechatDualOpenButton = NSButton(title: "微信双开", target: self, action: #selector(wechatDualOpenClicked))
+        wechatDualOpenButton.bezelStyle = .rounded
+        wechatDualOpenButton.toolTip = "创建或打开第二个微信（需管理员密码）"
+        stack.addArrangedSubview(wechatDualOpenButton)
+
+        wechatDualOpenStatusLabel = NSTextField(wrappingLabelWithString: "")
+        wechatDualOpenStatusLabel.font = .systemFont(ofSize: 11)
+        wechatDualOpenStatusLabel.textColor = .secondaryLabelColor
+        wechatDualOpenStatusLabel.preferredMaxLayoutWidth = 500
+        wechatDualOpenStatusLabel.isHidden = true
+        stack.addArrangedSubview(wechatDualOpenStatusLabel)
+
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 16),
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16)
+        ])
+        return container
+    }
+
     private func makeShortcutsTab() -> NSView {
         let container = NSView()
         let stack = NSStackView()
@@ -212,6 +260,30 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             }
         }
         stack.addArrangedSubview(list)
+
+        let windowKeysTitle = NSTextField(labelWithString: "窗口快捷键")
+        windowKeysTitle.font = .boldSystemFont(ofSize: 13)
+        stack.addArrangedSubview(windowKeysTitle)
+
+        let windowKeysHint = NSTextField(wrappingLabelWithString: "勾选后，对应快捷键在 NewFinder 中将不再生效（避免误触缩小或隐藏）。")
+        windowKeysHint.font = .systemFont(ofSize: 11)
+        windowKeysHint.textColor = .secondaryLabelColor
+        windowKeysHint.preferredMaxLayoutWidth = 500
+        stack.addArrangedSubview(windowKeysHint)
+
+        disableCommandMCheckbox = NSButton(
+            checkboxWithTitle: "禁用 ⌘M 缩小窗口",
+            target: self,
+            action: #selector(toggleDisableCommandM)
+        )
+        stack.addArrangedSubview(disableCommandMCheckbox)
+
+        disableCommandHCheckbox = NSButton(
+            checkboxWithTitle: "禁用 ⌘H 隐藏窗口",
+            target: self,
+            action: #selector(toggleDisableCommandH)
+        )
+        stack.addArrangedSubview(disableCommandHCheckbox)
 
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 16),
@@ -268,6 +340,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private func reloadValues() {
         redirectFinderCheckbox.state = settings.redirectFinderClicks ? .on : .off
         launchAtLoginCheckbox.state = settings.launchAtLogin ? .on : .off
+        disableCommandMCheckbox.state = settings.disableCommandMMinimize ? .on : .off
+        disableCommandHCheckbox.state = settings.disableCommandHHide ? .on : .off
         versionLabel.stringValue = UpdateChecker.currentVersion
         rebuildTypeRows()
     }
@@ -481,6 +555,92 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         typesChanged()
     }
 
+    // MARK: - WeChat dual open
+
+    @objc private func wechatDualOpenClicked() {
+        guard let source = WeChatDualOpen.findInstalledWeChat() else {
+            setWechatStatus("未找到微信。请先安装到「应用程序」文件夹（WeChat.app 或 微信.app）。")
+            let alert = NSAlert()
+            alert.messageText = "未找到微信"
+            alert.informativeText = "请先从官网或 App Store 安装微信到「应用程序」。"
+            alert.alertStyle = .warning
+            alert.runModal()
+            return
+        }
+
+        let clone = WeChatDualOpen.cloneURL
+        if FileManager.default.fileExists(atPath: clone.path) {
+            let alert = NSAlert()
+            alert.messageText = "微信分身已存在"
+            alert.informativeText = "检测到 \(clone.lastPathComponent)。\n可直接打开第二个微信，或在微信升级后重新创建分身。"
+            alert.addButton(withTitle: "打开第二个微信")
+            alert.addButton(withTitle: "重新创建分身")
+            alert.addButton(withTitle: "取消")
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
+                openWeChatClone()
+            case .alertSecondButtonReturn:
+                createWeChatClone(from: source, recreate: true)
+            default:
+                break
+            }
+            return
+        }
+
+        createWeChatClone(from: source, recreate: false)
+    }
+
+    private func createWeChatClone(from source: URL, recreate: Bool) {
+        wechatDualOpenButton.isEnabled = false
+        setWechatStatus(recreate ? "正在重新创建微信分身（需输入密码）…" : "正在创建微信分身（需输入密码）…")
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = WeChatDualOpen.createClone(from: source, recreate: recreate)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.wechatDualOpenButton.isEnabled = true
+                switch result {
+                case .success:
+                    self.setWechatStatus("分身已就绪，正在打开第二个微信…")
+                    self.openWeChatClone()
+                case .failure(let error):
+                    self.setWechatStatus("创建失败：\(error.localizedDescription)")
+                    let alert = NSAlert(error: error)
+                    alert.messageText = "微信双开失败"
+                    alert.runModal()
+                }
+            }
+        }
+    }
+
+    private func openWeChatClone() {
+        let clone = WeChatDualOpen.cloneURL
+        guard FileManager.default.fileExists(atPath: clone.path) else {
+            setWechatStatus("找不到 WeChat2.app，请先创建分身。")
+            return
+        }
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = true
+        NSWorkspace.shared.openApplication(at: clone, configuration: config) { [weak self] _, error in
+            DispatchQueue.main.async {
+                if let error {
+                    // Fallback for older launch paths
+                    let ok = NSWorkspace.shared.open(clone)
+                    if !ok {
+                        self?.setWechatStatus("打开失败：\(error.localizedDescription)")
+                        return
+                    }
+                }
+                self?.setWechatStatus("已启动第二个微信，请登录账号。")
+            }
+        }
+    }
+
+    private func setWechatStatus(_ text: String) {
+        wechatDualOpenStatusLabel.stringValue = text
+        wechatDualOpenStatusLabel.isHidden = text.isEmpty
+    }
+
     @objc private func toggleRedirectFinder() {
         settings.redirectFinderClicks = redirectFinderCheckbox.state == .on
         AppDelegate.shared.updateFinderWindowPollTimer()
@@ -490,6 +650,16 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     @objc private func toggleLaunchAtLogin() {
         settings.launchAtLogin = launchAtLoginCheckbox.state == .on
         AppDelegate.shared.applyLaunchAtLoginSetting()
+        notifyChange()
+    }
+
+    @objc private func toggleDisableCommandM() {
+        settings.disableCommandMMinimize = disableCommandMCheckbox.state == .on
+        notifyChange()
+    }
+
+    @objc private func toggleDisableCommandH() {
+        settings.disableCommandHHide = disableCommandHCheckbox.state == .on
         notifyChange()
     }
 

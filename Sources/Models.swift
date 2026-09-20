@@ -198,6 +198,8 @@ final class AppSettings {
         static let languageChinese = "languageChinese"
         static let redirectFinder = "redirectFinderClicks"
         static let launchAtLogin = "launchAtLogin"
+        static let disableCommandMMinimize = "disableCommandMMinimize"
+        static let disableCommandHHide = "disableCommandHHide"
         static let openWithDefaultHistory = "openWithDefaultHistory"
         static let openWithAppHistory = "openWithAppHistory"
         static let openWithAppHistoryByType = "openWithAppHistoryByType"
@@ -234,6 +236,18 @@ final class AppSettings {
             return defaults.bool(forKey: Keys.launchAtLogin)
         }
         set { defaults.set(newValue, forKey: Keys.launchAtLogin) }
+    }
+
+    /// Swallow ⌘M so windows are not miniaturized.
+    var disableCommandMMinimize: Bool {
+        get { defaults.bool(forKey: Keys.disableCommandMMinimize) }
+        set { defaults.set(newValue, forKey: Keys.disableCommandMMinimize) }
+    }
+
+    /// Swallow ⌘H so the app is not hidden.
+    var disableCommandHHide: Bool {
+        get { defaults.bool(forKey: Keys.disableCommandHHide) }
+        set { defaults.set(newValue, forKey: Keys.disableCommandHHide) }
     }
 
     /// Built-in New types (canonical keys). Display name for `dir` is「文件夹」.
