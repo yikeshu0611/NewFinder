@@ -42,6 +42,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     private var favoritesTrailingToolsStack: NSStackView!
     private var pathBarVisible = true
     private var statusLabel: NSTextField!
+    private var versionLabel: ClickableStatusLabel!
+    private var loadTimeLabel: NSTextField!
+    private var systemUsageLabel: ClickableStatusLabel!
     private var autocompletePanel: NSPanel?
     private var autocompleteList: NSTableView?
     private var autocompleteCandidates: [String] = []
@@ -56,6 +59,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     private var contentLoadGeneration = 0
     private var pendingReloadWorkItem: DispatchWorkItem?
     private var packageSizeWorkItem: DispatchWorkItem?
+    private var attributeFillWorkItem: DispatchWorkItem?
+    /// Timestamp of the moment the user opened a folder — used to report how
+    /// long the folder needed to load completely.
+    private var loadTimerStartedAt: CFAbsoluteTime?
+    /// Set once the timer has been reported, so it is only shown once per load.
+    private var loadTimerReported = false
     private var searchField: NSSearchField!
     private var pathBarTopConstraint: NSLayoutConstraint!
     private var pathBarHeightConstraint: NSLayoutConstraint!
@@ -174,7 +183,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
 
     private func configureUI() {
         guard let window else { return }
-
         let root = NSView(frame: window.contentView!.bounds)
         root.autoresizingMask = [.width, .height]
         window.contentView = root
@@ -254,7 +262,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             .withSymbolConfiguration(historyConfig)
         recentHistoryButton.image?.isTemplate = true
         recentHistoryButton.contentTintColor = .labelColor
-        recentHistoryButton.toolTip = "最近打开的历史"
+        recentHistoryButton.toolTip = "最近打开的历史 (⌘H)"
         recentHistoryButton.target = self
         recentHistoryButton.action = #selector(toggleHistoryPage(_:))
         recentHistoryButton.translatesAutoresizingMaskIntoConstraints = false
@@ -418,6 +426,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         contentController.onCopyPathRequest = { [weak self] in
             self?.copyPath(nil)
         }
+        contentController.onGoClipboardPathRequest = { [weak self] in
+            self?.goClipboardPath(nil)
+        }
+        contentController.onHistoryFilterChanged = { [weak self] _ in
+            self?.updateStatus(selection: self?.contentController.selectedItems ?? [])
+        }
         contentController.onCommitRename = { [weak self] item, newName in
             self?.commitRename(item, to: newName)
         }
@@ -493,15 +507,49 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         // NSSplitView manages child frames; keep autoresizing masks on.
 
         statusLabel = NSTextField(labelWithString: "")
-        statusLabel.font = .systemFont(ofSize: 11)
+        statusLabel.font = StatusBarFont.standard
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        versionLabel = ClickableStatusLabel(text: "版本\(UpdateChecker.currentVersion)")
+        versionLabel.font = StatusBarFont.standard
+        versionLabel.textColor = .secondaryLabelColor
+        versionLabel.idleColor = .secondaryLabelColor
+        versionLabel.alignment = .right
+        versionLabel.translatesAutoresizingMaskIntoConstraints = false
+        versionLabel.toolTip = "点击检查更新"
+        versionLabel.onClick = { [weak self] in
+            self?.checkForUpdatesFromStatusBar()
+        }
+
+        systemUsageLabel = ClickableStatusLabel()
+        systemUsageLabel.font = StatusBarFont.standard
+        systemUsageLabel.textColor = .secondaryLabelColor
+        systemUsageLabel.alignment = .right
+        systemUsageLabel.lineBreakMode = .byTruncatingTail
+        systemUsageLabel.translatesAutoresizingMaskIntoConstraints = false
+        systemUsageLabel.toolTip = "点击打开活动监视器"
+        systemUsageLabel.onClick = { [weak self] in
+            self?.openActivityMonitorInTab()
+        }
+
+        // Load time of the folder that was opened last (shown on request).
+        loadTimeLabel = NSTextField(labelWithString: "")
+        loadTimeLabel.font = StatusBarFont.standard
+        loadTimeLabel.textColor = .secondaryLabelColor
+        loadTimeLabel.alignment = .right
+        loadTimeLabel.lineBreakMode = .byTruncatingTail
+        loadTimeLabel.translatesAutoresizingMaskIntoConstraints = false
+        loadTimeLabel.toolTip = "上一个文件夹的加载耗时"
 
         let statusBar = NSView()
         statusBar.translatesAutoresizingMaskIntoConstraints = false
         statusBar.wantsLayer = true
         statusBar.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
         statusBar.addSubview(statusLabel)
+        statusBar.addSubview(versionLabel)
+        statusBar.addSubview(loadTimeLabel)
+        statusBar.addSubview(systemUsageLabel)
         statusBarView = statusBar
 
         let primaryHost = NSView()
@@ -635,8 +683,27 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             statusBarHeightConstraint,
 
             statusLabel.leadingAnchor.constraint(equalTo: statusBar.leadingAnchor, constant: 12),
-            statusLabel.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor)
+            statusLabel.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
+            statusLabel.trailingAnchor.constraint(
+                lessThanOrEqualTo: loadTimeLabel.leadingAnchor, constant: -12
+            ),
+
+            loadTimeLabel.trailingAnchor.constraint(equalTo: systemUsageLabel.leadingAnchor, constant: -12),
+            loadTimeLabel.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
+
+            systemUsageLabel.trailingAnchor.constraint(equalTo: versionLabel.leadingAnchor, constant: -12),
+            systemUsageLabel.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
+
+            versionLabel.trailingAnchor.constraint(equalTo: statusBar.trailingAnchor, constant: -12),
+            versionLabel.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor)
         ])
+
+        systemUsageLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        systemUsageLabel.setContentHuggingPriority(.required, for: .horizontal)
+        loadTimeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        loadTimeLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        versionLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        versionLabel.setContentHuggingPriority(.required, for: .horizontal)
 
         mainSplitView = NSSplitView()
         mainSplitView.isVertical = true
@@ -735,9 +802,25 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             self.applyContentZoom(self.settings.uiZoomPercent)
         }
         installFavoritesKeyMonitor()
+        startSystemUsageMonitor()
     }
 
-    /// Accessory apps don't reliably deliver hidden-menu key equivalents; handle ⌘O / ⌘⇧O / ⌘W directly.
+    /// Bottom-right of the status bar shows whole-machine disk / memory / CPU usage.
+    private func startSystemUsageMonitor() {
+        let monitor = SystemUsageMonitor.shared
+        monitor.start(interval: 3.0)
+        monitor.addListener { [weak self] snapshot in
+            guard let self else { return }
+            self.systemUsageLabel.stringValue = SystemUsageMonitor.formatText(snapshot)
+        }
+    }
+
+    /// Clicking the version number in the status bar checks for updates.
+    private func checkForUpdatesFromStatusBar() {
+        AppDelegate.shared.checkForUpdatesFromMenu(nil)
+    }
+
+    /// Accessory apps don't reliably deliver hidden-menu key equivalents; handle ⌘O / ⌘⇧O / ⌘W / ⌘H directly.
     private func installFavoritesKeyMonitor() {
         if let favoritesKeyMonitor {
             NSEvent.removeMonitor(favoritesKeyMonitor)
@@ -751,6 +834,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             let isW = event.keyCode == 13 || chars == "w"
             if isW, flags == .command {
                 self.closeActiveTabOrWindow(nil)
+                return nil
+            }
+
+            // ⌘H toggles the Recent-open history page (it would otherwise hide the app).
+            let isH = event.keyCode == 4 || chars == "h"
+            if isH, flags == .command {
+                self.toggleHistoryPage(nil)
                 return nil
             }
 
@@ -1149,6 +1239,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         }
         pane.onToggleFavoritesSidebar = { [weak self] in self?.toggleFavoritesSidebar(nil) }
         pane.onToggleFavoritesTopBar = { [weak self] in self?.toggleFavoritesTopBar(nil) }
+        pane.onGoClipboardPath = { [weak self] in self?.goClipboardPath(nil) }
+        pane.onOpenActivityMonitor = { [weak self] in self?.openActivityMonitorInTab() }
+        pane.onCheckForUpdates = { [weak self] in self?.checkForUpdatesFromStatusBar() }
     }
 
     private func focusExtraPane(_ pane: BrowserPaneController?) {
@@ -1559,6 +1652,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     private func selectTab(_ id: UUID) {
         guard let tab = tabs.first(where: { $0.id == id }) else { return }
         focusedColumnIndex = 0
+        // Remember what was selected in the tab we are leaving so switching back restores it.
+        if let leaving = tabs.first(where: { $0.id == activeTabID }), leaving.id != id,
+           !leaving.isSpecialContentTab, leaving.isArchiveTab || contentController.view.isHidden == false {
+            leaving.rememberedSelectionURLs = contentController.selectedItems.map(\.url)
+        }
         activeTabID = id
         refreshTabBar()
 
@@ -1587,9 +1685,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
                 ? tab.title
                 : "\(tab.title) — \(tab.archiveInternalPath)"
             updatePathChrome()
+            if !tab.rememberedSelectionURLs.isEmpty {
+                pendingSelectURLs = tab.rememberedSelectionURLs
+            }
             reloadContents()
         } else {
-            navigate(to: tab.directory, recordHistory: false)
+            navigate(to: tab.directory, recordHistory: false, restoreSelection: tab.rememberedSelectionURLs)
         }
     }
 
@@ -1824,7 +1925,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
 
     // MARK: - Navigation
 
-    func navigate(to url: URL, recordHistory: Bool = true) {
+    func navigate(to url: URL, recordHistory: Bool = true, restoreSelection: [URL]? = nil) {
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
             NSSound.beep()
@@ -1843,6 +1944,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             hideSpecialContentTabsIfNeeded()
         }
         let standardized = url.standardizedFileURL
+        // The load timer starts the moment the user opens a folder — this is the
+        // single entry point for every way of navigating (double click, path
+        // bar, breadcrumbs, sidebar, back / forward).
+        beginLoadTimer()
         currentDirectory = standardized
         if recordHistory {
             history.navigate(to: standardized)
@@ -1867,6 +1972,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         hideAutocomplete()
         // Always reload the file list so address/tab and table contents stay in sync.
         watchDirectory(standardized)
+        if let restoreSelection, !restoreSelection.isEmpty {
+            pendingSelectURLs = restoreSelection
+        }
         reloadContents()
         refreshTabBar()
     }
@@ -1892,23 +2000,29 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         pendingReloadWorkItem = nil
         packageSizeWorkItem?.cancel()
         packageSizeWorkItem = nil
+        attributeFillWorkItem?.cancel()
+        attributeFillWorkItem = nil
 
         // Keep the in-window history page until the user navigates away / toggles it off.
         if contentController.isShowingHistory {
             refreshHistoryPage()
+            reportLoadTimeIfNeeded()
             return
         }
 
         if activeTab.isActivityMonitorTab {
             showActivityMonitorTab()
+            reportLoadTimeIfNeeded()
             return
         }
         if activeTab.isTemperatureTab {
             showTemperatureTab()
+            reportLoadTimeIfNeeded()
             return
         }
         if activeTab.isCompareTab {
             showCompareTab()
+            reportLoadTimeIfNeeded()
             return
         }
 
@@ -1952,9 +2066,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             // Trash items may be marked hidden; always list them in trash mode.
-            var items = FileOperations.listDirectory(directory, showHidden: showHidden || inTrash)
+            // Names first (fast), attributes are filled in right after — huge
+            // folders show their rows immediately instead of after a long wait.
+            var items = FileOperations.listDirectoryNames(directory, showHidden: showHidden || inTrash)
             if inTrash {
                 items = items.filter { $0.name != ".DS_Store" }
+            }
+            let needsAttributes = items.count > FileOperations.progressiveListingThreshold
+            if !needsAttributes {
+                items = FileOperations.enrichWithAttributes(items, in: directory)
             }
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -1975,14 +2095,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
                         select: pendingSelect
                     )
                     if let renameURL = pendingRename,
-                       let item = self.contentController.items.first(where: {
-                           $0.url.standardizedFileURL.path == renameURL.standardizedFileURL.path
-                       }) {
+                       let item = self.contentController.item(for: renameURL) {
                         DispatchQueue.main.async {
                             self.contentController.beginInlineRename(item)
                         }
                     }
                 }
+                let nfM0b = Date()
                 // Directory refresh must not wipe an active search with the raw folder listing.
                 let query = self.searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !query.isEmpty, !inTrash {
@@ -2003,9 +2122,93 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
                     }
                     self.updateStatus(selection: self.contentController.selectedItems)
                 }
+                let nfM1 = Date()
                 self.schedulePackageSizeFill(items: items, generation: generation)
+                if needsAttributes {
+                    self.scheduleAttributeFill(items: items, directory: directory, generation: generation)
+                }
+                // The rows are on screen. For a huge folder the folder is only
+                // "completely loaded" once the background attribute pass is done.
+                if !needsAttributes {
+                    self.reportLoadTimeIfNeeded()
+                }
+                // Only folders big enough to matter are logged.
+                if items.count >= 4_000 {
+                    NSLog("[NF-PERF] list: status=%.3f count=%d",
+                          nfM1.timeIntervalSince(nfM0b), items.count)
+                }
             }
         }
+    }
+
+    /// Fill in sizes / dates for a huge folder after its rows are already visible.
+    private func scheduleAttributeFill(items: [FileItem], directory: URL, generation: Int) {
+        attributeFillWorkItem?.cancel()
+        var work: DispatchWorkItem!
+        work = DispatchWorkItem { [weak self] in
+            let enriched = FileOperations.enrichWithAttributes(items, in: directory)
+            DispatchQueue.main.async {
+                guard let self, generation == self.contentLoadGeneration else { return }
+                self.contentController.applyFileAttributes(enriched)
+                self.updateStatus(selection: self.contentController.selectedItems)
+                // The folder is now completely loaded (rows *and* attributes).
+                self.reportLoadTimeIfNeeded()
+            }
+        }
+        attributeFillWorkItem = work
+        DispatchQueue.global(qos: .utility).async(execute: work)
+    }
+
+    /// Start the load timer — called the moment the user opens a folder.
+    private func beginLoadTimer() {
+        loadTimerStartedAt = CFAbsoluteTimeGetCurrent()
+        loadTimerReported = true
+        if settings.showLoadTime {
+            loadTimeLabel.stringValue = ""
+        }
+    }
+
+    /// Report how long the folder that was just opened took to load.
+    ///
+    /// The timer starts when the user double-clicks a folder and stops once the
+    /// folder is completely on screen (rows plus, for huge folders, the
+    /// background attribute pass). The value is shown in the status bar.
+    private func reportLoadTimeIfNeeded() {
+        guard loadTimerReported, let startedAt = loadTimerStartedAt else { return }
+        loadTimerReported = false
+        loadTimerStartedAt = nil
+
+        let elapsed = CFAbsoluteTimeGetCurrent() - startedAt
+        guard elapsed.isFinite, elapsed >= 0 else { return }
+        NSLog("[NF-PERF] load time: %.3fs", elapsed)
+
+        guard settings.showLoadTime else {
+            loadTimeLabel.stringValue = ""
+            return
+        }
+        // Fast folders are not worth mentioning — only show a real delay.
+        guard elapsed > Self.minimumLoadTimeToShow else {
+            loadTimeLabel.stringValue = ""
+            return
+        }
+        loadTimeLabel.stringValue = Self.formatLoadTime(elapsed)
+        loadTimeLabel.toolTip = "上一个文件夹的加载耗时：\(Self.formatLoadTime(elapsed, precise: true))"
+    }
+
+    /// Folders that load faster than this are not reported in the status bar.
+    private static let minimumLoadTimeToShow: Double = 1.0
+
+    /// Formats a duration for the status bar: `0.28 秒`, `1.40 秒`, `2 分 03 秒`.
+    private static func formatLoadTime(_ seconds: Double, precise: Bool = false) -> String {
+        if seconds < 60 {
+            if precise {
+                return String(format: "%.3f 秒", seconds)
+            }
+            return String(format: "%.2f 秒", seconds)
+        }
+        let minutes = Int(seconds) / 60
+        let rest = Int(seconds) % 60
+        return String(format: "%d 分 %02d 秒", minutes, rest)
     }
 
     /// Compute .app / package sizes in the background and patch the table progressively.
@@ -2099,6 +2302,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         if let until = suppressDirectoryWatchUntil, Date() < until {
             return
         }
+        // The folder changed — drop its cached listing so the reload re-reads it.
+        FileOperations.invalidateListingCache(for: currentDirectory)
         pendingReloadWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             self?.reloadContents(preservingOutline: true)
@@ -2325,7 +2530,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         }
     }
 
-    @objc private func toggleHistoryPage(_ sender: Any?) {
+    @objc func toggleHistoryPage(_ sender: Any?) {
         if contentController.isShowingHistory {
             closeHistoryPage()
         } else {
@@ -2568,9 +2773,14 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         let selectedSize = formattedTotalSize(of: selection)
         let query = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if contentController.isShowingHistory {
-            statusLabel.stringValue = items.isEmpty
-                ? "暂无打开历史"
-                : "最近打开 \(total) 项，已选中 \(selectedCount) 个"
+            let historyQuery = contentController.historyFilterText
+            if items.isEmpty {
+                statusLabel.stringValue = historyQuery.isEmpty ? "暂无打开历史" : "无匹配历史记录"
+            } else if historyQuery.isEmpty {
+                statusLabel.stringValue = "最近打开 \(total) 项，已选中 \(selectedCount) 个"
+            } else {
+                statusLabel.stringValue = "最近打开 · 匹配 \(total) 项，已选中 \(selectedCount) 个 · 「\(historyQuery)」"
+            }
         } else if !query.isEmpty {
             statusLabel.stringValue = "搜索到 \(total) 个结果，\(totalSize)，已选中 \(selectedCount) 个，\(selectedSize) · 「\(query)」"
         } else {
@@ -2579,7 +2789,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     }
 
     private func formattedTotalSize(of items: [FileItem]) -> String {
-        let bytes = items.compactMap(\.fileSize).reduce(Int64(0), +)
+        var bytes: Int64 = 0
+        for item in items {
+            bytes += item.fileSize ?? 0
+        }
         return FileOperations.formatFileSize(bytes)
     }
 
@@ -3055,35 +3268,123 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         }
     }
 
+    /// ⌘P — jump to whatever is on the clipboard.
+    ///
+    /// Three shapes are understood, in this order:
+    /// 1. file URLs — what a ⌘C of a file leaves on the pasteboard. A folder
+    ///    is entered, a file is revealed in its folder and selected.
+    /// 2. a plain path — what ⌘⇧C (copy path) leaves behind.
+    /// 3. a `file://` URL string copied from somewhere else.
     @objc func goClipboardPath(_ sender: Any?) {
-        guard let raw = NSPasteboard.general.string(forType: .string)?
+        let pb = NSPasteboard.general
+
+        // 1) File URLs (a copied file or folder).
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: [
+            .urlReadingFileURLsOnly: true
+        ]) as? [URL], !urls.isEmpty {
+            revealClipboardURLs(urls)
+            return
+        }
+
+        // 2) A path or a file:// URL string.
+        guard let raw = pb.string(forType: .string)?
             .trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else {
             NSSound.beep()
+            statusLabel.stringValue = "剪贴板里没有地址"
             return
         }
+        // A copied file list can be several lines of paths.
+        let lines = raw
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if lines.count > 1 {
+            let urls = lines.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+            revealClipboardURLs(urls)
+            return
+        }
+
+        // `file:///Users/...` pasted as plain text.
+        if raw.lowercased().hasPrefix("file://"), let url = URL(string: raw), url.isFileURL {
+            revealClipboardURLs([url])
+            return
+        }
+
         let expanded = (raw as NSString).expandingTildeInPath
         var isDir: ObjCBool = false
         if FileManager.default.fileExists(atPath: expanded, isDirectory: &isDir) {
             if isDir.boolValue {
-                navigate(to: URL(fileURLWithPath: expanded))
+                navigate(to: URL(filePath: expanded))
             } else {
-                let file = URL(fileURLWithPath: expanded)
+                let file = URL(filePath: expanded)
                 pendingSelectURLs = [file]
                 navigate(to: file.deletingLastPathComponent())
             }
         } else {
             NSSound.beep()
+            statusLabel.stringValue = "剪贴板里的地址不存在"
         }
+    }
+
+    /// Navigates to the clipboard items and selects them.
+    ///
+    /// A single folder is entered directly. A single file is revealed inside
+    /// its parent folder and selected. Several items are revealed in the
+    /// folder that contains all of them.
+    private func revealClipboardURLs(_ urls: [URL]) {
+        let existing = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
+        guard !existing.isEmpty else {
+            NSSound.beep()
+            statusLabel.stringValue = "剪贴板里的文件已不存在"
+            return
+        }
+
+        if existing.count == 1, let only = existing.first {
+            var isDir: ObjCBool = false
+            let isDirectory = FileManager.default.fileExists(atPath: only.path, isDirectory: &isDir)
+                && isDir.boolValue
+            if isDirectory {
+                pendingSelectURLs = []
+                navigate(to: only.standardizedFileURL)
+            } else {
+                let file = only.standardizedFileURL
+                pendingSelectURLs = [file]
+                navigate(to: file.deletingLastPathComponent())
+            }
+            return
+        }
+
+        // Several items: go to the deepest folder that contains all of them.
+        let common = commonAncestor(of: existing.map { $0.standardizedFileURL.deletingLastPathComponent() })
+        pendingSelectURLs = existing.map(\.standardizedFileURL)
+        navigate(to: common)
+    }
+
+    /// The deepest folder that contains every given folder.
+    private func commonAncestor(of folders: [URL]) -> URL {
+        guard var best = folders.first else { return FileManager.default.homeDirectoryForCurrentUser }
+        for folder in folders.dropFirst() {
+            var candidate = folder
+            while !best.path.hasPrefix(candidate.path) {
+                let parent = candidate.deletingLastPathComponent()
+                guard parent.path != candidate.path else { break }
+                candidate = parent
+            }
+            if candidate.path.count < best.path.count {
+                best = candidate
+            }
+        }
+        return best
     }
 
     @objc func showBookmarkEditor(_ sender: Any?) {
         let path = currentDirectory.standardizedFileURL.path
-        // Path-bar star edits / adds the left-sidebar favorite only.
-        let existing = settings.bookmarks(in: .left).first {
+        // Default the editor to the top favorites bar; reuse an existing top entry when present.
+        let existing = settings.bookmarks(in: .top).first {
             URL(fileURLWithPath: $0.path).standardizedFileURL.path == path
         }
-        presentBookmarkEditor(for: existing, preferredPlacement: .left)
+        presentBookmarkEditor(for: existing, preferredPlacement: .top)
     }
 
     private func presentBookmarkEditor(for existingBookmark: Bookmark?, preferredPlacement: FavoritesPlacement) {

@@ -106,6 +106,21 @@ struct FileItem: Hashable {
         )
     }
 
+    /// Copy with size / modification date replaced (used by progressive listing).
+    func withAttributes(size: Int64?, modified: Date?) -> FileItem {
+        FileItem(
+            url: url,
+            name: name,
+            isDirectory: isDirectory,
+            isPackage: isPackage,
+            isHidden: isHidden,
+            fileSize: size,
+            modificationDate: modified,
+            creationDate: creationDate,
+            archiveEntryPath: archiveEntryPath
+        )
+    }
+
     static func archiveEntry(
         archive: URL,
         entryPath: String,
@@ -205,6 +220,8 @@ final class AppSettings {
         static let openWithAppHistoryByType = "openWithAppHistoryByType"
         static let uiZoomPercent = "uiZoomPercent"
         static let recentOpenHistory = "recentOpenHistory"
+        static let skipInitialSort = "skipInitialSort"
+        static let showLoadTime = "showLoadTime"
     }
 
     /// Content zoom 30%…500%. Default 100. Adjusted via menu-bar slider.
@@ -219,6 +236,27 @@ final class AppSettings {
     var showHiddenFiles: Bool {
         get { defaults.bool(forKey: Keys.showHidden) }
         set { defaults.set(newValue, forKey: Keys.showHidden) }
+    }
+
+    /// Show the time a folder needed to load in the status bar.
+    ///
+    /// Enabled by default — the user can turn it off in the settings window.
+    var showLoadTime: Bool {
+        get {
+            guard defaults.object(forKey: Keys.showLoadTime) != nil else { return true }
+            return defaults.bool(forKey: Keys.showLoadTime)
+        }
+        set { defaults.set(newValue, forKey: Keys.showLoadTime) }
+    }
+
+    /// List folders in the order the file system returns them (no sorting).
+    ///
+    /// Sorting a folder with hundreds of thousands of entries is the single most
+    /// expensive step of opening it. With this on, the rows appear in the raw
+    /// `readdir` order — noticeably faster, but not alphabetical.
+    var skipInitialSort: Bool {
+        get { defaults.bool(forKey: Keys.skipInitialSort) }
+        set { defaults.set(newValue, forKey: Keys.skipInitialSort) }
     }
 
     /// When Dock Finder is clicked / Finder windows open, switch to NewFinder.
@@ -414,7 +452,7 @@ final class AppSettings {
         bookmarks(in: placement).filter { Self.isFavoritesBarFolder($0.folder) }
     }
 
-    /// Bookmarks inside a real named folder (not the bar).
+    /// Bookmarks inside a real named folder (not the bar), sorted by name.
     func bookmarks(in folder: String, placement: FavoritesPlacement) -> [Bookmark] {
         let target = folder.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !Self.isFavoritesBarFolder(target) else {
@@ -425,6 +463,14 @@ final class AppSettings {
                 let name = $0.folder.trimmingCharacters(in: .whitespacesAndNewlines)
                 return !Self.isFavoritesBarFolder(name) && name == target
             }
+            .sorted(by: Self.byNameAlphabetically)
+    }
+
+    /// Alphabetical order by display name (locale-aware, case-insensitive).
+    static func byNameAlphabetically(_ lhs: Bookmark, _ rhs: Bookmark) -> Bool {
+        let comparison = lhs.name.localizedStandardCompare(rhs.name)
+        if comparison != .orderedSame { return comparison == .orderedAscending }
+        return lhs.path.localizedStandardCompare(rhs.path) == .orderedAscending
     }
 
     /// Real folders only — never invents a「收藏栏」folder chip/group.

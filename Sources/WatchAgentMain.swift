@@ -75,9 +75,17 @@ private final class WatchAgentDelegate: NSObject, NSApplicationDelegate {
         if let until = leaveFinderAloneUntil, Date() < until { return }
         if let last = lastLaunchAt, Date().timeIntervalSince(last) < 1.0 { return }
 
-        // Read selection BEFORE closing — same as UI path; skip /Volumes (DMG installers).
-        let context = probeFinderContext()
-        if contextInvolvesMountedVolume(context) || finderHasVolumeWindow() {
+        // Read the selection and close the Finder windows in ONE AppleScript round
+        // trip. The script has a 2 second timeout, so an unresponsive Finder can
+        // never stall the hand-off — we fall back to letting the UI app (which owns
+        // the "control Finder" automation grant) do the work.
+        guard let context = readAndCloseFinderContext() else {
+            // Finder did not answer in time: let the UI app work it out itself.
+            lastLaunchAt = Date()
+            launchUIInstance(select: nil, folder: nil)
+            return
+        }
+        if contextInvolvesMountedVolume(context) || finderContextHasVolumeWindow(context) {
             leaveFinderAloneUntil = Date().addingTimeInterval(600)
             return
         }
@@ -86,11 +94,14 @@ private final class WatchAgentDelegate: NSObject, NSApplicationDelegate {
 
         if context.select.isEmpty && context.folder == nil {
             // First DMG open: wait for mount window before closing anything.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                 guard let self, !self.isUIInstanceRunning() else { return }
                 if let until = self.leaveFinderAloneUntil, Date() < until { return }
-                let again = self.probeFinderContext()
-                if self.contextInvolvesMountedVolume(again) || self.finderHasVolumeWindow() {
+                guard let again = self.readFinderContext() else {
+                    self.launchUIInstance(select: nil, folder: nil)
+                    return
+                }
+                if self.contextInvolvesMountedVolume(again) || self.finderContextHasVolumeWindow(again) {
                     self.leaveFinderAloneUntil = Date().addingTimeInterval(600)
                     return
                 }
@@ -100,7 +111,6 @@ private final class WatchAgentDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        closeFinderWindowsPreservingVolumes()
         launchUIInstance(select: context.select, folder: context.folder)
     }
 
@@ -111,12 +121,10 @@ private final class WatchAgentDelegate: NSObject, NSApplicationDelegate {
         return FinderVolumeGuard.urlsInvolveMountedVolume(context.select)
     }
 
-    private func finderHasVolumeWindow() -> Bool {
-        var error: NSDictionary?
-        let raw = NSAppleScript(source: FinderVolumeGuard.listWindowTargetsScript)?
-            .executeAndReturnError(&error)
-            .stringValue
-        return FinderVolumeGuard.windowTargetsInvolveMountedVolume(scriptResult: raw)
+    /// A Finder window sitting on a mounted volume — derived from the state that
+    /// was read in the same AppleScript round trip as the selection.
+    private func finderContextHasVolumeWindow(_ context: FinderContext) -> Bool {
+        FinderVolumeGuard.pathsInvolveMountedVolume(context.windowTargets)
     }
 
     /// True when the NewFinder UI app is running.
@@ -130,52 +138,43 @@ private final class WatchAgentDelegate: NSObject, NSApplicationDelegate {
     private struct FinderContext {
         var select: [URL]
         var folder: URL?
+        /// POSIX paths of every open Finder window target (same round trip).
+        var windowTargets: [String] = []
+
+        init(state: FinderVolumeGuard.FinderState) {
+            windowTargets = state.windowTargets
+            if !state.selection.isEmpty {
+                select = state.selection.map { URL(fileURLWithPath: $0) }
+                folder = nil
+            } else if let dir = state.frontDirectory, !dir.isEmpty {
+                select = []
+                folder = URL(fileURLWithPath: dir)
+            } else {
+                select = []
+                folder = nil
+            }
+        }
     }
 
-    private func probeFinderContext() -> FinderContext {
-        let source = """
-        tell application "Finder"
-          set output to ""
-          try
-            set sel to the selection
-            if (count of sel) > 0 then
-              repeat with s in sel
-                try
-                  set output to output & POSIX path of (s as alias) & linefeed
-                end try
-              end repeat
-              if output is not "" then return "SEL:" & output
-            end if
-          end try
-          try
-            if (count of Finder windows) > 0 then
-              set t to target of front Finder window
-              return "DIR:" & POSIX path of (t as alias)
-            end if
-          end try
-          return ""
-        end tell
-        """
+    /// One AppleScript round trip: selection + front window target + all window
+    /// targets. Returns nil when Finder did not answer (timeout / error).
+    private func readFinderContext() -> FinderContext? {
         var error: NSDictionary?
-        let raw = NSAppleScript(source: source)?
+        let raw = NSAppleScript(source: FinderVolumeGuard.readFinderStateScript)?
             .executeAndReturnError(&error)
-            .stringValue?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let text = raw, !text.isEmpty else {
-            return FinderContext(select: [], folder: nil)
-        }
+            .stringValue
+        if error != nil { return nil }
+        return FinderContext(state: FinderVolumeGuard.parseFinderState(raw))
+    }
 
-        if text.hasPrefix("SEL:") {
-            let body = String(text.dropFirst(4))
-            let paths = body.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
-            return FinderContext(select: paths.map { URL(fileURLWithPath: $0) }, folder: nil)
-        }
-        if text.hasPrefix("DIR:") {
-            let path = String(text.dropFirst(4)).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !path.isEmpty else { return FinderContext(select: [], folder: nil) }
-            return FinderContext(select: [], folder: URL(fileURLWithPath: path))
-        }
-        return FinderContext(select: [], folder: nil)
+    /// Read + close in a single round trip. Returns nil when Finder did not answer.
+    private func readAndCloseFinderContext() -> FinderContext? {
+        var error: NSDictionary?
+        let raw = NSAppleScript(source: FinderVolumeGuard.readAndCloseFinderStateScript)?
+            .executeAndReturnError(&error)
+            .stringValue
+        if error != nil { return nil }
+        return FinderContext(state: FinderVolumeGuard.parseFinderState(raw))
     }
 
     private func closeFinderWindowsPreservingVolumes() {
@@ -184,17 +183,17 @@ private final class WatchAgentDelegate: NSObject, NSApplicationDelegate {
             .executeAndReturnError(&error)
     }
 
-    private func launchUIInstance(select: [URL], folder: URL?) {
+    private func launchUIInstance(select: [URL]?, folder: URL?) {
         // Do not use `open -n` — that spawned duplicate UI windows/processes.
         var args = [
             WatchAgentMain.uiAppURL().path,
             "--args",
             "--steal-finder"
         ]
-        for url in select {
+        for url in select ?? [] {
             args.append(contentsOf: ["--reveal", url.path])
         }
-        if select.isEmpty, let folder {
+        if (select ?? []).isEmpty, let folder {
             args.append(contentsOf: ["--reveal-dir", folder.path])
         }
 

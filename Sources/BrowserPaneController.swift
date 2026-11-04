@@ -17,6 +17,14 @@ final class BrowserPaneController: NSViewController, NSSearchFieldDelegate {
     var onGoEnclosingFolder: (() -> Void)?
     var onToggleFavoritesSidebar: (() -> Void)?
     var onToggleFavoritesTopBar: (() -> Void)?
+    /// ⌘P — jump to the address on the clipboard.
+    var onGoClipboardPath: (() -> Void)?
+    /// Request to open the in-app Activity Monitor (triggered by clicking the
+    /// system-usage readout in the bottom-right of the status bar).
+    var onOpenActivityMonitor: (() -> Void)?
+    /// Request to check for app updates (triggered by clicking the version
+    /// number in the middle of the status bar).
+    var onCheckForUpdates: (() -> Void)?
 
     private(set) var directory: URL
     private let history = NavigationHistory()
@@ -33,6 +41,8 @@ final class BrowserPaneController: NSViewController, NSSearchFieldDelegate {
     private var pathBookmarkButton: NSButton!
     private var searchField: NSSearchField!
     private var statusLabel: NSTextField!
+    private var versionLabel: ClickableStatusLabel!
+    private var systemUsageLabel: ClickableStatusLabel!
     private var statusBar: NSView!
 
     private var loadGeneration = 0
@@ -98,7 +108,7 @@ final class BrowserPaneController: NSViewController, NSSearchFieldDelegate {
         statusLabel.stringValue = "正在加载…"
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let items = FileOperations.listDirectory(dir, showHidden: showHidden)
+            let items = FileOperations.listDirectoryCached(dir, showHidden: showHidden)
             DispatchQueue.main.async {
                 guard let self, generation == self.loadGeneration else { return }
                 self.contentController.setItems(items, alreadySortedByName: true)
@@ -190,15 +200,39 @@ final class BrowserPaneController: NSViewController, NSSearchFieldDelegate {
         contentController.view.translatesAutoresizingMaskIntoConstraints = false
 
         statusLabel = NSTextField(labelWithString: "")
-        statusLabel.font = .systemFont(ofSize: 11)
+        statusLabel.font = StatusBarFont.standard
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        versionLabel = ClickableStatusLabel(text: "版本\(UpdateChecker.currentVersion)")
+        versionLabel.font = StatusBarFont.standard
+        versionLabel.textColor = .secondaryLabelColor
+        versionLabel.idleColor = .secondaryLabelColor
+        versionLabel.alignment = .right
+        versionLabel.translatesAutoresizingMaskIntoConstraints = false
+        versionLabel.toolTip = "点击检查更新"
+        versionLabel.onClick = { [weak self] in
+            self?.onCheckForUpdates?()
+        }
+
+        systemUsageLabel = ClickableStatusLabel()
+        systemUsageLabel.font = StatusBarFont.standard
+        systemUsageLabel.textColor = .secondaryLabelColor
+        systemUsageLabel.alignment = .right
+        systemUsageLabel.lineBreakMode = .byTruncatingTail
+        systemUsageLabel.translatesAutoresizingMaskIntoConstraints = false
+        systemUsageLabel.toolTip = "点击打开活动监视器"
+        systemUsageLabel.onClick = { [weak self] in
+            self?.onOpenActivityMonitor?()
+        }
 
         statusBar = NSView()
         statusBar.translatesAutoresizingMaskIntoConstraints = false
         statusBar.wantsLayer = true
         statusBar.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
         statusBar.addSubview(statusLabel)
+        statusBar.addSubview(versionLabel)
+        statusBar.addSubview(systemUsageLabel)
 
         view.addSubview(pathBar)
         view.addSubview(contentController.view)
@@ -253,9 +287,26 @@ final class BrowserPaneController: NSViewController, NSSearchFieldDelegate {
             statusBar.heightAnchor.constraint(equalToConstant: 22),
 
             statusLabel.leadingAnchor.constraint(equalTo: statusBar.leadingAnchor, constant: 10),
-            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: statusBar.trailingAnchor, constant: -10),
-            statusLabel.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor)
+            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: systemUsageLabel.leadingAnchor, constant: -10),
+            statusLabel.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
+
+            systemUsageLabel.trailingAnchor.constraint(equalTo: versionLabel.leadingAnchor, constant: -10),
+            systemUsageLabel.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
+
+            versionLabel.trailingAnchor.constraint(equalTo: statusBar.trailingAnchor, constant: -10),
+            versionLabel.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor)
         ])
+
+        systemUsageLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        systemUsageLabel.setContentHuggingPriority(.required, for: .horizontal)
+        versionLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        versionLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        let monitor = SystemUsageMonitor.shared
+        monitor.start(interval: 3.0)
+        monitor.addListener { [weak self] snapshot in
+            self?.systemUsageLabel.stringValue = SystemUsageMonitor.formatText(snapshot)
+        }
     }
 
     private func wireContent() {
@@ -294,6 +345,7 @@ final class BrowserPaneController: NSViewController, NSSearchFieldDelegate {
         contentController.onToggleFavoritesSidebar = { [weak self] in self?.onToggleFavoritesSidebar?() }
         contentController.onToggleFavoritesTopBar = { [weak self] in self?.onToggleFavoritesTopBar?() }
         contentController.onCopyPathRequest = { [weak self] in self?.copyPathClicked() }
+        contentController.onGoClipboardPathRequest = { [weak self] in self?.onGoClipboardPath?() }
         contentController.onDirectoryNeedsReload = { [weak self] in
             self?.reloadContents()
             self?.onDirectoryNeedsReload?()

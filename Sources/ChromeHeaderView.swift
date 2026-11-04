@@ -16,6 +16,8 @@ final class BrowserTab {
     var isCompareTab = false
     /// 1-based workspace index when `isCompareTab` (比对1…比对10).
     var compareWorkspaceIndex: Int = 1
+    /// Selection to restore when the user switches back to this tab.
+    var rememberedSelectionURLs: [URL] = []
 
     var isArchiveTab: Bool { archiveURL != nil }
     var isSpecialContentTab: Bool { isActivityMonitorTab || isTemperatureTab || isCompareTab }
@@ -141,6 +143,9 @@ final class ChromeHeaderView: NSView {
             : NSColor(calibratedWhite: 0.82, alpha: 1)
         layer?.backgroundColor = chrome.cgColor
         tabRow.layer?.backgroundColor = chrome.cgColor
+        // The trailing button cluster stays opaque so tabs never bleed through it.
+        trailingToolsHost.wantsLayer = true
+        trailingToolsHost.layer?.backgroundColor = chrome.cgColor
     }
 
     func bind(target: AnyObject) {
@@ -188,6 +193,8 @@ final class ChromeHeaderView: NSView {
         tabRow.wantsLayer = true
 
         tabStrip.translatesAutoresizingMaskIntoConstraints = false
+        tabStrip.wantsLayer = true
+        tabStrip.layer?.masksToBounds = true
         tabStrip.onSelectTab = { [weak self] id in self?.onSelectTab?(id) }
         tabStrip.onCloseTab = { [weak self] id in self?.onCloseTab?(id) }
         tabStrip.onNewTab = { [weak self] in self?.onNewTab?() }
@@ -273,10 +280,22 @@ final class ChromeHeaderView: NSView {
                 title: tab.title,
                 icon: icon,
                 isActive: tab.id == activeTabID,
-                canClose: true
+                canClose: true,
+                detail: Self.tooltipDetail(for: tab)
             )
         }
         tabStrip.setItems(items)
+    }
+
+    /// Tooltip detail line: the full path for folder tabs, archive path for archive tabs.
+    private static func tooltipDetail(for tab: BrowserTab) -> String? {
+        if tab.isArchiveTab, let archiveURL = tab.archiveURL {
+            return tab.archiveInternalPath.isEmpty
+                ? archiveURL.path
+                : archiveURL.path + "/" + tab.archiveInternalPath
+        }
+        if tab.isSpecialContentTab { return nil }
+        return tab.directory.path
     }
 
     private func rebuildTools(types: [String]? = nil) {
@@ -414,13 +433,15 @@ final class ChromeHeaderView: NSView {
 
 // MARK: - Tab strip (single view owns all hit-testing — Chrome-like)
 
-final class TabStripView: NSView {
+final class TabStripView: NSView, NSViewToolTipOwner {
     struct Item {
         let id: UUID
         let title: String
         let icon: NSImage?
         let isActive: Bool
         let canClose: Bool
+        /// Extra tooltip detail (e.g. the full path) shown under the title.
+        var detail: String?
     }
 
     var onSelectTab: ((UUID) -> Void)?
@@ -451,11 +472,26 @@ final class TabStripView: NSView {
 
     private let tabHeight: CGFloat = 32
     private let tabFixedWidth: CGFloat = 140
+    /// Narrowest a tab may become before extra tabs move into the overflow menu.
+    private let tabMinWidth: CGFloat = 64
+    /// Below this width the tab shows its icon only (no title), like Chrome.
+    private let tabTitleMinWidth: CGFloat = 96
     private let overlap: CGFloat = 0
     private let corner: CGFloat = 0
     private let ear: CGFloat = 0
     private let plusSize: CGFloat = 20
     private let plusGap: CGFloat = 4
+    private let chevronSize: CGFloat = 18
+
+    /// Tabs currently painted (may be fewer than `items` when overflowing).
+    private(set) var visibleItems: [Item] = []
+    /// Tabs hidden behind the overflow chevron.
+    private(set) var hiddenItems: [Item] = []
+    private var chevronFrame: NSRect = .zero
+    /// Registered tooltip rects → tab id, so hovering a tab shows its name.
+    private var toolTipTags: [NSView.ToolTipTag: UUID] = [:]
+    /// Signature of the last registered tooltip layout — used to avoid churn.
+    private var toolTipSignature: String = ""
 
     func setItems(_ items: [Item]) {
         self.items = items
@@ -464,18 +500,27 @@ final class TabStripView: NSView {
         needsDisplay = true
         needsLayout = true
     }
-
     override var isFlipped: Bool { true }
 
     override func layout() {
         super.layout()
         recalculateFrames()
+        needsDisplay = true
     }
 
     private func recalculateFrames() {
+        computeFrames()
+        refreshToolTips()
+    }
+
+    private func computeFrames() {
         tabFrames.removeAll()
         closeFrames.removeAll()
         plusFrame = .zero
+        chevronFrame = .zero
+        visibleItems = []
+        hiddenItems = []
+
         guard !items.isEmpty else {
             // Still show + at leading edge when empty (shouldn't happen)
             let y = bounds.height - tabHeight + (tabHeight - plusSize) / 2
@@ -483,29 +528,121 @@ final class TabStripView: NSView {
             return
         }
 
-        let width = tabFixedWidth
+        let available = max(0, bounds.width)
+        let trailingReserve = plusGap + plusSize
+        guard available > trailingReserve + tabMinWidth else {
+            // Not enough room to lay out tabs — keep the "+" button reachable.
+            visibleItems = []
+            hiddenItems = items
+            let plusY = bounds.height - tabHeight + (tabHeight - plusSize) / 2
+            plusFrame = NSRect(x: max(0, available - plusSize), y: plusY, width: plusSize, height: plusSize)
+            return
+        }
+
+        // Chrome-like: shrink every tab to share the available width.
+        func widthForAll(_ count: Int, reserve: CGFloat) -> CGFloat {
+            let usable = available - trailingReserve - reserve
+            guard count > 0 else { return tabFixedWidth }
+            return max(0, min(tabFixedWidth, usable / CGFloat(count)))
+        }
+
+        var width = widthForAll(items.count, reserve: 0)
+        var visible = items
+        var hidden: [Item] = []
+        var reserve: CGFloat = 0
+
+        if width < tabMinWidth {
+            // Not enough room even at the minimum width — overflow into the chevron menu.
+            reserve = chevronSize + plusGap
+            let capacity = max(1, Int((available - trailingReserve - reserve) / tabMinWidth))
+            let activeIndex = items.firstIndex(where: { $0.isActive }) ?? 0
+            var start = 0
+            if activeIndex >= capacity {
+                start = activeIndex - capacity + 1
+            }
+            let end = min(items.count, start + capacity)
+            visible = Array(items[start..<end])
+            hidden = Array(items[..<start]) + Array(items[end...])
+            width = widthForAll(visible.count, reserve: reserve)
+        }
+
+        visibleItems = visible
+        hiddenItems = hidden
+
         var x: CGFloat = 0
         let y = bounds.height - tabHeight
-        for item in items {
+        for item in visible {
             let frame = NSRect(x: x, y: y, width: width, height: tabHeight)
             tabFrames[item.id] = frame
-            closeFrames[item.id] = NSRect(
-                x: frame.maxX - 28,
-                y: frame.midY - 8,
-                width: 16,
-                height: 16
-            )
+            let closeRect: NSRect
+            if width < tabTitleMinWidth {
+                // Icon-only tab — the ✕ takes the icon's place on hover.
+                closeRect = NSRect(
+                    x: frame.midX - 8,
+                    y: frame.midY - 8,
+                    width: 16,
+                    height: 16
+                )
+            } else {
+                closeRect = NSRect(
+                    x: frame.maxX - 28,
+                    y: frame.midY - 8,
+                    width: 16,
+                    height: 16
+                )
+            }
+            closeFrames[item.id] = closeRect
             x += width
         }
 
+        // Overflow chevron (hidden tabs) sits right after the last visible tab.
+        if !hidden.isEmpty {
+            let chevronY = y + (tabHeight - chevronSize) / 2
+            chevronFrame = NSRect(x: x + plusGap, y: chevronY, width: chevronSize, height: chevronSize)
+            x = chevronFrame.maxX
+        }
+
         // + sits immediately to the right of the last tab
-        let lastMaxX = (items.last.flatMap { tabFrames[$0.id]?.maxX }) ?? 0
         let plusY = y + (tabHeight - plusSize) / 2
-        plusFrame = NSRect(x: lastMaxX + plusGap, y: plusY, width: plusSize, height: plusSize)
+        plusFrame = NSRect(x: x + plusGap, y: plusY, width: plusSize, height: plusSize)
         // Keep + inside strip
         if plusFrame.maxX > bounds.width {
             plusFrame.origin.x = max(0, bounds.width - plusSize)
         }
+    }
+
+    /// Re-registers one tooltip rect per visible tab so hovering shows its name.
+    /// Re-registration is skipped when the tab layout has not changed.
+    private func refreshToolTips() {
+        let signature = visibleItems
+            .compactMap { item in tabFrames[item.id].map { "\(item.id.uuidString):\(Int($0.minX))x\(Int($0.width))" } }
+            .joined(separator: ",")
+        guard signature != toolTipSignature else { return }
+        toolTipSignature = signature
+
+        removeAllToolTips()
+        toolTipTags.removeAll()
+        for item in visibleItems {
+            guard let frame = tabFrames[item.id] else { continue }
+            let tag = addToolTip(frame, owner: self, userData: nil)
+            toolTipTags[tag] = item.id
+        }
+    }
+
+    /// Tooltip text for a hovered tab — the tab name (plus path when useful).
+    func toolTipText(for tag: NSView.ToolTipTag) -> String? {
+        guard let id = toolTipTags[tag] else { return nil }
+        guard let item = items.first(where: { $0.id == id }) else { return nil }
+        if let detail = item.detail, !detail.isEmpty {
+            return "\(item.title)\n\(detail)"
+        }
+        return item.title
+    }
+
+    // MARK: NSViewToolTipOwner
+
+    func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData: UnsafeMutableRawPointer?) -> String {
+        toolTipText(for: tag) ?? ""
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -513,7 +650,7 @@ final class TabStripView: NSView {
         let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
 
         // Draw left → right; no overlap, so active tab never covers neighbors.
-        for item in items {
+        for item in visibleItems {
             guard let frame = tabFrames[item.id] else { continue }
             let isHovered = hoveredID == item.id
             let fill: NSColor
@@ -530,8 +667,8 @@ final class TabStripView: NSView {
             path.fill()
 
             // Hairline only between two inactive tabs — avoid a recessed look around the active tab.
-            if let index = items.firstIndex(where: { $0.id == item.id }), index > 0 {
-                let previous = items[index - 1]
+            if let index = visibleItems.firstIndex(where: { $0.id == item.id }), index > 0 {
+                let previous = visibleItems[index - 1]
                 if !item.isActive && !previous.isActive {
                     let divider = dark
                         ? NSColor(calibratedWhite: 0.12, alpha: 1)
@@ -545,35 +682,46 @@ final class TabStripView: NSView {
                 }
             }
 
-            let iconRect = NSRect(x: frame.minX + 12, y: frame.midY - 7, width: 14, height: 14)
-            if let icon = item.icon {
+            let narrow = frame.width < tabTitleMinWidth
+            var iconRect = NSRect(x: frame.minX + 12, y: frame.midY - 7, width: 14, height: 14)
+            if narrow {
+                // Icon-only tab: center the icon in the tab.
+                iconRect.origin.x = frame.midX - 7
+            }
+            // On a narrow tab the ✕ replaces the favicon while hovering.
+            let hoverClose = narrow && isHovered
+            if !hoverClose, let icon = item.icon {
                 icon.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
             }
 
-            let titleRect = NSRect(
-                x: iconRect.maxX + 6,
-                y: frame.minY,
-                width: max(0, frame.maxX - 34 - (iconRect.maxX + 6)),
-                height: frame.height
-            )
-            let paragraph = NSMutableParagraphStyle()
-            paragraph.lineBreakMode = .byTruncatingTail
-            let titleColor = dark
-                ? NSColor(calibratedWhite: 0.82, alpha: 1)
-                : NSColor.black
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 12, weight: item.isActive ? .medium : .regular),
-                .foregroundColor: titleColor,
-                .paragraphStyle: paragraph
-            ]
-            let titleSize = (item.title as NSString).size(withAttributes: attrs)
-            let textY = frame.minY + (frame.height - titleSize.height) / 2
-            (item.title as NSString).draw(
-                in: NSRect(x: titleRect.minX, y: textY, width: titleRect.width, height: titleSize.height),
-                withAttributes: attrs
-            )
+            if !narrow {
+                let titleRect = NSRect(
+                    x: iconRect.maxX + 6,
+                    y: frame.minY,
+                    width: max(0, frame.maxX - 34 - (iconRect.maxX + 6)),
+                    height: frame.height
+                )
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.lineBreakMode = .byTruncatingTail
+                let titleColor = dark
+                    ? NSColor(calibratedWhite: 0.82, alpha: 1)
+                    : NSColor.black
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 12, weight: item.isActive ? .medium : .regular),
+                    .foregroundColor: titleColor,
+                    .paragraphStyle: paragraph
+                ]
+                let titleSize = (item.title as NSString).size(withAttributes: attrs)
+                let textY = frame.minY + (frame.height - titleSize.height) / 2
+                (item.title as NSString).draw(
+                    in: NSRect(x: titleRect.minX, y: textY, width: titleRect.width, height: titleSize.height),
+                    withAttributes: attrs
+                )
+            }
 
-            if item.canClose, let closeRect = closeFrames[item.id] {
+            // Close button only when the tab is wide enough to host it (or on hover).
+            let showClose = item.canClose && (!narrow || hoverClose)
+            if showClose, let closeRect = closeFrames[item.id] {
                 let xAttrs: [NSAttributedString.Key: Any] = [
                     .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
                     .foregroundColor: NSColor.secondaryLabelColor
@@ -588,6 +736,23 @@ final class TabStripView: NSView {
                     withAttributes: xAttrs
                 )
             }
+        }
+
+        // Overflow chevron for tabs that did not fit.
+        if !chevronFrame.isEmpty {
+            let chevronAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 14, weight: .medium),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+            let chevron = "»" as NSString
+            let chevronSize = chevron.size(withAttributes: chevronAttrs)
+            chevron.draw(
+                at: NSPoint(
+                    x: chevronFrame.midX - chevronSize.width / 2,
+                    y: chevronFrame.midY - chevronSize.height / 2
+                ),
+                withAttributes: chevronAttrs
+            )
         }
 
         // New-tab + immediately after last tab
@@ -656,10 +821,23 @@ final class TabStripView: NSView {
             return
         }
 
+        // Overflow chevron — opens a menu listing the tabs that did not fit.
+        if !chevronFrame.isEmpty, chevronFrame.insetBy(dx: -3, dy: -3).contains(point) {
+            resetTabClickSequence()
+            showOverflowMenu()
+            return
+        }
+
         // Prefer close hits before tab selection so the × always works (including the last tab).
-        for item in items {
+        for item in visibleItems {
             guard item.canClose, let closeRect = closeFrames[item.id] else { continue }
-            if closeRect.insetBy(dx: -4, dy: -4).contains(point) {
+            // On icon-only tabs the ✕ only exists while hovering, so only treat it as a
+            // close target for the tab the pointer is actually over.
+            let narrow = (tabFrames[item.id]?.width ?? 0) < tabTitleMinWidth
+            if narrow && hoveredID != item.id { continue }
+            // Icon-only tabs: hit exactly the ✕ glyph, not the whole icon slot.
+            let hitRect = narrow ? closeRect : closeRect.insetBy(dx: -4, dy: -4)
+            if hitRect.contains(point) {
                 resetTabClickSequence()
                 onCloseTab?(item.id)
                 return
@@ -667,7 +845,7 @@ final class TabStripView: NSView {
         }
 
         var seen = Set<UUID>()
-        let ordered = (items.filter(\.isActive) + items.filter { !$0.isActive }.reversed())
+        let ordered = (visibleItems.filter(\.isActive) + visibleItems.filter { !$0.isActive }.reversed())
             .filter { seen.insert($0.id).inserted }
 
         for item in ordered {
@@ -697,7 +875,7 @@ final class TabStripView: NSView {
     override func rightMouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         var seen = Set<UUID>()
-        let ordered = (items.filter(\.isActive) + items.filter { !$0.isActive }.reversed())
+        let ordered = (visibleItems.filter(\.isActive) + visibleItems.filter { !$0.isActive }.reversed())
             .filter { seen.insert($0.id).inserted }
 
         guard let item = ordered.first(where: { tab in
@@ -785,7 +963,7 @@ final class TabStripView: NSView {
         let newPlus = plusFrame.insetBy(dx: -2, dy: -2).contains(point)
         var newHover: UUID?
         if !newPlus {
-            let ordered = items.filter(\.isActive) + items.filter { !$0.isActive }.reversed()
+            let ordered = visibleItems.filter(\.isActive) + visibleItems.filter { !$0.isActive }.reversed()
             for item in ordered {
                 guard let frame = tabFrames[item.id] else { continue }
                 if chromeTabPath(in: frame, corner: corner, ear: ear).contains(point) {
@@ -799,6 +977,27 @@ final class TabStripView: NSView {
             plusHovered = newPlus
             needsDisplay = true
         }
+    }
+
+    /// Menu listing the tabs that did not fit in the strip.
+    private func showOverflowMenu() {
+        guard !hiddenItems.isEmpty else { return }
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        for item in hiddenItems {
+            let menuItem = NSMenuItem(title: item.title, action: #selector(overflowSelected(_:)), keyEquivalent: "")
+            menuItem.target = self
+            menuItem.representedObject = item.id
+            menuItem.image = item.icon
+            menu.addItem(menuItem)
+        }
+        let origin = convert(chevronFrame.origin, to: nil)
+        menu.popUp(positioning: nil, at: NSPoint(x: origin.x, y: origin.y + chevronFrame.height + 4), in: nil)
+    }
+
+    @objc private func overflowSelected(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID else { return }
+        onSelectTab?(id)
     }
 
     override func updateTrackingAreas() {

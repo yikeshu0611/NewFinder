@@ -15,6 +15,10 @@ final class ContentViewController: NSViewController {
     var onToggleFavoritesTopBar: (() -> Void)?
     /// Copy selected item path(s), or the current folder path when nothing is selected.
     var onCopyPathRequest: (() -> Void)?
+    /// ⌘P — jump to the address on the clipboard.
+    var onGoClipboardPathRequest: (() -> Void)?
+    /// Reports how many history entries survived the history search filter.
+    var onHistoryFilterChanged: ((Int) -> Void)?
     /// Called after compress/extract so the browser can reload the folder.
     var onDirectoryNeedsReload: (() -> Void)?
     /// Open one or more archives in Chrome-style tabs.
@@ -42,6 +46,10 @@ final class ContentViewController: NSViewController {
     var onUninstallApps: (() -> Void)?
 
     private(set) var items: [FileItem] = []
+    /// Row lookup by file name — keeps selection O(1) instead of scanning every row.
+    private var rowIndexByName: [String: Int] = [:]
+    /// Rows for names that appear more than once (outline mode).
+    private var rowIndexByNameDuplicates: [String: [Int]] = [:]
     /// Top-level items for the current folder (tree root).
     private var rootItems: [FileItem] = []
     private var rowDepths: [Int] = []
@@ -56,6 +64,10 @@ final class ContentViewController: NSViewController {
     private var searchQuery: String = ""
     /// Local filter for Applications uninstall mode (banner search field).
     private var applicationsFilterQuery: String = ""
+    /// Local filter for the Recent-open history page (banner search field).
+    private var historyFilterQuery: String = ""
+    /// The current history search text (used for the status bar readout).
+    var historyFilterText: String { historyFilterQuery }
     /// Apps marked via the list checkboxes for thorough uninstall.
     private var checkedUninstallURLs: Set<URL> = []
     /// Trailing-slash path of the search root so results can strip this prefix when displayed.
@@ -71,6 +83,7 @@ final class ContentViewController: NSViewController {
     private var searchBanner: NSView!
     private var searchBannerLabel: NSTextField!
     private var applicationsFilterField: NSSearchField!
+    private var historyFilterField: NSSearchField!
     private var searchBannerActionButton: NSButton!
     private var headerCheckButton: NSButton!
     private var searchBannerHeight: NSLayoutConstraint!
@@ -79,6 +92,8 @@ final class ContentViewController: NSViewController {
     /// Banner layouts: apps = uninstall left + search; other = label left + action right.
     private var bannerDefaultConstraints: [NSLayoutConstraint] = []
     private var bannerApplicationsConstraints: [NSLayoutConstraint] = []
+    /// History banner layout: label left + search middle + action right.
+    private var bannerHistoryConstraints: [NSLayoutConstraint] = []
     private weak var renamingField: NSTextField?
     private var renamingItem: FileItem?
     private var renamingOriginalName: String?
@@ -130,14 +145,30 @@ final class ContentViewController: NSViewController {
         applicationsFilterField.isHidden = true
         applicationsFilterField.setContentHuggingPriority(.defaultLow, for: .horizontal)
         applicationsFilterField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        historyFilterField = NSSearchField()
+        historyFilterField.translatesAutoresizingMaskIntoConstraints = false
+        historyFilterField.placeholderString = "搜索历史记录"
+        historyFilterField.controlSize = .small
+        historyFilterField.font = .systemFont(ofSize: 12)
+        historyFilterField.sendsSearchStringImmediately = true
+        historyFilterField.sendsWholeSearchString = false
+        historyFilterField.target = self
+        historyFilterField.action = #selector(historyFilterChanged(_:))
+        historyFilterField.isHidden = true
+        historyFilterField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        historyFilterField.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
         let clearSearch = NSButton(title: "清除搜索", target: self, action: #selector(clearSearchClicked))
         clearSearch.bezelStyle = .recessed
         clearSearch.controlSize = .small
         clearSearch.font = .systemFont(ofSize: 11)
         clearSearch.translatesAutoresizingMaskIntoConstraints = false
+        // Keep the button compact — the search field absorbs the leftover space.
+        clearSearch.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        clearSearch.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
         searchBannerActionButton = clearSearch
         searchBanner.addSubview(searchBannerLabel)
         searchBanner.addSubview(applicationsFilterField)
+        searchBanner.addSubview(historyFilterField)
         searchBanner.addSubview(clearSearch)
 
         bannerDefaultConstraints = [
@@ -154,6 +185,17 @@ final class ContentViewController: NSViewController {
             applicationsFilterField.centerYAnchor.constraint(equalTo: searchBanner.centerYAnchor),
             applicationsFilterField.trailingAnchor.constraint(equalTo: searchBanner.trailingAnchor, constant: -10),
             applicationsFilterField.heightAnchor.constraint(equalToConstant: 22)
+        ]
+        bannerHistoryConstraints = [
+            searchBannerLabel.leadingAnchor.constraint(equalTo: searchBanner.leadingAnchor, constant: 12),
+            searchBannerLabel.centerYAnchor.constraint(equalTo: searchBanner.centerYAnchor),
+            historyFilterField.leadingAnchor.constraint(equalTo: searchBannerLabel.trailingAnchor, constant: 8),
+            historyFilterField.centerYAnchor.constraint(equalTo: searchBanner.centerYAnchor),
+            historyFilterField.heightAnchor.constraint(equalToConstant: 22),
+            historyFilterField.widthAnchor.constraint(greaterThanOrEqualToConstant: 160),
+            clearSearch.leadingAnchor.constraint(equalTo: historyFilterField.trailingAnchor, constant: 8),
+            clearSearch.centerYAnchor.constraint(equalTo: searchBanner.centerYAnchor),
+            clearSearch.trailingAnchor.constraint(equalTo: searchBanner.trailingAnchor, constant: -10)
         ]
         NSLayoutConstraint.activate(bannerDefaultConstraints)
 
@@ -250,6 +292,7 @@ final class ContentViewController: NSViewController {
         columnBrowser.isHidden = true
         columnBrowser.onSelectionChange = { [weak self] items in
             self?.onSelectionChange?(items)
+            self?.syncQuickLookIfVisible()
         }
         columnBrowser.onOpen = { [weak self] item in
             self?.onOpen?(item)
@@ -262,6 +305,9 @@ final class ContentViewController: NSViewController {
         }
         columnBrowser.onDirectoryNeedsReload = { [weak self] in
             self?.onDirectoryNeedsReload?()
+        }
+        columnBrowser.onRenameCommit = { [weak self] item, newName in
+            self?.commitColumnRename(item, to: newName)
         }
         root.addSubview(columnBrowser)
 
@@ -361,9 +407,36 @@ final class ContentViewController: NSViewController {
 
     /// Re-tint rows after cut / copy / paste changes the pasteboard.
     func refreshCutAppearance() {
-        guard isViewLoaded, listView != nil else { return }
+        guard isViewLoaded else { return }
         lastPasteboardChangeCount = NSPasteboard.general.changeCount
-        listView.reloadData()
+        if isColumnView {
+            columnBrowser.refreshCutAppearance()
+            return
+        }
+        guard listView != nil else { return }
+        // Only the visible rows can show the "cut" tint — reloading every row of a
+        // 200k-item folder would freeze the UI for seconds.
+        guard let visible = visibleRowIndexes() else { return }
+        listView.reloadData(forRowIndexes: visible, columnIndexes: IndexSet(integersIn: 0..<listView.numberOfColumns))
+    }
+
+    /// The rows that intersect the table's visible rect.
+    ///
+    /// `NSTableView.row(at:)` cannot be used for this: the visible rect starts
+    /// at the height of the table *header* (a negative origin), so the first
+    /// probe lands outside of row 0 and returns `-1`. The row range is derived
+    /// from `rect(ofRow:)` instead, which is exact in both scroll positions.
+    private func visibleRowIndexes() -> IndexSet? {
+        let total = listView.numberOfRows
+        guard total > 0 else { return nil }
+        let rect = listView.visibleRect
+        let origin = listView.rect(ofRow: 0).minY
+        let rowHeight = listView.rowHeight
+        guard rowHeight > 0 else { return nil }
+        let first = max(0, Int(floor((rect.minY - origin) / rowHeight)))
+        let last = min(total - 1, Int(ceil((rect.maxY - origin) / rowHeight)) - 1)
+        guard first <= last else { return nil }
+        return IndexSet(integersIn: first...last)
     }
 
     @objc private func pasteboardMayHaveChanged() {
@@ -374,7 +447,7 @@ final class ContentViewController: NSViewController {
     }
 
     private func isItemCut(_ item: FileItem) -> Bool {
-        FileOperations.isURLCut(item.url)
+        FileOperations.isURLMarked(item.url)
     }
 
     private func applyCutAppearance(to cell: NSTableCellView, item: FileItem, nameColumn: Bool) {
@@ -444,7 +517,26 @@ final class ContentViewController: NSViewController {
         }
         guard changed else { return }
         rebuildVisibleRows(preservingSelection: true, selectedURLs: selected)
-        onSelectionChange?(selectedItems)
+        notifySelectionChange()
+    }
+
+    /// Replace the listing with a richer version of the same rows (progressive listing:
+    /// names are shown first, sizes / dates arrive a moment later).
+    func applyFileAttributes(_ items: [FileItem]) {
+        guard !items.isEmpty else { return }
+        let selected = selectedItems.map(\.url.standardizedFileURL)
+        rootItems = items
+        if isShowingSearchResults || isShowingHistory {
+            // Search / history listings are not tied to the folder listing.
+            rebuildVisibleRows(preservingSelection: true, selectedURLs: selected)
+            return
+        }
+        let defaultNameSort = sortKeys == [SortKey(columnID: "name", ascending: true)]
+        if defaultNameSort {
+            rebuildVisibleRows(preservingSelection: true, selectedURLs: selected)
+        } else {
+            applySort(preservingSelection: true)
+        }
     }
 
     /// Show or hide the search-results chrome so search mode is visually distinct.
@@ -473,7 +565,7 @@ final class ContentViewController: NSViewController {
             checkedUninstallURLs.removeAll()
             applicationsFilterQuery = ""
             applicationsFilterField.stringValue = ""
-            setBannerPrimaryContent(isApplicationsFilter: false)
+            setBannerPrimaryContent(.label)
             applyBannerChrome(active: true)
             let scope = scopeName.isEmpty ? "当前文件夹" : scopeName
             searchBannerLabel.stringValue = "搜索结果 · 「\(query)」 · \(resultCount) 项 · 在「\(scope)」中"
@@ -509,7 +601,7 @@ final class ContentViewController: NSViewController {
             applicationsFilterField.stringValue = ""
             isShowingSearchResults = false
             searchQuery = ""
-            setBannerPrimaryContent(isApplicationsFilter: false)
+            setBannerPrimaryContent(.label)
             applyBannerChrome(active: true)
             searchBannerLabel.stringValue = itemCount == 0
                 ? "废纸篓为空"
@@ -548,7 +640,7 @@ final class ContentViewController: NSViewController {
                 applicationsFilterField.stringValue = ""
                 checkedUninstallURLs.removeAll()
             }
-            setBannerPrimaryContent(isApplicationsFilter: true)
+            setBannerPrimaryContent(.applicationsFilter)
             applyBannerChrome(active: true)
             emptyLabel.stringValue = applicationsFilterQuery.isEmpty ? "没有应用程序" : "无匹配应用"
             let tint = NSColor.systemBlue.withAlphaComponent(0.12)
@@ -559,7 +651,7 @@ final class ContentViewController: NSViewController {
             applicationsFilterQuery = ""
             applicationsFilterField.stringValue = ""
             checkedUninstallURLs.removeAll()
-            setBannerPrimaryContent(isApplicationsFilter: false)
+            setBannerPrimaryContent(.label)
             if !isShowingSearchResults && !isShowingTrash && !isShowingHistory {
                 applyBannerChrome(active: false)
                 emptyLabel.stringValue = "文件夹为空"
@@ -581,7 +673,7 @@ final class ContentViewController: NSViewController {
 
     func refreshApplicationsBanner() {
         guard isShowingApplications else { return }
-        setBannerPrimaryContent(isApplicationsFilter: true)
+        setBannerPrimaryContent(.applicationsFilter)
         let count = checkedUninstallURLs.count
         if count == 0 {
             searchBannerActionButton.title = "卸载"
@@ -608,7 +700,9 @@ final class ContentViewController: NSViewController {
             checkedUninstallURLs.removeAll()
             applicationsFilterQuery = ""
             applicationsFilterField.stringValue = ""
-            setBannerPrimaryContent(isApplicationsFilter: false)
+            historyFilterQuery = ""
+            historyFilterField.stringValue = ""
+            setBannerPrimaryContent(.historyFilter)
             applyBannerChrome(active: true)
             searchBannerLabel.stringValue = itemCount == 0
                 ? "最近打开 · 暂无记录"
@@ -625,6 +719,8 @@ final class ContentViewController: NSViewController {
                 dateCol.title = "打开时间"
             }
         } else {
+            historyFilterQuery = ""
+            historyFilterField.stringValue = ""
             if let dateCol = listView?.tableColumn(withIdentifier: .init("date")) {
                 dateCol.title = "修改日期"
             }
@@ -646,15 +742,32 @@ final class ContentViewController: NSViewController {
         onClearOpenHistory?()
     }
 
-    private func setBannerPrimaryContent(isApplicationsFilter: Bool) {
-        applicationsFilterField.isHidden = !isApplicationsFilter
-        searchBannerLabel.isHidden = isApplicationsFilter
-        if isApplicationsFilter {
-            NSLayoutConstraint.deactivate(bannerDefaultConstraints)
-            NSLayoutConstraint.activate(bannerApplicationsConstraints)
-        } else {
-            NSLayoutConstraint.deactivate(bannerApplicationsConstraints)
+    /// Which control the banner shows in its primary (left) slot.
+    private enum BannerContent {
+        /// A plain status label (search results / trash / plain folders).
+        case label
+        /// The Applications uninstall search field.
+        case applicationsFilter
+        /// The Recent-open history search field.
+        case historyFilter
+    }
+
+    private func setBannerPrimaryContent(_ content: BannerContent) {
+        applicationsFilterField.isHidden = content != .applicationsFilter
+        historyFilterField.isHidden = content != .historyFilter
+        searchBannerLabel.isHidden = content == .applicationsFilter
+
+        NSLayoutConstraint.deactivate(bannerDefaultConstraints)
+        NSLayoutConstraint.deactivate(bannerApplicationsConstraints)
+        NSLayoutConstraint.deactivate(bannerHistoryConstraints)
+
+        switch content {
+        case .label:
             NSLayoutConstraint.activate(bannerDefaultConstraints)
+        case .applicationsFilter:
+            NSLayoutConstraint.activate(bannerApplicationsConstraints)
+        case .historyFilter:
+            NSLayoutConstraint.activate(bannerHistoryConstraints)
         }
     }
 
@@ -748,6 +861,20 @@ final class ContentViewController: NSViewController {
         emptyLabel.stringValue = applicationsFilterQuery.isEmpty ? "没有应用程序" : "无匹配应用"
     }
 
+    /// Filters the Recent-open history list by path / name.
+    @objc private func historyFilterChanged(_ sender: NSSearchField) {
+        guard isShowingHistory else { return }
+        historyFilterQuery = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        rebuildVisibleRows(preservingSelection: true)
+        emptyLabel.isHidden = !items.isEmpty
+        emptyLabel.stringValue = historyFilterQuery.isEmpty ? "暂无打开历史" : "无匹配历史记录"
+        let matched = items.count
+        searchBannerLabel.stringValue = historyFilterQuery.isEmpty
+            ? (matched == 0 ? "最近打开 · 暂无记录" : "最近打开 · \(matched) 项")
+            : "最近打开 · 匹配 \(matched) 项"
+        onHistoryFilterChanged?(matched)
+    }
+
     @objc private func appCheckToggled(_ sender: NSButton) {
         let row = sender.tag
         guard items.indices.contains(row) else { return }
@@ -764,7 +891,7 @@ final class ContentViewController: NSViewController {
     var packagesForUninstall: [FileItem] {
         if !checkedUninstallURLs.isEmpty {
             return checkedUninstallURLs.compactMap { url -> FileItem? in
-                if let item = rootItems.first(where: { $0.url.standardizedFileURL == url }) {
+                if let item = item(for: url) {
                     return item
                 }
                 return FileItem.from(url: url)
@@ -880,9 +1007,11 @@ final class ContentViewController: NSViewController {
         beginRename: URL? = nil
     ) {
         emptyLabel.isHidden = isColumnView || !items.isEmpty
+        let nfR0 = Date()
         let previousSelection = select.isEmpty
             ? selectedItems.map(\.url.standardizedFileURL)
             : select.map(\.standardizedFileURL)
+        let nfR1 = Date()
 
         if isColumnView, let root = directoryForDrop?() {
             let reveal = (beginRename.map { [$0] } ?? []) + previousSelection
@@ -899,6 +1028,11 @@ final class ContentViewController: NSViewController {
                 select: previousSelection,
                 beginRename: beginRename
             )
+            let nfR2 = Date()
+            if nfR2.timeIntervalSince(nfR1) > 0.1 {
+                NSLog("[NF-PERF] root: selectionMap=%.3f finishListing=%.3f count=%d",
+                      nfR1.timeIntervalSince(nfR0), nfR2.timeIntervalSince(nfR1), items.count)
+            }
             return
         }
 
@@ -954,9 +1088,9 @@ final class ContentViewController: NSViewController {
         if !select.isEmpty {
             self.select(urls: select)
         }
-        onSelectionChange?(selectedItems)
+        notifySelectionChange()
         if let renameURL = beginRename?.standardizedFileURL,
-           let item = items.first(where: { $0.url.standardizedFileURL == renameURL }) {
+           let item = item(for: renameURL) {
             DispatchQueue.main.async { [weak self] in
                 self?.beginInlineRename(item)
             }
@@ -1035,15 +1169,18 @@ final class ContentViewController: NSViewController {
         let selected = selectedURLs ?? (preservingSelection ? selectedItems.map(\.url) : [])
         var display: [FileItem] = []
         var depths: [Int] = []
+        display.reserveCapacity(items.count)
+        depths.reserveCapacity(items.count)
 
         func walk(_ nodes: [FileItem], depth: Int) {
             for item in nodes {
                 display.append(item)
                 depths.append(depth)
+                // Only folders can be expanded — skip URL standardization for files
+                // (it is expensive and this runs once per row).
+                guard item.isDirectory, !item.isArchiveEntry else { continue }
                 let key = item.url.standardizedFileURL
-                if item.isDirectory,
-                   !item.isArchiveEntry,
-                   expandedURLs.contains(key),
+                if expandedURLs.contains(key),
                    let kids = childrenCache[key] {
                     walk(kids, depth: depth + 1)
                 }
@@ -1054,19 +1191,27 @@ final class ContentViewController: NSViewController {
         if isShowingApplications, !applicationsFilterQuery.isEmpty {
             let query = applicationsFilterQuery
             roots = rootItems.filter { $0.name.localizedCaseInsensitiveContains(query) }
+        } else if isShowingHistory, !historyFilterQuery.isEmpty {
+            // History rows display their full path — match against both.
+            let query = historyFilterQuery
+            roots = rootItems.filter {
+                $0.name.localizedCaseInsensitiveContains(query)
+                    || $0.url.path.localizedCaseInsensitiveContains(query)
+            }
         } else {
             roots = rootItems
         }
         walk(roots, depth: 0)
         items = display
         rowDepths = depths
+        rebuildRowIndex()
         listView.reloadData()
         updateSortIndicator()
         updateHeaderCheckButton()
         if preservingSelection || selectedURLs != nil, !selected.isEmpty {
             select(urls: selected)
         }
-        onSelectionChange?(selectedItems)
+        notifySelectionChange()
     }
 
     private func sortedItems(_ items: [FileItem], keys: [SortKey]) -> [FileItem] {
@@ -1084,6 +1229,9 @@ final class ContentViewController: NSViewController {
     }
 
     private func compare(_ lhs: FileItem, _ rhs: FileItem, by columnID: String) -> ComparisonResult {
+        // Big listings use the byte-wise comparator — `localizedStandardCompare` is
+        // an order of magnitude slower once a folder holds tens of thousands of rows.
+        let fast = items.count > 5_000
         switch columnID {
         case "date":
             let l = lhs.modificationDate ?? .distantPast
@@ -1096,12 +1244,18 @@ final class ContentViewController: NSViewController {
             if l == r { return .orderedSame }
             return l < r ? .orderedAscending : .orderedDescending
         case "kind":
-            return kindString(for: lhs).localizedStandardCompare(kindString(for: rhs))
+            let l = kindString(for: lhs)
+            let r = kindString(for: rhs)
+            if fast { return FileOperations.fastNameComparison(l, r) }
+            return l.localizedStandardCompare(r)
         default:
             if isShowingSearchResults {
-                return searchResultPath(for: lhs)
-                    .localizedStandardCompare(searchResultPath(for: rhs))
+                let l = searchResultPath(for: lhs)
+                let r = searchResultPath(for: rhs)
+                if fast { return FileOperations.fastNameComparison(l, r) }
+                return l.localizedStandardCompare(r)
             }
+            if fast { return FileOperations.fastNameComparison(lhs.name, rhs.name) }
             return lhs.name.localizedStandardCompare(rhs.name)
         }
     }
@@ -1277,7 +1431,7 @@ final class ContentViewController: NSViewController {
                 self.rebuildVisibleRows(preservingSelection: false)
                 self.select(urls: [created])
                 if beginRename,
-                   let item = self.items.first(where: { $0.url.standardizedFileURL == created }) {
+                   let item = self.item(for: created) {
                     DispatchQueue.main.async {
                         self.beginInlineRename(item)
                     }
@@ -1317,7 +1471,7 @@ final class ContentViewController: NSViewController {
         guard want != isColumnView else {
             if want, let reveal {
                 columnBrowser.select(urls: [reveal.standardizedFileURL])
-                onSelectionChange?(selectedItems)
+                notifySelectionChange()
             }
             onViewModeChange?(isColumnView)
             return
@@ -1338,7 +1492,7 @@ final class ContentViewController: NSViewController {
             rebuildVisibleRows(preservingSelection: true)
         }
         onViewModeChange?(isColumnView)
-        onSelectionChange?(selectedItems)
+        notifySelectionChange()
     }
 
     func toggleColumnView() {
@@ -1363,18 +1517,86 @@ final class ContentViewController: NSViewController {
         return nil
     }
 
+    /// Rebuilds the name → row lookup used by `select(urls:)`.
+    ///
+    /// The index is always built — it costs ~20 ms for 200k rows, while the
+    /// linear scan it replaces costs seconds.
+    private func rebuildRowIndex() {
+        var byName: [String: Int] = [:]
+        byName.reserveCapacity(items.count)
+        var duplicates: [String: [Int]] = [:]
+        for (row, item) in items.enumerated() {
+            if let existing = byName[item.name] {
+                // Outline mode can show the same name in two folders — keep
+                // every candidate so the right row can be picked later.
+                if duplicates[item.name] == nil {
+                    duplicates[item.name] = [existing]
+                }
+                duplicates[item.name]?.append(row)
+            } else {
+                byName[item.name] = row
+            }
+        }
+        rowIndexByName = byName
+        rowIndexByNameDuplicates = duplicates
+    }
+
+    /// Row of a URL inside the current listing (name lookup + path verification).
+    private func rowIndex(for url: URL) -> Int? {
+        let name = url.lastPathComponent
+        guard let row = rowIndexByName[name], items.indices.contains(row) else { return nil }
+        if itemMatchesURL(items[row], url) { return row }
+        // The same name can exist in more than one folder (outline mode).
+        if let candidates = rowIndexByNameDuplicates[name] {
+            for candidate in candidates where items.indices.contains(candidate) {
+                if itemMatchesURL(items[candidate], url) { return candidate }
+            }
+        }
+        return nil
+    }
+
+    /// Whether a listed item is the file the URL points at.
+    ///
+    /// Comparing the full path is not enough: the same file can be spelled
+    /// with a trailing slash or with a relative base. Comparing the parent
+    /// folder plus the name covers those cases without a second index.
+    private func itemMatchesURL(_ item: FileItem, _ url: URL) -> Bool {
+        let itemPath = item.url.path
+        if itemPath == url.path { return true }
+        if itemPath == url.standardizedFileURL.path { return true }
+        // Same name inside the same folder → the same file.
+        let parent = url.deletingLastPathComponent()
+            .appendingPathComponent(url.lastPathComponent).path
+        return itemPath == parent
+    }
+
+    /// Row numbers for the given URLs (fast path uses the row index).
+    private func rowIndexes(for urls: [URL]) -> IndexSet {
+        var indexes = IndexSet()
+        guard !urls.isEmpty else { return indexes }
+        for url in urls {
+            if let row = rowIndex(for: url) {
+                indexes.insert(row)
+            }
+        }
+        return indexes
+    }
+
+    /// Item of the current listing that matches a URL (fast path via the row index).
+    func item(for url: URL) -> FileItem? {
+        if let row = rowIndex(for: url), items.indices.contains(row) {
+            return items[row]
+        }
+        return nil
+    }
+
     func select(urls: [URL]) {
         if isColumnView {
             columnBrowser.select(urls: urls)
-            onSelectionChange?(selectedItems)
+            notifySelectionChange()
             return
         }
-        // Compare by path string — file URL Hashable/equality can miss matches across listing vs search.
-        let paths = Set(urls.map { $0.standardizedFileURL.path })
-        var indexes = IndexSet()
-        for (idx, item) in items.enumerated() where paths.contains(item.url.standardizedFileURL.path) {
-            indexes.insert(idx)
-        }
+        let indexes = rowIndexes(for: urls)
         listView.selectRowIndexes(indexes, byExtendingSelection: false)
         if let first = indexes.first {
             listView.scrollRowToVisible(first)
@@ -1388,7 +1610,7 @@ final class ContentViewController: NSViewController {
                 self.view.window?.makeFirstResponder(self.listView)
             }
         }
-        onSelectionChange?(selectedItems)
+        notifySelectionChange()
     }
 
     func selectAll() {
@@ -1397,7 +1619,7 @@ final class ContentViewController: NSViewController {
             return
         }
         listView.selectAll(nil)
-        onSelectionChange?(selectedItems)
+        notifySelectionChange()
     }
 
     /// When renaming inline, ⌘A should select the whole name, not every file.
@@ -1409,10 +1631,22 @@ final class ContentViewController: NSViewController {
     }
 
     func beginInlineRename(_ item: FileItem) {
-        guard let row = items.firstIndex(where: { $0.url.standardizedFileURL == item.url.standardizedFileURL }) else {
+        // The column view has its own editor — the list rows do not exist there.
+        if isColumnView {
+            columnBrowser.beginInlineRename()
             return
         }
-        listView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        guard let row = rowIndex(for: item.url) else { return }
+        beginInlineRename(atRow: row, item: item)
+    }
+
+    /// Commits a rename that was started in the column view.
+    private func commitColumnRename(_ item: FileItem, to newName: String) {
+        onCommitRename?(item, newName)
+    }
+
+    private func beginInlineRename(atRow row: Int, item: FileItem) {
+        listView.selectRowIndexes(IndexSet(integersIn: row..<(row+1)), byExtendingSelection: false)
         listView.scrollRowToVisible(row)
         listView.layoutSubtreeIfNeeded()
 
@@ -1510,12 +1744,23 @@ final class ContentViewController: NSViewController {
     }
 
     private func handleKey(_ event: NSEvent) -> NSEvent? {
-        guard view.window?.isKeyWindow == true else { return event }
         if view.window?.firstResponder is NSTextView || view.window?.firstResponder is NSTextField {
             return event
         }
 
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+
+        // The Quick Look panel is a separate window and can take the keyboard
+        // focus away from the list. When that happens, ↑/↓ must still move the
+        // selection so the preview follows to the next file.
+        if flags.isEmpty, event.keyCode == 125 || event.keyCode == 126 {
+            if view.window?.isKeyWindow != true, isPreviewPanelVisible {
+                moveSelectionVertically(offset: event.keyCode == 126 ? -1 : 1)
+                return nil
+            }
+        }
+
+        guard view.window?.isKeyWindow == true else { return event }
 
         // ⌘C / ⌘X / ⌘V / ⌘A / ⌘O (left favorites) / ⌘⇧O (top favorites)
         if let ch = event.charactersIgnoringModifiers?.lowercased() {
@@ -1535,6 +1780,9 @@ final class ContentViewController: NSViewController {
                     return nil
                 case "o":
                     onToggleFavoritesSidebar?()
+                    return nil
+                case "p":
+                    onGoClipboardPathRequest?()
                     return nil
                 default:
                     break
@@ -1563,7 +1811,7 @@ final class ContentViewController: NSViewController {
             return nil
         }
 
-        // Space → Quick Look (Finder)
+        // Space → Quick Look (system preview window)
         if event.keyCode == 49, flags.isEmpty {
             toggleQuickLook()
             return nil
@@ -1585,13 +1833,23 @@ final class ContentViewController: NSViewController {
             NotificationCenter.default.post(name: .contentRequestTrash, object: self)
             return nil
         }
-        // F2 → rename (keyCode 120 = kVK_F2; also match NSF2FunctionKey character)
+        // F2 → rename (keyCode 120 = kVK_F2).
+        //
+        // Function keys arrive with the `.numericPad` flag set, so the modifier
+        // check has to ignore the flags that are not real modifiers — testing
+        // `flags == .function` never matches and F2 stays dead.
         let isF2 = event.keyCode == 120
             || event.specialKey == .f2
             || event.charactersIgnoringModifiers?.utf16.first == UInt16(NSF2FunctionKey)
-        if isF2, flags.isEmpty || flags == .function {
-            if let item = selectedItems.first {
-                onRenameRequest?(item)
+        if isF2 {
+            // Only the real modifiers matter — ⌘F2 / ⌥F2 belong to the system.
+            let realModifiers = flags.intersection([.command, .control, .option, .shift])
+            if realModifiers.isEmpty {
+                if let item = selectedItems.first {
+                    onRenameRequest?(item)
+                    return nil
+                }
+                NSSound.beep()
                 return nil
             }
         }
@@ -1632,6 +1890,37 @@ final class ContentViewController: NSViewController {
         showQuickLook()
     }
 
+    // MARK: - Quick Look (system preview window)
+
+    /// True while the shared Quick Look panel is on screen.
+    private var isPreviewPanelVisible: Bool {
+        guard QLPreviewPanel.sharedPreviewPanelExists(),
+              let panel = QLPreviewPanel.shared() else { return false }
+        return panel.isVisible
+    }
+
+    /// Move the selection up/down. Used while the Quick Look panel has the focus,
+    /// so ↑/↓ keep switching the previewed file.
+    private func moveSelectionVertically(offset: Int) {
+        guard offset != 0 else { return }
+        if isColumnView {
+            columnBrowser.moveSelectionVertically(offset: offset)
+            return
+        }
+        let rowCount = listView.numberOfRows
+        guard rowCount > 0 else { return }
+        let current = listView.selectedRow
+        let next: Int
+        if current < 0 {
+            next = offset > 0 ? 0 : rowCount - 1
+        } else {
+            next = min(rowCount - 1, max(0, current + offset))
+        }
+        guard next != current else { return }
+        listView.selectRowIndexes(IndexSet(integer: next), byExtendingSelection: false)
+        listView.scrollRowToVisible(next)
+    }
+
     private func showQuickLook() {
         refreshPreviewItems()
         guard !previewItems.isEmpty else {
@@ -1641,7 +1930,9 @@ final class ContentViewController: NSViewController {
         guard let panel = QLPreviewPanel.shared() else { return }
         view.window?.makeFirstResponder(listView)
         panel.updateController()
-        panel.makeKeyAndOrderFront(nil)
+        // Order the panel in without stealing the keyboard focus: the file list
+        // keeps the focus so ↑/↓ keep changing the previewed file.
+        panel.orderFront(nil)
     }
 
     private func syncQuickLookIfVisible() {
@@ -1654,6 +1945,16 @@ final class ContentViewController: NSViewController {
             return
         }
         panel.reloadData()
+        // The panel follows the selection, so always show the first (only) item.
+        if panel.currentPreviewItemIndex != 0 {
+            panel.currentPreviewItemIndex = 0
+        }
+    }
+
+    /// Single funnel for selection changes so the preview window follows along.
+    private func notifySelectionChange() {
+        onSelectionChange?(selectedItems)
+        syncQuickLookIfVisible()
     }
 
     @objc private func contextOpenWithOther() {
@@ -1943,7 +2244,7 @@ final class ContentViewController: NSViewController {
         guard row >= 0, items.indices.contains(row) else { return }
         if !listView.selectedRowIndexes.contains(row) {
             listView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-            onSelectionChange?(selectedItems)
+            notifySelectionChange()
         }
     }
 }
@@ -2170,8 +2471,7 @@ extension ContentViewController: NSTableViewDataSource, NSTableViewDelegate {
         if !isShowingApplications {
             refreshApplicationsBanner()
         }
-        onSelectionChange?(selectedItems)
-        syncQuickLookIfVisible()
+        notifySelectionChange()
     }
 
     // MARK: - Drag source
@@ -2206,7 +2506,7 @@ extension ContentViewController: NSTableViewDataSource, NSTableViewDelegate {
         }
         guard !urls.isEmpty else { return }
         session.draggingPasteboard.clearContents()
-        session.draggingPasteboard.writeObjects(urls as [NSURL])
+        session.draggingPasteboard.writeObjects(FileOperations.absolutePasteboardURLs(urls) as [NSURL])
     }
 
     func tableView(
@@ -2551,8 +2851,15 @@ extension ContentViewController: QLPreviewPanelDataSource, QLPreviewPanelDelegat
         // Arrow / Home / End / Page keys → move selection in the file list.
         let navKeys: Set<UInt16> = [123, 124, 125, 126, 115, 119, 116, 121]
         if navKeys.contains(event.keyCode), flags.isEmpty || flags == .shift {
-            listView.keyDown(with: event)
-            return true
+            // ↑/↓ switch the previewed file (works in both list and column view).
+            if event.keyCode == 125 || event.keyCode == 126 {
+                moveSelectionVertically(offset: event.keyCode == 126 ? -1 : 1)
+                return true
+            }
+            if !isColumnView {
+                listView.keyDown(with: event)
+                return true
+            }
         }
         return false
     }

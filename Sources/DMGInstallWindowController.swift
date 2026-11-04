@@ -323,6 +323,29 @@ final class DMGInstallWindowController: NSWindowController {
 
     private func runInstall(openAfter: Bool) {
         guard let app = selectedApp, mounted != nil, !isBusy else { return }
+
+        // Check if the app is already running
+        if let runningApp = DMGInstallSupport.checkRunningApp(for: app) {
+            setBusy(true, status: "正在请求退出程序…", indeterminate: true)
+            DMGInstallSupport.promptAndQuitRunningApp(runningApp, window: window) { [weak self] didQuit in
+                DispatchQueue.main.async {
+                    if didQuit {
+                        // User confirmed quit, wait briefly then proceed with install
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                            self?.proceedWithInstall(app: app, openAfter: openAfter)
+                        }
+                    } else {
+                        // User cancelled
+                        self?.setBusy(false, status: "安装已取消", indeterminate: false)
+                    }
+                }
+            }
+        } else {
+            proceedWithInstall(app: app, openAfter: openAfter)
+        }
+    }
+
+    private func proceedWithInstall(app: URL, openAfter: Bool) {
         setBusy(true, status: "正在准备安装…", indeterminate: false)
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in

@@ -219,4 +219,85 @@ enum DMGInstallSupport {
         configuration.promptsUserIfNeeded = true
         NSWorkspace.shared.openApplication(at: appURL, configuration: configuration) { _, _ in }
     }
+
+    /// Find a running application by its bundle identifier or app name.
+    static func findRunningApp(bundleIdentifier: String, name: String) -> NSRunningApplication? {
+        NSWorkspace.shared.runningApplications.first { app in
+            guard !app.isTerminated, app.activationPolicy == .regular else { return false }
+            if let bid = app.bundleIdentifier, bid == bundleIdentifier {
+                return true
+            }
+            if let appName = app.localizedName, appName.lowercased() == name.lowercased() {
+                return true
+            }
+            return false
+        }
+    }
+
+    /// Check if any running app matches the target app to be installed.
+    static func checkRunningApp(for appURL: URL) -> NSRunningApplication? {
+        guard let bundle = Bundle(url: appURL) else { return nil }
+        let bundleId = bundle.bundleIdentifier ?? ""
+        let appName = appURL.deletingPathExtension().lastPathComponent
+        return findRunningApp(bundleIdentifier: bundleId, name: appName)
+    }
+
+    /// Show alert to ask user whether to quit the running app, then force quit if confirmed.
+    /// Returns true if the app was quit (or wasn't running), false if user cancelled.
+    static func promptAndQuitApp(_ runningApp: NSRunningApplication, in window: NSWindow?) -> Bool {
+        let appName = runningApp.localizedName ?? "该程序"
+        let alert = NSAlert()
+        alert.messageText = "「\(appName)」正在运行"
+        alert.informativeText = "安装前需要退出「\(appName)」才能继续。是否退出该程序？"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "退出并安装")
+        alert.addButton(withTitle: "取消安装")
+
+        if let window = window {
+            alert.beginSheetModal(for: window) { response in
+                if response == .alertFirstButtonReturn {
+                    runningApp.forceTerminate()
+                }
+            }
+            return false
+        } else {
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                runningApp.forceTerminate()
+                return true
+            }
+            return false
+        }
+    }
+
+    /// Callback-based version for sheet-style alerts in NSWindow.
+    static func promptAndQuitRunningApp(_ runningApp: NSRunningApplication, window: NSWindow?, completion: @escaping (Bool) -> Void) {
+        let appName = runningApp.localizedName ?? "该程序"
+        let alert = NSAlert()
+        alert.messageText = "「\(appName)」正在运行"
+        alert.informativeText = "安装前需要退出「\(appName)」才能继续。是否退出该程序？"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "退出并安装")
+        alert.addButton(withTitle: "取消安装")
+
+        guard let window = window else {
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                runningApp.forceTerminate()
+                completion(true)
+            } else {
+                completion(false)
+            }
+            return
+        }
+
+        alert.beginSheetModal(for: window) { response in
+            if response == .alertFirstButtonReturn {
+                runningApp.forceTerminate()
+                completion(true)
+            } else {
+                completion(false)
+            }
+        }
+    }
 }

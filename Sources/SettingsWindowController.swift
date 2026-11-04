@@ -21,6 +21,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private var wechatDualOpenStatusLabel: NSTextField!
     private var disableCommandMCheckbox: NSButton!
     private var disableCommandHCheckbox: NSButton!
+    private var skipInitialSortCheckbox: NSButton!
+    private var showLoadTimeCheckbox: NSButton!
     private var pendingRelease: UpdateChecker.ReleaseInfo?
 
     private init() {
@@ -118,6 +120,24 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             action: #selector(toggleLaunchAtLogin)
         )
         stack.addArrangedSubview(launchAtLoginCheckbox)
+
+        let perfTitle = NSTextField(labelWithString: "性能")
+        perfTitle.font = .boldSystemFont(ofSize: 13)
+        stack.addArrangedSubview(perfTitle)
+
+        skipInitialSortCheckbox = NSButton(
+            checkboxWithTitle: "打开文件夹时不排序（保持系统默认顺序，速度更快）",
+            target: self,
+            action: #selector(toggleSkipInitialSort)
+        )
+        stack.addArrangedSubview(skipInitialSortCheckbox)
+
+        showLoadTimeCheckbox = NSButton(
+            checkboxWithTitle: "在状态栏显示加载耗时",
+            target: self,
+            action: #selector(toggleShowLoadTime)
+        )
+        stack.addArrangedSubview(showLoadTimeCheckbox)
 
         let updateRow = NSStackView()
         updateRow.orientation = .horizontal
@@ -237,6 +257,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             ("拷贝", "⌘C", "复制选中项到剪贴板"),
             ("剪切", "⌘X", "剪切选中项（粘贴后移动）"),
             ("粘贴", "⌘V", "粘贴到当前文件夹或展开中的文件夹"),
+            ("复制路径", "⌘⇧C", "复制选中项的完整路径"),
+            ("跳转到剪贴板地址", "⌘P", "跳转到剪贴板中的文件或文件夹"),
+            ("显示/隐藏最近打开", "⌘H", "打开或关闭「最近打开」历史记录"),
             ("移到废纸篓", "Delete 或 ⌘⌫", "删除选中项")
         ]
 
@@ -265,7 +288,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         windowKeysTitle.font = .boldSystemFont(ofSize: 13)
         stack.addArrangedSubview(windowKeysTitle)
 
-        let windowKeysHint = NSTextField(wrappingLabelWithString: "勾选后，对应快捷键在 NewFinder 中将不再生效（避免误触缩小或隐藏）。")
+        let windowKeysHint = NSTextField(wrappingLabelWithString: "勾选后，对应快捷键在 NewFinder 中将不再生效（避免误触缩小或隐藏）。⌘H 已用于「最近打开」，不会隐藏应用。")
         windowKeysHint.font = .systemFont(ofSize: 11)
         windowKeysHint.textColor = .secondaryLabelColor
         windowKeysHint.preferredMaxLayoutWidth = 500
@@ -279,7 +302,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         stack.addArrangedSubview(disableCommandMCheckbox)
 
         disableCommandHCheckbox = NSButton(
-            checkboxWithTitle: "禁用 ⌘H 隐藏窗口",
+            checkboxWithTitle: "禁用 ⌘H 隐藏应用（无浏览器窗口时）",
             target: self,
             action: #selector(toggleDisableCommandH)
         )
@@ -342,6 +365,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         launchAtLoginCheckbox.state = settings.launchAtLogin ? .on : .off
         disableCommandMCheckbox.state = settings.disableCommandMMinimize ? .on : .off
         disableCommandHCheckbox.state = settings.disableCommandHHide ? .on : .off
+        skipInitialSortCheckbox.state = settings.skipInitialSort ? .on : .off
+        showLoadTimeCheckbox.state = settings.showLoadTime ? .on : .off
         versionLabel.stringValue = UpdateChecker.currentVersion
         rebuildTypeRows()
     }
@@ -660,6 +685,16 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     @objc private func toggleDisableCommandH() {
         settings.disableCommandHHide = disableCommandHCheckbox.state == .on
+        notifyChange()
+    }
+
+    @objc private func toggleSkipInitialSort() {
+        settings.skipInitialSort = skipInitialSortCheckbox.state == .on
+        notifyChange()
+    }
+
+    @objc private func toggleShowLoadTime() {
+        settings.showLoadTime = showLoadTimeCheckbox.state == .on
         notifyChange()
     }
 

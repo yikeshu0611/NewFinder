@@ -8,6 +8,8 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
     var onActivateDirectory: ((URL) -> Void)?
     var onPerformFileDrop: (([URL], URL, Bool) -> Void)?
     var onDirectoryNeedsReload: (() -> Void)?
+    /// The user finished editing a name in a column (F2 / right-click → 重命名).
+    var onRenameCommit: ((FileItem, String) -> Void)?
 
     private let scrollView = NSScrollView()
     private let columnsStack = NSStackView()
@@ -19,6 +21,9 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
     private var suppressSelectionEvent = false
     private var columnWidthConstraints: [NSLayoutConstraint] = []
     private var isDragging = false
+    /// Bumped whenever the columns change so a stale background attribute fill
+    /// does not overwrite a newer listing.
+    private var columnLoadGeneration = 0
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -37,12 +42,14 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
 
     func setRootURL(_ url: URL) {
         rootURL = url.standardizedFileURL
+        columnLoadGeneration += 1
         childrenCache.removeAll(keepingCapacity: true)
         rebuildColumns(directories: [rootURL], selections: [nil], forceReload: true)
         notifySelection()
     }
 
     func reload() {
+        columnLoadGeneration += 1
         childrenCache.removeAll(keepingCapacity: true)
         let dirs = columnDirectories.isEmpty ? [rootURL] : columnDirectories
         let sels = columnSelections
@@ -53,6 +60,7 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
     /// After move/copy/delete: drop cached listings, keep the open column path when possible, then reveal `select`.
     func refreshAfterMutation(root: URL, select urls: [URL]) {
         let standardized = root.standardizedFileURL
+        columnLoadGeneration += 1
         childrenCache.removeAll(keepingCapacity: true)
 
         let sameRoot = standardized.path == rootURL.standardizedFileURL.path
@@ -308,14 +316,148 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
     private func children(of url: URL) -> [FileItem] {
         let key = url.standardizedFileURL
         if let cached = childrenCache[key] { return cached }
-        let listed = FileOperations.listDirectory(key, showHidden: AppSettings.shared.showHiddenFiles)
+        // A column shows the names immediately; sizes / dates are filled in
+        // afterwards. Listing a folder with hundreds of thousands of entries
+        // synchronously would freeze the whole window for seconds.
+        let listed = FileOperations.listDirectoryNames(key, showHidden: AppSettings.shared.showHiddenFiles)
         childrenCache[key] = listed
+        scheduleAttributeFill(for: key, items: listed)
         return listed
+    }
+
+    /// Fills in the metadata of a column in the background and refreshes it
+    /// once the values are there.
+    private func scheduleAttributeFill(for key: URL, items: [FileItem]) {
+        guard items.count > FileOperations.progressiveListingThreshold else { return }
+        let generation = columnLoadGeneration
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let enriched = FileOperations.enrichWithAttributes(items, in: key)
+            DispatchQueue.main.async {
+                guard let self, generation == self.columnLoadGeneration else { return }
+                self.childrenCache[key] = enriched
+                self.reloadColumn(for: key)
+            }
+        }
+    }
+
+    /// Reloads the tables that show a given folder.
+    private func reloadColumn(for key: URL) {
+        for (index, dir) in columnDirectories.enumerated() where dir == key {
+            guard columnTables.indices.contains(index) else { continue }
+            columnTables[index].reloadData()
+        }
+        applySelectionHighlights()
+    }
+
+    /// Re-tint the rows after cut / copy changed the pasteboard.
+    func refreshCutAppearance() {
+        for table in columnTables {
+            table.reloadData()
+        }
+        applySelectionHighlights()
     }
 
     private func items(inColumn index: Int) -> [FileItem] {
         guard columnDirectories.indices.contains(index) else { return [] }
         return children(of: columnDirectories[index])
+    }
+
+    // MARK: - Inline rename
+
+    /// Text field that is currently editing a name.
+    private var renamingField: NSTextField?
+    private var renamingItem: FileItem?
+    private var renamingOriginalName: String = ""
+
+    /// Starts editing the name of the selected item (F2 / right-click → 重命名).
+    func beginInlineRename() {
+        guard renamingField == nil else {
+            window?.makeFirstResponder(renamingField)
+            return
+        }
+        guard let item = deepestSelection() else {
+            NSSound.beep()
+            return
+        }
+        // Find the column that holds the selection and the row inside it.
+        guard let column = columnSelections.lastIndex(where: { $0 != nil }),
+              columnTables.indices.contains(column) else { return }
+        let rows = items(inColumn: column)
+        guard let row = rows.firstIndex(where: { $0.url.standardizedFileURL == item.url.standardizedFileURL }) else { return }
+
+        let table = columnTables[column]
+        table.scrollRowToVisible(row)
+        table.layoutSubtreeIfNeeded()
+        guard let cell = table.view(atColumn: 0, row: row, makeIfNecessary: true) as? NSTableCellView,
+              let label = cell.textField else { return }
+
+        renamingItem = item
+        renamingOriginalName = item.name
+        renamingField = label
+
+        label.isEditable = true
+        label.isSelectable = true
+        label.isBordered = true
+        label.isBezeled = true
+        label.bezelStyle = .squareBezel
+        label.drawsBackground = true
+        label.backgroundColor = .textBackgroundColor
+        label.focusRingType = .default
+        label.delegate = self
+        label.target = self
+        label.action = #selector(renameFieldAction(_:))
+        label.stringValue = item.name
+
+        window?.makeFirstResponder(label)
+        DispatchQueue.main.async { [weak self, weak label] in
+            guard let self, let label, self.renamingField === label else { return }
+            let editor = label.currentEditor()
+            editor?.selectAll(nil)
+        }
+    }
+
+    /// Commits the edited name (the delegate also calls this when editing ends).
+    func commitInlineRename(_ newName: String) {
+        guard let field = renamingField, let item = renamingItem else { return }
+        renamingField = nil
+        renamingItem = nil
+        renamingOriginalName = ""
+        field.isEditable = false
+        field.isSelectable = false
+        field.isBordered = false
+        field.isBezeled = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.delegate = nil
+        field.target = nil
+        field.action = nil
+        field.stringValue = item.name
+
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != item.name else { return }
+        onRenameCommit?(item, trimmed)
+    }
+
+    /// Cancels an in-progress rename and restores the original name.
+    func cancelInlineRename() {
+        guard let field = renamingField, let item = renamingItem else { return }
+        renamingField = nil
+        renamingItem = nil
+        renamingOriginalName = ""
+        field.isEditable = false
+        field.isSelectable = false
+        field.isBordered = false
+        field.isBezeled = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.delegate = nil
+        field.target = nil
+        field.action = nil
+        field.stringValue = item.name
+    }
+
+    @objc private func renameFieldAction(_ sender: NSTextField) {
+        commitInlineRename(sender.stringValue)
     }
 
     private func deepestSelection() -> FileItem? {
@@ -356,6 +498,29 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
         } else {
             onActivateDirectory?(rootURL)
         }
+    }
+
+    /// Move the selection up/down inside the deepest column that has one.
+    /// - Parameter offset: -1 moves up, 1 moves down.
+    @discardableResult
+    func moveSelectionVertically(offset: Int) -> Bool {
+        guard offset != 0 else { return false }
+        guard let column = columnSelections.lastIndex(where: { $0 != nil }) else { return false }
+        let rows = items(inColumn: column)
+        guard !rows.isEmpty else { return false }
+        let selected = columnSelections[column]
+        let currentIndex = selected.flatMap { item in
+            rows.firstIndex(where: { $0.url.standardizedFileURL == item.url.standardizedFileURL })
+        }
+        let nextIndex: Int
+        if let currentIndex {
+            nextIndex = min(rows.count - 1, max(0, currentIndex + offset))
+            guard nextIndex != currentIndex else { return false }
+        } else {
+            nextIndex = offset > 0 ? 0 : rows.count - 1
+        }
+        handleClick(column: column, row: nextIndex)
+        return true
     }
 
     private func handleClick(column index: Int, row: Int) {
@@ -443,6 +608,11 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
         cell.imageView?.image = icon
         cell.textField?.stringValue = item.name
 
+        // Items marked on the pasteboard are greyed out, like the list view does.
+        let isCut = FileOperations.isURLMarked(item.url)
+        cell.imageView?.alphaValue = isCut ? 0.45 : 1
+        cell.textField?.textColor = isCut ? .tertiaryLabelColor : .labelColor
+
         let arrow = cell.viewWithTag(9911) as? NSImageView
         if item.isDirectory, !item.isPackage {
             let img = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: nil)
@@ -497,7 +667,7 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
         }
         guard !urls.isEmpty else { return }
         session.draggingPasteboard.clearContents()
-        session.draggingPasteboard.writeObjects(urls as [NSURL])
+        session.draggingPasteboard.writeObjects(FileOperations.absolutePasteboardURLs(urls) as [NSURL])
     }
 
     func tableView(
@@ -604,5 +774,19 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
             }
         }
         return true
+    }
+}
+
+extension ColumnBrowserView: NSTextFieldDelegate {
+    /// The rename editor lost focus (the user clicked elsewhere) — commit the name.
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard let field = renamingField, obj.object as AnyObject? === field else { return }
+        let movement = obj.userInfo?["NSTextMovement"] as? Int ?? 0
+        let cancelled = movement == NSTextMovement.cancel.rawValue
+        if cancelled {
+            cancelInlineRename()
+        } else {
+            commitInlineRename(field.stringValue)
+        }
     }
 }

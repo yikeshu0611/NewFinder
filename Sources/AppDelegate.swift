@@ -31,6 +31,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Always accessory: no Dock icon, no app name in the system menu bar.
         NSApp.setActivationPolicy(.accessory)
+        PerfLog.reset()
+        PerfLog.setSession(String(Int(Date().timeIntervalSince1970)))
 
         // Agent-style apps can spawn many instances; keep a single UI process.
         if handOffToExistingUIInstanceIfNeeded() {
@@ -41,9 +43,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = buildMainMenu()
         installWindowShortcutMonitor()
         StatusBarController.shared.install()
-        registerAsDefaultFolderViewer()
-        applyLaunchAtLoginSetting()
-        installWatchAgent()
+        // Claiming the folder types talks to Launch Services and blocks for
+        // 100+ ms — keep it off the launch critical path so the window shows
+        // up immediately.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.registerAsDefaultFolderViewer()
+        }
+        // Both of these talk to launchd / LaunchServices and cost 50-150ms.
+        // Keep them off the launch critical path so the window shows up at once.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.applyLaunchAtLoginSetting()
+            self?.installWatchAgent()
+        }
         startFinderRedirectObserver()
         registerExternalShowObservers()
 
@@ -61,7 +72,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if stealFinder {
             // Relaunched after Dock-Finder click: steal immediately, then ensure a window.
             scheduleFinderRedirect(settle: 0)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            // The redirect reads the Finder context (one AppleScript round trip) and
+            // opens the right window itself. Wait for it before falling back to the
+            // Desktop, so the user never sees a Desktop window flash first.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
                 guard let self else { return }
                 self.showFrontBrowserOrOpenDesktop()
                 self.bringUIToFront()
@@ -71,6 +85,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             showFrontBrowserOrOpenDesktop()
             bringUIToFront()
         }
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+    }
+
+    func applicationDidResignActive(_ notification: Notification) {
     }
 
     /// Files to select after cold launch (`--reveal /path`).
@@ -141,7 +161,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func handleExternalStealFinder(_ notification: Notification) {
         scheduleFinderRedirect(settle: 0)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in
             self?.userRequestedShowUI()
         }
     }
@@ -358,6 +378,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Show items inside NewFinder (replaces system Finder reveal).
+    /// Optimized for fast reveal: pre-loads directory listing before creating window.
     func reveal(_ urls: [URL]) {
         guard let first = urls.first?.standardizedFileURL else { return }
         let values = try? first.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
@@ -370,6 +391,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let parent = first.deletingLastPathComponent()
         let select = urls.map(\.standardizedFileURL)
 
+        // Navigate right away: the window must appear now, the directory listing
+        // itself already happens asynchronously inside reloadContents(). The old
+        // pre-load blocked the window by a full directory listing and then threw
+        // the result away.
         // Set pending selection BEFORE navigating so async reload still selects the file.
         if let front = keyBrowser() {
             front.selectAfterNavigate(select)
@@ -555,12 +580,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
 
-        // Force Launch Services to re-scan this build.
-        let lsregister = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-        if FileManager.default.isExecutableFile(atPath: lsregister) {
+        // Force Launch Services to re-scan this build. This keeps Launch Services
+        // busy for a while, so run it in the background.
+        let appPath = appURL.path
+        DispatchQueue.global(qos: .utility).async {
+            let lsregister = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+            guard FileManager.default.isExecutableFile(atPath: lsregister) else { return }
             let process = Process()
             process.executableURL = URL(fileURLWithPath: lsregister)
-            process.arguments = ["-f", appURL.path]
+            process.arguments = ["-f", appPath]
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
             try? process.run()
@@ -655,8 +683,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
               app.bundleIdentifier == "com.apple.finder" else { return }
         if shouldSuppressRedirect() { return }
-        // Tiny settle so selection exists; keep short to avoid visible lag.
-        scheduleFinderRedirect(settle: 0.04)
+        // Immediate redirect for WeChat-style "Show in Finder" operations — no settle delay.
+        scheduleFinderRedirect(settle: 0)
     }
 
     func updateFinderWindowPollTimer() {
@@ -740,8 +768,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // During a DMG session: probe without stealing. Stay on installer if still on /Volumes/.
         if isLeavingFinderAloneForVolumes() {
-            let context = probeFinderContext()
-            if finderContextInvolvesMountedVolume(context) || finderHasVolumeWindow() {
+            let context = readFinderContext()
+            if finderContextInvolvesMountedVolume(context) || finderContextHasVolumeWindow(context) {
                 return
             }
             // Finder moved to a normal folder — resume interception.
@@ -753,13 +781,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isRedirectingFinder = true
         lastFinderRedirectAt = Date()
         // Closing Finder / activating NF can re-fire Finder notifications — pause briefly.
-        suppressFinderRedirectUntil = Date().addingTimeInterval(1.2)
+        suppressFinderRedirectUntil = Date().addingTimeInterval(0.5)
 
         // Switch focus first so the Finder flash is as short as possible (same as before).
         forceActivateNewFinder()
 
-        let context = probeFinderContext()
-        if finderContextInvolvesMountedVolume(context) || finderHasVolumeWindow() {
+        // ONE AppleScript round trip: read the selection / window targets AND close
+        // the Finder windows that are not on a mounted volume. Previously this was
+        // three separate scripts, each of which had to wait for Finder's main thread.
+        let context = readAndCloseFinderContext()
+        if finderContextInvolvesMountedVolume(context) || finderContextHasVolumeWindow(context) {
             beginLeavingFinderAlone()
             // Prefer NewFinder's installer UI over the fragile system Finder sheet.
             if let volume = volumeURLForInstaller(from: context) {
@@ -775,12 +806,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if context.selectURLs.isEmpty && context.folderURL == nil {
             // First DMG open: mount + installer often arrive after Finder activates.
             // Do NOT close windows yet — wait and re-check for /Volumes/.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                 guard let self else { return }
                 defer { self.isRedirectingFinder = false }
 
-                let again = self.probeFinderContext()
-                if self.finderContextInvolvesMountedVolume(again) || self.finderHasVolumeWindow() {
+                let again = self.readAndCloseFinderContext()
+                if self.finderContextInvolvesMountedVolume(again) || self.finderContextHasVolumeWindow(again) {
                     self.beginLeavingFinderAlone()
                     if let volume = self.volumeURLForInstaller(from: again) {
                         _ = self.presentInstallerForMountedVolume(volume)
@@ -791,7 +822,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     return
                 }
 
-                self.closeFinderWindowsPreservingVolumes()
                 self.applyFinderContext(again)
                 self.forceActivateNewFinder()
                 if again.selectURLs.isEmpty && again.folderURL == nil,
@@ -802,11 +832,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        closeFinderWindowsPreservingVolumes()
         applyFinderContext(context)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-            self?.isRedirectingFinder = false
-        }
+        isRedirectingFinder = false
     }
 
     private func finderContextInvolvesMountedVolume(_ context: FinderContext) -> Bool {
@@ -817,9 +844,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Finder window target under /Volumes/ (works even before FileManager lists the mount).
-    private func finderHasVolumeWindow() -> Bool {
-        let (raw, _) = runAppleScript(FinderVolumeGuard.listWindowTargetsScript)
-        return FinderVolumeGuard.windowTargetsInvolveMountedVolume(scriptResult: raw)
+    /// Derived from the state that was read in the same round trip as the selection.
+    private func finderContextHasVolumeWindow(_ context: FinderContext) -> Bool {
+        FinderVolumeGuard.pathsInvolveMountedVolume(context.windowTargets)
     }
 
     private func volumeURLForInstaller(from context: FinderContext) -> URL? {
@@ -840,12 +867,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Fall back to any Finder window on /Volumes that looks like an installer.
-        let (raw, _) = runAppleScript(FinderVolumeGuard.listWindowTargetsScript)
-        let paths = (raw ?? "")
-            .split(separator: "\n")
-            .map(String.init)
-            .filter { !$0.isEmpty }
-        for path in paths where FinderVolumeGuard.pathLooksLikeMountedVolume(path) {
+        for path in context.windowTargets where FinderVolumeGuard.pathLooksLikeMountedVolume(path) {
             var volume = URL(fileURLWithPath: path, isDirectory: true)
             let parts = volume.pathComponents
             if parts.count >= 3, parts[1] == "Volumes" {
@@ -918,7 +940,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Bring NewFinder windows forward without switching to `.regular` (keeps Dock / menu bar clear).
     func bringUIToFront() {
-        suppressFinderRedirectUntil = Date().addingTimeInterval(1.5)
+        suppressFinderRedirectUntil = Date().addingTimeInterval(0.5)
         if NSApp.activationPolicy() != .accessory {
             NSApp.setActivationPolicy(.accessory)
         }
@@ -936,14 +958,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.unhide(nil)
         NSApp.activate(ignoringOtherApps: true)
         NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
-
-        // One short retry — Chrome/Finder may reclaim focus for a beat.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
-            guard let self else { return }
-            self.keyBrowser()?.window?.orderFrontRegardless()
-            self.keyBrowser()?.window?.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-        }
     }
 
     private func noteFinderAutomationFailureIfNeeded() {
@@ -969,6 +983,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private struct FinderContext {
         var folderURL: URL?
         var selectURLs: [URL]
+        /// POSIX paths of every open Finder window target (same AppleScript round trip).
+        var windowTargets: [String] = []
+
+        init(state: FinderVolumeGuard.FinderState) {
+            windowTargets = state.windowTargets
+            if !state.selection.isEmpty {
+                selectURLs = state.selection.map { URL(fileURLWithPath: $0) }
+                folderURL = nil
+            } else if let dir = state.frontDirectory, !dir.isEmpty {
+                selectURLs = []
+                folderURL = URL(fileURLWithPath: dir)
+            } else {
+                selectURLs = []
+                folderURL = nil
+            }
+        }
     }
 
     private func runAppleScript(_ source: String) -> (string: String?, error: NSDictionary?) {
@@ -983,46 +1013,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return (result.stringValue, nil)
     }
 
-    private func probeFinderContext() -> FinderContext {
-        let source = """
-        tell application "Finder"
-          set output to ""
-          try
-            set sel to the selection
-            if (count of sel) > 0 then
-              repeat with s in sel
-                try
-                  set output to output & POSIX path of (s as alias) & linefeed
-                end try
-              end repeat
-              if output is not "" then return "SEL:" & output
-            end if
-          end try
-          try
-            if (count of Finder windows) > 0 then
-              set t to target of front Finder window
-              return "DIR:" & POSIX path of (t as alias)
-            end if
-          end try
-          return ""
-        end tell
-        """
-        let (raw, _) = runAppleScript(source)
-        guard let text = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
-            return FinderContext(folderURL: nil, selectURLs: [])
-        }
+    /// One AppleScript round trip for the selection, the front window target and
+    /// every open window target. Each of those used to be a separate script, and
+    /// every extra round trip had to wait for Finder's (busy) main thread.
+    private func readFinderContext() -> FinderContext {
+        let (raw, _) = runAppleScript(FinderVolumeGuard.readFinderStateScript)
+        return FinderContext(state: FinderVolumeGuard.parseFinderState(raw))
+    }
 
-        if text.hasPrefix("SEL:") {
-            let body = String(text.dropFirst(4))
-            let paths = body.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
-            return FinderContext(folderURL: nil, selectURLs: paths.map { URL(fileURLWithPath: $0) })
-        }
-        if text.hasPrefix("DIR:") {
-            let path = String(text.dropFirst(4)).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !path.isEmpty else { return FinderContext(folderURL: nil, selectURLs: []) }
-            return FinderContext(folderURL: URL(fileURLWithPath: path), selectURLs: [])
-        }
-        return FinderContext(folderURL: nil, selectURLs: [])
+    /// Same as `readFinderContext()`, but the same round trip also closes every
+    /// Finder window that is not on a mounted volume.
+    private func readAndCloseFinderContext() -> FinderContext {
+        let (raw, _) = runAppleScript(FinderVolumeGuard.readAndCloseFinderStateScript)
+        return FinderContext(state: FinderVolumeGuard.parseFinderState(raw))
     }
 
     private func finderHasOpenWindows() -> Bool {
@@ -1061,6 +1064,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         shortcutsMenu.addItem(withTitle: "拷贝", action: #selector(BrowserWindowController.copy(_:)), keyEquivalent: "c")
         shortcutsMenu.addItem(withTitle: "粘贴", action: #selector(BrowserWindowController.paste(_:)), keyEquivalent: "v")
         shortcutsMenu.addItem(withTitle: "全选", action: #selector(BrowserWindowController.selectAllItems(_:)), keyEquivalent: "a")
+        shortcutsMenu.addItem(
+            withTitle: "跳转到剪贴板地址",
+            action: #selector(BrowserWindowController.goClipboardPath(_:)),
+            keyEquivalent: "p"
+        )
+        let copyPathItem = shortcutsMenu.addItem(
+            withTitle: "复制路径",
+            action: #selector(BrowserWindowController.copyPath(_:)),
+            keyEquivalent: "c"
+        )
+        copyPathItem.keyEquivalentModifierMask = [.command, .shift]
+        shortcutsMenu.addItem(
+            withTitle: "显示/隐藏最近打开",
+            action: #selector(BrowserWindowController.toggleHistoryPage(_:)),
+            keyEquivalent: "h"
+        )
         let upItem = shortcutsMenu.addItem(
             withTitle: "上层文件夹",
             action: #selector(BrowserWindowController.goEnclosingFolder(_:)),
@@ -1118,6 +1137,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return nil
             }
             if isH, AppSettings.shared.disableCommandHHide {
+                // ⌘H opens the Recent-open history page while a browser window is
+                // focused — let the browser have it instead of hiding the app.
+                if self.keyBrowser()?.window?.isKeyWindow == true {
+                    return event
+                }
                 return nil
             }
             return event
@@ -1219,6 +1243,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: ""
         )
         terminal.target = self
+        let clipboard = goToMenu.addItem(
+            withTitle: "剪贴板地址 (⌘P)",
+            action: #selector(goToClipboardPath(_:)),
+            keyEquivalent: ""
+        )
+        clipboard.target = self
         goToItem.submenu = goToMenu
         menu.addItem(goToItem)
 
@@ -1262,6 +1292,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         openSystemApp(at: "/System/Applications/Utilities/Terminal.app")
     }
 
+    /// Jump to the address on the clipboard (⌘P).
+    @objc private func goToClipboardPath(_ sender: Any?) {
+        keyBrowser()?.goClipboardPath(sender)
+    }
+
     @objc private func goToQuitApps(_ sender: Any?) {
         suppressFinderRedirectUntil = Date().addingTimeInterval(1.0)
         QuitAppsWindowController.shared.show()
@@ -1301,7 +1336,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         bringUIToFront()
     }
 
-    @objc private func checkForUpdatesFromMenu(_ sender: Any?) {
+    @objc func checkForUpdatesFromMenu(_ sender: Any?) {
         UpdateChecker.fetchLatest { [weak self] result in
             guard self != nil else { return }
             switch result {
