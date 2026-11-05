@@ -25,6 +25,9 @@ final class ContentViewController: NSViewController {
     var onOpenArchives: (([URL]) -> Void)?
     /// Current window directory (drop onto empty area / non-folder rows).
     var directoryForDrop: (() -> URL)?
+    /// Right-click → 新建: create a new item of the given type
+    /// (`nil` extension = folder) in the target directory.
+    var onCreateNewItemRequest: ((String?) -> Void)?
     /// Handle a file drop: sources, destination folder, whether to copy (true) or move (false).
     var onPerformFileDrop: (([URL], URL, Bool) -> Void)?
 
@@ -99,6 +102,7 @@ final class ContentViewController: NSViewController {
     private var renamingOriginalName: String?
     private weak var openWithMenuItem: NSMenuItem?
     private weak var compareMenuItem: NSMenuItem?
+    private weak var newItemMenuItem: NSMenuItem?
     private weak var putBackMenuItem: NSMenuItem?
     private weak var deleteForeverMenuItem: NSMenuItem?
     private weak var uninstallMenuItem: NSMenuItem?
@@ -309,6 +313,9 @@ final class ContentViewController: NSViewController {
         columnBrowser.onRenameCommit = { [weak self] item, newName in
             self?.commitColumnRename(item, to: newName)
         }
+        columnBrowser.onCreateNewItemRequest = { [weak self] directory, extensionName in
+            self?.createNewItem(in: directory, extensionName: extensionName)
+        }
         root.addSubview(columnBrowser)
 
         view = root
@@ -341,6 +348,15 @@ final class ContentViewController: NSViewController {
         let menu = NSMenu()
         menu.autoenablesItems = false
         menu.delegate = self
+        // 新建 — always at the top, like Finder.
+        let newItem = NSMenuItem(title: "新建", action: nil, keyEquivalent: "")
+        newItem.submenu = NewItemMenu.makeSubmenu(
+            action: #selector(contextCreateNewItem(_:)),
+            target: self
+        )
+        newItemMenuItem = newItem
+        menu.addItem(newItem)
+        menu.addItem(NSMenuItem.separator())
         menu.addItem(withTitle: "打开", action: #selector(contextOpen), keyEquivalent: "")
         let openWith = NSMenuItem(title: "打开方式", action: nil, keyEquivalent: "")
         openWith.submenu = NSMenu()
@@ -351,7 +367,11 @@ final class ContentViewController: NSViewController {
         compareMenuItem = compare
         menu.addItem(compare)
         menu.addItem(withTitle: "打开所在位置", action: #selector(contextRevealInEnclosingFolder), keyEquivalent: "")
-        menu.addItem(NSMenuItem.separator())
+        // The separators around the (hidden) trash / archive sections are shown
+        // only when one of those sections is visible.
+        let sectionSeparator = NSMenuItem.separator()
+        sectionSeparator.identifier = NewItemMenu.archiveLeadingSeparatorID
+        menu.addItem(sectionSeparator)
         let putBack = NSMenuItem(title: "放回原处", action: #selector(contextPutBack), keyEquivalent: "")
         putBackMenuItem = putBack
         menu.addItem(putBack)
@@ -361,7 +381,9 @@ final class ContentViewController: NSViewController {
         let uninstall = NSMenuItem(title: "卸载…", action: #selector(contextUninstallApps), keyEquivalent: "")
         uninstallMenuItem = uninstall
         menu.addItem(uninstall)
-        menu.addItem(NSMenuItem.separator())
+        let archiveSeparator = NSMenuItem.separator()
+        archiveSeparator.identifier = NewItemMenu.archiveTrailingSeparatorID
+        menu.addItem(archiveSeparator)
         menu.addItem(withTitle: "压缩…", action: #selector(contextCompress), keyEquivalent: "")
         menu.addItem(withTitle: "解压…", action: #selector(contextExtract), keyEquivalent: "")
         menu.addItem(withTitle: "打开压缩包窗口", action: #selector(contextOpenArchive), keyEquivalent: "")
@@ -1440,6 +1462,27 @@ final class ContentViewController: NSViewController {
         }
     }
 
+    /// Creates a new item inside a specific folder (used by the column view's
+    ///「新建」menu, which knows which folder the right-click happened in).
+    func createNewItem(in directory: URL, extensionName: String?) {
+        do {
+            let url = try FileOperations.createNewItem(in: directory, extensionName: extensionName)
+            let created = url.standardizedFileURL
+            if isColumnView {
+                columnBrowser.reloadColumnAfterCreate(directory: directory, url: created)
+                DispatchQueue.main.async { [weak self] in
+                    self?.columnBrowser.beginInlineRename()
+                }
+            } else {
+                refreshAfterCreate(at: created, parent: directory, beginRename: true)
+            }
+            onDirectoryNeedsReload?()
+        } catch {
+            let alert = NSAlert(error: error)
+            alert.runModal()
+        }
+    }
+
     /// After delete/rename of outline rows: drop stale expansions and refresh caches.
     func noteRemovedURLs(_ urls: [URL]) {
         for url in urls {
@@ -2225,6 +2268,12 @@ final class ContentViewController: NSViewController {
         onCopyPathRequest?()
     }
 
+    /// Right-click → 新建 → <type>.
+    @objc private func contextCreateNewItem(_ sender: NSMenuItem) {
+        guard let type = sender.representedObject as? String else { return }
+        onCreateNewItemRequest?(NewItemMenu.extensionName(forType: type))
+    }
+
     @objc private func contextRevealInEnclosingFolder() {
         ensureClickedRowSelected()
         guard let item = selectedItems.first(where: { !$0.isArchiveEntry }) else { return }
@@ -2293,26 +2342,30 @@ extension ContentViewController: NSMenuDelegate {
         rebuildCompareSubmenu()
         compareMenuItem?.isEnabled = canCompare
 
-        var sawArchiveItem = false
+        // 新建 — only in a real folder listing, and only when the user has at
+        // least one New type configured.
+        if let newItemMenuItem {
+            let canCreate = !isShowingSearchResults && !isShowingHistory
+            newItemMenuItem.isHidden = !canCreate
+            newItemMenuItem.isEnabled = canCreate
+            if canCreate {
+                // Rebuild so the list always matches Settings → 新建类型.
+                newItemMenuItem.submenu = NewItemMenu.makeSubmenu(
+                    action: #selector(contextCreateNewItem(_:)),
+                    target: self
+                )
+            }
+        }
+
+        // The archive section is framed by two identified separators, so they
+        // can be hidden together when no archive action applies.
         var archiveLeadingSeparator: NSMenuItem?
         var archiveTrailingSeparator: NSMenuItem?
-
-        for item in menu.items {
-            if item.isSeparatorItem {
-                if !sawArchiveItem {
-                    archiveLeadingSeparator = item
-                } else if archiveTrailingSeparator == nil {
-                    archiveTrailingSeparator = item
-                }
-                continue
-            }
-            switch item.action {
-            case #selector(contextCompress),
-                 #selector(contextExtract),
-                 #selector(contextOpenArchive):
-                sawArchiveItem = true
-            default:
-                break
+        for item in menu.items where item.isSeparatorItem {
+            if item.identifier == NewItemMenu.archiveLeadingSeparatorID {
+                archiveLeadingSeparator = item
+            } else if item.identifier == NewItemMenu.archiveTrailingSeparatorID {
+                archiveTrailingSeparator = item
             }
         }
 

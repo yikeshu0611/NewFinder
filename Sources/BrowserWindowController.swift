@@ -429,6 +429,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         contentController.onGoClipboardPathRequest = { [weak self] in
             self?.goClipboardPath(nil)
         }
+        contentController.onCreateNewItemRequest = { [weak self] extensionName in
+            self?.createNewItem(extensionName: extensionName, openAfterCreate: false)
+        }
         contentController.onHistoryFilterChanged = { [weak self] _ in
             self?.updateStatus(selection: self?.contentController.selectedItems ?? [])
         }

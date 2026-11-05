@@ -10,6 +10,9 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
     var onDirectoryNeedsReload: (() -> Void)?
     /// The user finished editing a name in a column (F2 / right-click → 重命名).
     var onRenameCommit: ((FileItem, String) -> Void)?
+    /// Right-click → 新建: create a new item of the given type
+    /// (`nil` extension = folder) inside the clicked column's folder.
+    var onCreateNewItemRequest: ((URL, String?) -> Void)?
 
     private let scrollView = NSScrollView()
     private let columnsStack = NSStackView()
@@ -18,6 +21,8 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
     private var columnDirectories: [URL] = []
     private var columnTables: [NSTableView] = []
     private var columnSelections: [FileItem?] = []
+    /// Context menu of each column (index matches `columnDirectories`).
+    private var columnMenus: [NSMenu] = []
     private var suppressSelectionEvent = false
     private var columnWidthConstraints: [NSLayoutConstraint] = []
     private var isDragging = false
@@ -88,6 +93,23 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
         } else {
             notifySelection()
         }
+    }
+
+    /// Reloads one column after a new item was created in it and selects the
+    /// new row so the rename editor can start on it.
+    func reloadColumnAfterCreate(directory: URL, url: URL) {
+        let key = directory.standardizedFileURL
+        let created = url.standardizedFileURL
+        childrenCache[key] = nil
+        guard let index = columnDirectories.firstIndex(where: { $0.standardizedFileURL == key }),
+              columnTables.indices.contains(index) else { return }
+        columnTables[index].reloadData()
+        let rows = items(inColumn: index)
+        guard let row = rows.firstIndex(where: { $0.url.standardizedFileURL == created }) else { return }
+        columnSelections[index] = rows[row]
+        applySelectionHighlights()
+        columnTables[index].scrollRowToVisible(row)
+        notifySelection()
     }
 
     var selectedItems: [FileItem] {
@@ -201,6 +223,7 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
                 constraint.isActive = false
             }
             if !columnTables.isEmpty { columnTables.removeLast() }
+            if !columnMenus.isEmpty { columnMenus.removeLast() }
             columnDirectories.removeLast()
             if !columnSelections.isEmpty { columnSelections.removeLast() }
         }
@@ -278,6 +301,21 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
         table.registerForDraggedTypes([.fileURL])
         table.setDraggingSourceOperationMask([.copy, .move, .delete], forLocal: false)
         table.setDraggingSourceOperationMask([.copy, .move], forLocal: true)
+
+        // Each column gets its own context menu so「新建」knows which folder to
+        // create in.
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        menu.delegate = self
+        let newItem = NSMenuItem(title: "新建", action: nil, keyEquivalent: "")
+        newItem.submenu = NewItemMenu.makeSubmenu(
+            action: #selector(columnContextCreateNewItem(_:)),
+            target: self,
+            tag: index
+        )
+        menu.addItem(newItem)
+        table.menu = menu
+        columnMenus.append(menu)
 
         scroll.documentView = table
         container.addSubview(scroll)
@@ -552,6 +590,24 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
         onOpen?(item)
     }
 
+    // MARK: - Context menu
+
+    /// Right-click → 新建 → <type> inside the clicked column's folder.
+    @objc private func columnContextCreateNewItem(_ sender: NSMenuItem) {
+        let columnIndex = sender.tag
+        guard columnIndex >= 0, columnIndex < columnDirectories.count else { return }
+        guard let type = sender.representedObject as? String else { return }
+        onCreateNewItemRequest?(
+            columnDirectories[columnIndex].standardizedFileURL,
+            NewItemMenu.extensionName(forType: type)
+        )
+    }
+
+    /// The column whose menu is about to open (the menu carries its column index).
+    private func columnIndex(for menu: NSMenu) -> Int? {
+        columnMenus.firstIndex { $0 === menu }
+    }
+
     // MARK: - Table
 
     func numberOfRows(in tableView: NSTableView) -> Int {
@@ -774,6 +830,21 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
             }
         }
         return true
+    }
+}
+
+extension ColumnBrowserView: NSMenuDelegate {
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        // Rebuild the submenu so it always matches Settings → 新建类型.
+        guard let index = columnIndex(for: menu),
+              let newItem = menu.items.first(where: { $0.title == "新建" }) else { return }
+        newItem.submenu = NewItemMenu.makeSubmenu(
+            action: #selector(columnContextCreateNewItem(_:)),
+            target: self,
+            tag: index
+        )
+        newItem.isEnabled = true
+        newItem.isHidden = false
     }
 }
 

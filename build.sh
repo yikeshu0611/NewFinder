@@ -36,6 +36,7 @@ SOURCES=(
   "$ROOT_DIR/Sources/StatusBarController.swift"
   "$ROOT_DIR/Sources/SystemUsageMonitor.swift"
   "$ROOT_DIR/Sources/ClickableStatusLabel.swift"
+  "$ROOT_DIR/Sources/NewItemMenu.swift"
   "$ROOT_DIR/Sources/WatchAgentMain.swift"
   "$ROOT_DIR/Sources/Models.swift"
   "$ROOT_DIR/Sources/PerfLog.swift"

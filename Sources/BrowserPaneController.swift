@@ -346,6 +346,9 @@ final class BrowserPaneController: NSViewController, NSSearchFieldDelegate {
         contentController.onToggleFavoritesTopBar = { [weak self] in self?.onToggleFavoritesTopBar?() }
         contentController.onCopyPathRequest = { [weak self] in self?.copyPathClicked() }
         contentController.onGoClipboardPathRequest = { [weak self] in self?.onGoClipboardPath?() }
+        contentController.onCreateNewItemRequest = { [weak self] extensionName in
+            self?.createNewItem(extensionName: extensionName)
+        }
         contentController.onDirectoryNeedsReload = { [weak self] in
             self?.reloadContents()
             self?.onDirectoryNeedsReload?()
@@ -466,6 +469,26 @@ final class BrowserPaneController: NSViewController, NSSearchFieldDelegate {
         onFocus?()
         let selected = contentController.selectedItems.map(\.url)
         onCopyPath?(selected, directory)
+    }
+
+    /// Right-click → 新建: create a new item in this pane's folder and start
+    /// renaming it right away.
+    private func createNewItem(extensionName: String?) {
+        onFocus?()
+        let targetDir = contentController.createTargetDirectory(fallback: directory)
+        do {
+            let url = try FileOperations.createNewItem(in: targetDir, extensionName: extensionName)
+            let created = url.standardizedFileURL
+            reloadContents()
+            contentController.select(urls: [created])
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let item = self.contentController.item(for: created) else { return }
+                self.contentController.beginInlineRename(item)
+            }
+        } catch {
+            let alert = NSAlert(error: error)
+            alert.runModal()
+        }
     }
 
     @objc private func bookmarkClicked() {
