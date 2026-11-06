@@ -7,6 +7,7 @@ import UniformTypeIdentifiers
 final class AppDelegate: NSObject, NSApplicationDelegate {
     static let showUINotification = Notification.Name("com.zhangjing.NewFinder.showUI")
     static let stealFinderNotification = Notification.Name("com.zhangjing.NewFinder.stealFinder")
+    static let showDesktopNotification = Notification.Name("com.zhangjing.NewFinder.showDesktop")
 
     private var windowControllers: [BrowserWindowController] = []
     private var dmgInstallWindows: [DMGInstallWindowController] = []
@@ -42,6 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         NSApp.mainMenu = buildMainMenu()
         installWindowShortcutMonitor()
+        updateTrackpadGestureMonitor()
         StatusBarController.shared.install()
         // Claiming the folder types talks to Launch Services and blocks for
         // 100+ ms — keep it off the launch critical path so the window shows
@@ -153,6 +155,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: Self.stealFinderNotification,
             object: bid
         )
+        center.addObserver(
+            self,
+            selector: #selector(handleExternalShowDesktop(_:)),
+            name: Self.showDesktopNotification,
+            object: bid
+        )
+    }
+
+    @objc private func handleExternalShowDesktop(_ notification: Notification) {
+        performShowDesktop(nil)
     }
 
     @objc private func handleExternalShowUI(_ notification: Notification) {
@@ -1148,6 +1160,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - Trackpad gesture
+
+    /// Starts or stops the three-finger-swipe gesture monitor to match the
+    /// setting in Settings → 快捷键.
+    func updateTrackpadGestureMonitor() {
+        guard AppSettings.shared.threeFingerSwipeShowDesktop else {
+            TrackpadGestureMonitor.stop()
+            return
+        }
+        TrackpadGestureMonitor.start()
+        TrackpadGestureMonitor.shared?.onSwipeDown = { [weak self] in
+            self?.performShowDesktop(nil)
+        }
+    }
+
+    /// 三指向下滑动 → 隐藏所有 App，显示桌面.
+    @objc func performShowDesktop(_ sender: Any?) {
+        // The gesture may fire while NewFinder is in front — the user's own
+        // windows should not be hidden by it.
+        suppressFinderRedirectUntil = Date().addingTimeInterval(1.0)
+        PerfLog.log("[NF-DESKTOP] show desktop requested")
+        ShowDesktopAction.perform { [weak self] in
+            self?.hideOwnWindowsForDesktop()
+        }
+        PerfLog.log("[NF-DESKTOP] done, frontmost=\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?")")
+    }
+
+    /// Pushes NewFinder's own windows out of the way so the desktop is
+    /// visible. They are ordered out, not closed, so the session survives.
+    private func hideOwnWindowsForDesktop() {
+        for controller in windowControllers {
+            guard let window = controller.window else { continue }
+            window.orderOut(nil)
+        }
+        NSApp.hide(nil)
+    }
+
     /// Shared chrome menu for the toolbar gear and status-item (显示 / 窗口 / 缩放 / 更新 / 设置).
     /// - Parameters:
     ///   - includeShowAndWindows: status-item keeps「显示 / 窗口」; in-window gear omits them.
@@ -1203,6 +1252,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: ""
         )
         update.target = self
+
+        // Shows the desktop — the same action the three-finger swipe fires.
+        // Useful on a desktop Mac, and it makes the feature reachable when the
+        // gesture is not available (no trackpad, or no Input Monitoring
+        // permission).
+        let showDesktop = menu.addItem(
+            withTitle: "显示桌面",
+            action: #selector(performShowDesktop(_:)),
+            keyEquivalent: ""
+        )
+        showDesktop.target = self
 
         let settings = menu.addItem(
             withTitle: "设置",

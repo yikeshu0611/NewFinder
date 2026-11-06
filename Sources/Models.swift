@@ -222,6 +222,7 @@ final class AppSettings {
         static let recentOpenHistory = "recentOpenHistory"
         static let skipInitialSort = "skipInitialSort"
         static let showLoadTime = "showLoadTime"
+        static let threeFingerSwipeShowDesktop = "threeFingerSwipeShowDesktop"
     }
 
     /// Content zoom 30%…500%. Default 100. Adjusted via menu-bar slider.
@@ -286,6 +287,16 @@ final class AppSettings {
     var disableCommandHHide: Bool {
         get { defaults.bool(forKey: Keys.disableCommandHHide) }
         set { defaults.set(newValue, forKey: Keys.disableCommandHHide) }
+    }
+
+    /// Swipe down with three fingers on the trackpad to hide every app and
+    /// show the desktop.
+    ///
+    /// Off by default — it needs the Input Monitoring permission, and on a
+    /// desktop Mac with a mouse it is never used.
+    var threeFingerSwipeShowDesktop: Bool {
+        get { defaults.bool(forKey: Keys.threeFingerSwipeShowDesktop) }
+        set { defaults.set(newValue, forKey: Keys.threeFingerSwipeShowDesktop) }
     }
 
     /// Built-in New types (canonical keys). Display name for `dir` is「文件夹」.

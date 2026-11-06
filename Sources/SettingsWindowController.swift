@@ -21,18 +21,23 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private var wechatDualOpenStatusLabel: NSTextField!
     private var disableCommandMCheckbox: NSButton!
     private var disableCommandHCheckbox: NSButton!
+    private var threeFingerSwipeCheckbox: NSButton!
+    private var gesturePermissionLabel: NSTextField!
     private var skipInitialSortCheckbox: NSButton!
     private var showLoadTimeCheckbox: NSButton!
     private var pendingRelease: UpdateChecker.ReleaseInfo?
+    /// Polls the「辅助功能」permission so the gesture hint stays accurate.
+    private var permissionTimer: Timer?
 
     private init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 540),
-            styleMask: [.titled, .closable],
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 620),
+            styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "NewFinder 设置"
+        window.minSize = NSSize(width: 560, height: 420)
         window.center()
         super.init(window: window)
         configure()
@@ -45,6 +50,17 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     func show() {
         reloadValues()
+        startPermissionPolling()
+        // Stop polling once the window is closed — the timer would otherwise
+        // keep the controller alive for as long as the app runs.
+        if window?.isVisible != true {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(settingsWindowClosed),
+                name: NSWindow.willCloseNotification,
+                object: window
+            )
+        }
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -63,6 +79,15 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         window?.isVisible == true
     }
 
+    @objc private func settingsWindowClosed() {
+        stopPermissionPolling()
+        NotificationCenter.default.removeObserver(
+            self,
+            name: NSWindow.willCloseNotification,
+            object: window
+        )
+    }
+
     private func configure() {
         guard let content = window?.contentView else { return }
 
@@ -73,17 +98,17 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
         let generalItem = NSTabViewItem(identifier: "general")
         generalItem.label = "常规"
-        generalItem.view = makeGeneralTab()
+        generalItem.view = scrollable(makeGeneralTab())
         tabView.addTabViewItem(generalItem)
 
         let shortcutsItem = NSTabViewItem(identifier: "shortcuts")
         shortcutsItem.label = "快捷键"
-        shortcutsItem.view = makeShortcutsTab()
+        shortcutsItem.view = scrollable(makeShortcutsTab())
         tabView.addTabViewItem(shortcutsItem)
 
         let toolsItem = NSTabViewItem(identifier: "tools")
         toolsItem.label = "工具"
-        toolsItem.view = makeToolsTab()
+        toolsItem.view = scrollable(makeToolsTab())
         tabView.addTabViewItem(toolsItem)
 
         NSLayoutConstraint.activate([
@@ -92,6 +117,32 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             tabView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
             tabView.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12)
         ])
+    }
+
+    /// Wraps a tab's content in a scroll view, so a tab that is taller than the
+    /// window (the shortcut tab grew when the trackpad gesture was added) can
+    /// still be reached by scrolling.
+    private func scrollable(_ view: NSView) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+
+        // The flag has to be cleared *before* the view becomes the document
+        // view — otherwise the clip view installs its own (autoresizing)
+        // width constraint, which fights the ones added below.
+        view.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = view
+
+        NSLayoutConstraint.activate([
+            // The document view spans the scroll view's width, so its content
+            // is never squeezed. Its height stays intrinsic, which is what
+            // makes the scroll view scroll.
+            view.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            view.topAnchor.constraint(equalTo: scroll.contentView.topAnchor)
+        ])
+        return scroll
     }
 
     private func makeGeneralTab() -> NSView {
@@ -189,6 +240,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 16),
             stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
             stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -16),
             typeRowsStack.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
         return container
@@ -228,7 +280,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 16),
             stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16)
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -16)
         ])
         return container
     }
@@ -308,10 +361,53 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         )
         stack.addArrangedSubview(disableCommandHCheckbox)
 
+        let gestureTitle = NSTextField(labelWithString: "触控板手势")
+        gestureTitle.font = .boldSystemFont(ofSize: 13)
+        stack.addArrangedSubview(gestureTitle)
+
+        let gestureHint = NSTextField(wrappingLabelWithString: "三指向下滑动触控板，隐藏所有 App 并显示桌面。需要「辅助功能」和「输入监控」权限才能识别手势；若无法触发，请到「系统设置 → 隐私与安全性」中为 NewFinder 开启这两项权限。")
+        gestureHint.font = .systemFont(ofSize: 11)
+        gestureHint.textColor = .secondaryLabelColor
+        gestureHint.preferredMaxLayoutWidth = 500
+        stack.addArrangedSubview(gestureHint)
+
+        threeFingerSwipeCheckbox = NSButton(
+            checkboxWithTitle: "三指向下滑动 → 隐藏所有 App，显示桌面",
+            target: self,
+            action: #selector(toggleThreeFingerSwipe)
+        )
+        stack.addArrangedSubview(threeFingerSwipeCheckbox)
+
+        let gestureRow = NSStackView()
+        gestureRow.orientation = .horizontal
+        gestureRow.spacing = 8
+        gestureRow.alignment = .centerY
+        let openListenSettings = NSButton(
+            title: "打开「辅助功能」设置…",
+            target: self,
+            action: #selector(openAccessibilitySettings)
+        )
+        openListenSettings.bezelStyle = .rounded
+        let openInputMonitoringSettings = NSButton(
+            title: "打开「输入监控」设置…",
+            target: self,
+            action: #selector(openInputMonitoringSettings)
+        )
+        openInputMonitoringSettings.bezelStyle = .rounded
+        gesturePermissionLabel = NSTextField(labelWithString: "")
+        gesturePermissionLabel.font = .systemFont(ofSize: 11)
+        gesturePermissionLabel.textColor = .secondaryLabelColor
+        gestureRow.addArrangedSubview(openListenSettings)
+        gestureRow.addArrangedSubview(openInputMonitoringSettings)
+        gestureRow.addArrangedSubview(gesturePermissionLabel)
+        stack.addArrangedSubview(gestureRow)
+        updateGesturePermissionLabel()
+
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 16),
             stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
             stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -16),
             list.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
         return container
@@ -365,6 +461,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         launchAtLoginCheckbox.state = settings.launchAtLogin ? .on : .off
         disableCommandMCheckbox.state = settings.disableCommandMMinimize ? .on : .off
         disableCommandHCheckbox.state = settings.disableCommandHHide ? .on : .off
+        threeFingerSwipeCheckbox.state = settings.threeFingerSwipeShowDesktop ? .on : .off
+        updateGesturePermissionLabel()
         skipInitialSortCheckbox.state = settings.skipInitialSort ? .on : .off
         showLoadTimeCheckbox.state = settings.showLoadTime ? .on : .off
         versionLabel.stringValue = UpdateChecker.currentVersion
@@ -686,6 +784,66 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     @objc private func toggleDisableCommandH() {
         settings.disableCommandHHide = disableCommandHCheckbox.state == .on
         notifyChange()
+    }
+
+    @objc private func toggleThreeFingerSwipe() {
+        settings.threeFingerSwipeShowDesktop = threeFingerSwipeCheckbox.state == .on
+        AppDelegate.shared.updateTrackpadGestureMonitor()
+        updateGesturePermissionLabel()
+        notifyChange()
+    }
+
+    /// Opens「系统设置 → 隐私与安全性 → 辅助功能」so the user can grant the
+    /// permission the gesture needs.
+    @objc private func openAccessibilitySettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        ) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    /// Opens「系统设置 → 隐私与安全性 → 输入监控」so the user can grant the
+    /// permission that lets the tap *receive* the trackpad frames.
+    @objc private func openInputMonitoringSettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
+        ) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    /// Shows whether the gesture can currently be recognised.
+    ///
+    /// Two permissions are needed:「辅助功能」to create the event tap and
+    /// 「输入监控」to actually receive the trackpad frames.
+    private func updateGesturePermissionLabel() {
+        guard let label = gesturePermissionLabel else { return }
+        let hasAccessibility = NFHasAccessibilityAccess()
+        let hasInputMonitoring = NFHasListenEventAccess()
+
+        if hasAccessibility && hasInputMonitoring {
+            label.stringValue = "已获得「辅助功能」和「输入监控」权限，手势可用"
+            label.textColor = .systemGreen
+        } else if hasAccessibility {
+            label.stringValue = "还需「输入监控」权限，手势暂不可用"
+            label.textColor = .systemOrange
+        } else {
+            label.stringValue = "还需「辅助功能」权限，手势暂不可用"
+            label.textColor = .systemOrange
+        }
+    }
+
+    /// The permission is granted in System Settings, so the label is polled
+    /// while the window is open instead of only at launch.
+    private func startPermissionPolling() {
+        permissionTimer?.invalidate()
+        permissionTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+            self?.updateGesturePermissionLabel()
+        }
+    }
+
+    private func stopPermissionPolling() {
+        permissionTimer?.invalidate()
+        permissionTimer = nil
     }
 
     @objc private func toggleSkipInitialSort() {

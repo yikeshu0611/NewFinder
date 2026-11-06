@@ -37,6 +37,9 @@ SOURCES=(
   "$ROOT_DIR/Sources/SystemUsageMonitor.swift"
   "$ROOT_DIR/Sources/ClickableStatusLabel.swift"
   "$ROOT_DIR/Sources/NewItemMenu.swift"
+  "$ROOT_DIR/Sources/TrackpadGestureMonitor.swift"
+  "$ROOT_DIR/Sources/SwipeDownDetector.swift"
+  "$ROOT_DIR/Sources/ShowDesktopAction.swift"
   "$ROOT_DIR/Sources/WatchAgentMain.swift"
   "$ROOT_DIR/Sources/Models.swift"
   "$ROOT_DIR/Sources/PerfLog.swift"
@@ -76,6 +79,8 @@ swiftc \
   -whole-module-optimization \
   -target arm64-apple-macos13.0 \
   "${SOURCES[@]}" \
+  -import-objc-header "$ROOT_DIR/Sources/NativeHelpers.h" \
+  "$ROOT_DIR/Sources/NativeHelpers.m" \
   -framework AppKit \
   -framework QuickLookUI \
   -framework ServiceManagement \
@@ -92,6 +97,8 @@ if [[ "$(uname -m)" == "arm64" ]]; then
     -whole-module-optimization \
     -target x86_64-apple-macos13.0 \
     "${SOURCES[@]}" \
+    -import-objc-header "$ROOT_DIR/Sources/NativeHelpers.h" \
+    "$ROOT_DIR/Sources/NativeHelpers.m" \
     -framework AppKit \
     -framework QuickLookUI \
     -framework ServiceManagement \
@@ -111,7 +118,35 @@ mkdir -p "$WATCH_APP/Contents/MacOS"
 cp "$ROOT_DIR/WatchInfo.plist" "$WATCH_APP/Contents/Info.plist"
 cp "$APP_DIR/Contents/MacOS/$APP_NAME" "$WATCH_APP/Contents/MacOS/NewFinderWatch"
 
-codesign --force --deep --sign - "$APP_DIR" 2>/dev/null || true
+# Sign with the stable Developer ID when one is available.
+#
+# The ad-hoc signature (`-`) changes on every build, which makes macOS treat
+# the app as a *different* app and drop the permissions the user granted
+# (辅助功能 / 输入监控) — the trackpad gesture would stop working after every
+# rebuild. A Developer ID signature is stable, so the grants survive.
+#
+# The identity is addressed by its SHA hash: several certificates share the
+# same common name, and codesign refuses an ambiguous name.
+SIGN_IDENTITY="${NF_CODESIGN_IDENTITY:-}"
+if [[ -z "$SIGN_IDENTITY" ]]; then
+  SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+    | grep "3rd Party Mac Developer Application" \
+    | head -1 \
+    | grep -oE '[A-F0-9]{40}' \
+    | head -1)"
+fi
+
+if [[ -n "$SIGN_IDENTITY" ]]; then
+  if codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_DIR" 2>/dev/null; then
+    echo "Signed with Developer ID: $SIGN_IDENTITY"
+  else
+    codesign --force --deep --sign - "$APP_DIR" 2>/dev/null || true
+    echo "Signed ad-hoc (Developer ID signing failed — permissions may reset on rebuild)"
+  fi
+else
+  codesign --force --deep --sign - "$APP_DIR" 2>/dev/null || true
+  echo "Signed ad-hoc (no Developer ID found — permissions may reset on rebuild)"
+fi
 
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$ROOT_DIR/Info.plist")"
 rm -f "$DMG_PATH" "$DIST_DIR/${APP_NAME}-${VERSION}.dmg"
