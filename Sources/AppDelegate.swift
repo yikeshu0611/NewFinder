@@ -793,6 +793,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        // A click on the blank desktop activates Finder but produces no
+        // context at all — no selection, no window. Following the normal path
+        // would end in the "nothing to show" fallback and open the Desktop
+        // folder in NF, so a stray click on the desktop would pop a window
+        // open. The click is classified before any focus is stolen.
+        //
+        // The throttle IS applied here: the Finder poll timer runs every
+        // 120 ms, and without a throttle the same click would be classified
+        // (and logged) over and over while the pointer stayed still.
+        if frontIsFinder && isBlankDesktopClick() {
+            isRedirectingFinder = false
+            // macOS sends several activation notifications for one click, and
+            // the poll timer adds more — only report the first one.
+            let isRepeat = FinderActivationIntent.isRepeatOfRecentBlankDesktopClick()
+            lastFinderRedirectAt = Date()
+            suppressFinderRedirectUntil = Date().addingTimeInterval(0.5)
+            FinderActivationIntent.noteBlankDesktopClickReported()
+            if !isRepeat {
+                PerfLog.log("[NF-FINDER] blank desktop click — not redirecting")
+            }
+            return
+        }
+
         isRedirectingFinder = true
         lastFinderRedirectAt = Date()
         // Closing Finder / activating NF can re-fire Finder notifications — pause briefly.
@@ -837,8 +860,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     return
                 }
 
-                self.applyFinderContext(again)
-                self.forceActivateNewFinder()
+                // `applyFinderContext` returns false when the screen belongs to
+                // Finder — NF must not steal the focus back in that case.
+                let shouldFocusNF = self.applyFinderContext(again)
+                if shouldFocusNF {
+                    self.forceActivateNewFinder()
+                }
                 if again.selectURLs.isEmpty && again.folderURL == nil,
                    self.finderLooksLikeItHasBrowserWindows() || self.finderHasOpenWindows() {
                     self.noteFinderAutomationFailureIfNeeded()
@@ -902,22 +929,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .activate(options: [.activateIgnoringOtherApps])
     }
 
+    /// True when the click that just activated Finder landed on the blank
+    /// desktop rather than on something that carries a folder to show.
+    ///
+    /// Only the blank desktop is excluded — a click on a desktop icon, on the
+    /// Dock, or in a Finder window keeps its current behaviour.
+    private func isBlankDesktopClick() -> Bool {
+        FinderActivationIntent.currentIntent() == .blankDesktop
+    }
+
     /// Close Finder windows except those on `/Volumes/` (DMG installers, USB, etc.).
     /// Always filter by path — never `close every window` while a mount may still be appearing.
     private func closeFinderWindowsPreservingVolumes() {
         _ = runAppleScript(FinderVolumeGuard.closeNonVolumeWindowsScript)
     }
 
-    private func applyFinderContext(_ context: FinderContext) {
+    /// Applies a Finder context to NF.
+    ///
+    /// Returns `true` when NF should be brought to the front, `false` when the
+    /// screen belongs to Finder and must be handed back to it.
+    @discardableResult
+    private func applyFinderContext(_ context: FinderContext) -> Bool {
         if finderContextInvolvesMountedVolume(context) {
             reactivateFinder()
-            return
+            return false
         }
         // Dock / Finder Trash → open NewFinder's trash UI.
         if let folder = context.folderURL, FileOperations.isTrashDirectory(folder) {
             openTrash(at: folder)
             forceActivateNewFinder()
-            return
+            return true
         }
         if !context.selectURLs.isEmpty,
            context.selectURLs.contains(where: { FileOperations.isURLInTrash($0) }) {
@@ -928,7 +969,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             openTrash(at: trash)
             reveal(context.selectURLs)
             forceActivateNewFinder()
-            return
+            return true
         }
         if !context.selectURLs.isEmpty {
             reveal(context.selectURLs)
@@ -938,10 +979,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if let folder = context.folderURL {
             openNewWindow(at: folder)
         } else {
-            let desktop = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop")
-            openNewWindow(at: desktop)
+            // No selection and no folder — there is nothing to show. This used
+            // to open the Desktop folder, which meant that a click on the
+            // blank desktop (which produces exactly this empty context) popped
+            // an NF window open. Handing the screen back to Finder is the
+            // right answer: the user clicked the desktop, so the desktop is
+            // what they want.
+            PerfLog.log("[NF-FINDER] empty context — keeping Finder")
+            reactivateFinder()
+            return false
         }
         forceActivateNewFinder()
+        return true
     }
 
     /// Open the Trash in a new tab (or focus an existing Trash tab) — never replace the current tab.
