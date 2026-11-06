@@ -10,8 +10,9 @@ import ApplicationServices
 /// "no context" as "open the Desktop folder", so a stray click on the desktop
 /// popped an NF window open.
 ///
-/// The distinction is made from the click position, via the accessibility hit
-/// test — the same mechanism the system uses to route a click to its target:
+/// The distinction is made from the click itself. A global mouse monitor
+/// records where the user actually clicked, and the accessibility hit test
+/// says what was under the pointer at that exact spot:
 ///
 /// * a click **on the Dock** is deliberate (the Finder icon, a stack, or the
 ///   Desktop folder) — the redirect must follow through;
@@ -20,12 +21,16 @@ import ApplicationServices
 /// * a click **on the blank desktop** hits the full-screen desktop container —
 ///   there is nothing to show, so NF must stay out of the way.
 ///
+/// Recording the click is much more reliable than asking where the pointer
+/// happens to be when an activation notification arrives: by then the user
+/// may have moved the mouse, and the notification may even be about a
+/// different window altogether.
+///
 /// IMPORTANT: the hit test is performed **per application** (Finder, Dock),
 /// never system-wide. A system-wide hit test returns whichever overlay window
 /// happens to be on top — an IDE, a panel, another app — which would make the
 /// classification meaningless. App-scoped hit tests always report the element
-/// that belongs to the app that was asked about, and they are what the
-/// classification actually needs.
+/// that belongs to the app that was asked about.
 ///
 /// IMPORTANT: the accessibility API uses **Quartz coordinates** (origin at the
 /// top-left of the primary display), while `NSEvent.mouseLocation` uses
@@ -53,53 +58,98 @@ enum FinderActivationIntent {
         case content
     }
 
-    // MARK: - Cache
+    /// A click the user made, and what it landed on.
+    struct Click {
+        /// The click position, in Quartz coordinates.
+        let location: CGPoint
+        /// What the click landed on.
+        let intent: Intent
+        /// When the click happened.
+        let date: Date
+    }
 
-    /// The last classification, together with the mouse position it was made
-    /// for. The Finder poll timer runs every 120 ms and would otherwise redo
-    /// the same hit test over and over — and log the same line over and over.
-    private static var cachedPosition: NSPoint?
-    private static var cachedIntent: Intent?
-    private static var cachedAt: Date?
+    /// How long a click stays relevant. Long enough to cover the delay
+    /// between the click and the activation notification it causes, short
+    /// enough that a click from a while ago does not classify a later event.
+    static let clickValidity: TimeInterval = 2.0
 
-    /// How long a classification stays valid for the same mouse position.
-    private static let cacheLifetime: TimeInterval = 0.8
-
-    /// How far the mouse may drift before the cached answer is discarded.
-    private static let cachePositionTolerance: CGFloat = 2
+    /// The most recent click, if it is one.
+    private static var lastClick: Click?
 
     /// The position and time of the last blank-desktop click that was already
     /// reported, so the burst of activation notifications that macOS sends
     /// for a single click only produces one report.
-    private static var lastBlankDesktopPosition: NSPoint?
+    private static var lastBlankDesktopPosition: CGPoint?
     private static var lastBlankDesktopAt: Date?
 
     /// How long the same spot counts as "the same click".
     private static let blankDesktopRepeatWindow: TimeInterval = 3
 
+    /// The monitor that watches for clicks. Held so it can be removed again.
+    private static var globalMonitor: Any?
+    private static var localMonitor: Any?
+
     // MARK: - Public API
 
-    /// Classifies the click that is currently under the mouse pointer.
+    /// Starts watching for clicks.
     ///
-    /// Called right after Finder was activated, so the pointer is still where
-    /// the user clicked.
-    static func currentIntent() -> Intent {
-        let mouse = quartzMouseLocation()
+    /// Safe to call repeatedly — only the first call installs the monitors.
+    static func startMonitoringClicks() {
+        guard globalMonitor == nil, localMonitor == nil else { return }
 
-        if let position = cachedPosition,
-           let intent = cachedIntent,
-           let at = cachedAt,
-           Date().timeIntervalSince(at) < cacheLifetime,
-           abs(position.x - mouse.x) < cachePositionTolerance,
-           abs(position.y - mouse.y) < cachePositionTolerance {
-            return intent
+        let mask: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown]
+
+        // Global — clicks that go to other applications (the desktop, the
+        // Dock, a Finder window). This is the interesting case.
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { event in
+            record(event)
         }
 
-        let intent = classify(at: mouse)
-        cachedPosition = mouse
-        cachedIntent = intent
-        cachedAt = Date()
-        return intent
+        // Local — clicks that land in NewFinder's own windows. They do not
+        // cause a Finder activation, but recording them keeps the state
+        // consistent (a stale click must not classify a later event).
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { event in
+            record(event)
+            return event
+        }
+    }
+
+    /// Stops watching for clicks.
+    static func stopMonitoringClicks() {
+        if let globalMonitor {
+            NSEvent.removeMonitor(globalMonitor)
+            self.globalMonitor = nil
+        }
+        if let localMonitor {
+            NSEvent.removeMonitor(localMonitor)
+            self.localMonitor = nil
+        }
+        lastClick = nil
+    }
+
+    /// The most recent click, if it is still recent enough to be relevant.
+    static func recentClick(now: Date = Date()) -> Click? {
+        guard let lastClick else { return nil }
+        guard now.timeIntervalSince(lastClick.date) < clickValidity else { return nil }
+        return lastClick
+    }
+
+    /// The intent of the click that is happening right now, if there is one.
+    ///
+    /// Returns `nil` when Finder was activated *without* a click — an app
+    /// asking Finder to reveal a file, for example. Such an activation must
+    /// always be redirected, whatever the mouse happens to be resting on.
+    static func currentClickIntent(now: Date = Date()) -> Intent? {
+        guard let lastClick, now.timeIntervalSince(lastClick.date) < clickValidity else {
+            return nil
+        }
+        return lastClick.intent
+    }
+
+    /// Forgets the recorded click — used when a redirect has been handled, so
+    /// that the same click is not classified twice.
+    static func clearLastClick() {
+        lastClick = nil
     }
 
     /// True when the current blank-desktop click has already been reported.
@@ -112,52 +162,100 @@ enum FinderActivationIntent {
         guard let position = lastBlankDesktopPosition, let at = lastBlankDesktopAt else {
             return false
         }
-        let mouse = quartzMouseLocation()
+        guard let click = recentClick() else { return false }
         return Date().timeIntervalSince(at) < blankDesktopRepeatWindow
-            && abs(position.x - mouse.x) < cachePositionTolerance
-            && abs(position.y - mouse.y) < cachePositionTolerance
+            && abs(position.x - click.location.x) < 2
+            && abs(position.y - click.location.y) < 2
     }
 
     /// Remembers a blank-desktop click as reported.
     static func noteBlankDesktopClickReported() {
-        lastBlankDesktopPosition = quartzMouseLocation()
+        guard let click = recentClick() else { return }
+        lastBlankDesktopPosition = click.location
         lastBlankDesktopAt = Date()
+    }
+
+    /// Classifies the click that is currently under the mouse pointer.
+    ///
+    /// Used when no click was recorded (for instance when Finder was
+    /// activated by something other than a click) — the pointer position is
+    /// the best guess available then.
+    static func currentIntent() -> Intent {
+        if let click = recentClick() {
+            return click.intent
+        }
+        return classify(at: quartzMouseLocation())
+    }
+
+    // MARK: - Recording
+
+    private static func record(_ event: NSEvent) {
+        let location = quartzLocation(of: event)
+        let intent = classify(at: location)
+        lastClick = Click(location: location, intent: intent, date: Date())
     }
 
     // MARK: - Classification
 
     private static func classify(at point: CGPoint) -> Intent {
-        // The Dock sits on top of the desktop, so it has to be asked first —
-        // otherwise a Dock click would be reported as a click on the blank
-        // desktop underneath it.
-        if let dock = applicationElement(for: "com.apple.dock"),
-           let hit = hitTest(application: dock, at: point),
-           hit.isDockItem {
-            return .dock
-        }
+        let dockHit = applicationElement(for: "com.apple.dock")
+            .flatMap { hitTest(application: $0, at: point) }
+        let finderHit = applicationElement(for: "com.apple.finder")
+            .flatMap { hitTest(application: $0, at: point) }
 
-        guard let finder = applicationElement(for: "com.apple.finder"),
-              let hit = hitTest(application: finder, at: point) else {
-            // Without a hit test nothing can be said — let the normal path run.
-            return .content
-        }
+        let displaySize = displayBounds(containing: point)?.size
+            ?? NSScreen.main?.frame.size
+            ?? .zero
 
-        if hit.isDesktopIcon {
-            return .content
-        }
-        if hit.coversScreen(at: point) {
-            return .blankDesktop
-        }
-        // Anything else (a Finder window, an unknown element) — follow the
-        // normal path and let the Finder context decide.
-        return .content
+        return intent(dockHit: dockHit, finderHit: finderHit, displaySize: displaySize)
     }
 
     // MARK: - Coordinates
 
-    /// The mouse position in Quartz coordinates (origin at the top-left of the
-    /// primary display), which is the space the accessibility API uses.
+    /// The position of a mouse event, in Quartz coordinates (origin at the
+    /// top-left of the primary display), which is the space the accessibility
+    /// API uses.
+    private static func quartzLocation(of event: NSEvent) -> CGPoint {
+        // A global monitor reports an event that belongs to no window, and
+        // `locationInWindow` is then in screen (Cocoa) coordinates. A local
+        // monitor reports window-relative coordinates instead, so the screen
+        // position is read from the current mouse location — the event is
+        // handled as the click happens, so the two agree.
+        let cocoa: NSPoint
+        if event.window == nil {
+            cocoa = event.locationInWindow
+        } else {
+            cocoa = NSEvent.mouseLocation
+        }
+        return quartzLocation(cocoa: cocoa)
+    }
+
+    /// Converts a Cocoa point (origin at the bottom-left of the primary
+    /// display) to Quartz coordinates (origin at the top-left).
+    ///
+    /// The two spaces share the x axis, so only y has to be flipped: the
+    /// Quartz y is the distance from the top of the primary display.
+    /// `primary.frame.maxY` is that distance for the bottom edge of the
+    /// primary display, and the same formula holds for every other display —
+    /// Cocoa already encodes its position in the frame.
+    ///
+    /// - Parameters:
+    ///   - cocoa: the point in Cocoa (bottom-left origin) coordinates.
+    ///   - primaryMaxY: the height of the primary display, in points.
+    static func quartzLocation(cocoa: NSPoint, primaryMaxY: CGFloat) -> CGPoint {
+        CGPoint(x: cocoa.x, y: primaryMaxY - cocoa.y)
+    }
+
+    private static func quartzLocation(cocoa: NSPoint) -> CGPoint {
+        guard let primary = NSScreen.screens.first else {
+            return CGPoint(x: cocoa.x, y: cocoa.y)
+        }
+        return quartzLocation(cocoa: cocoa, primaryMaxY: primary.frame.maxY)
+    }
+
+    /// The mouse position in Quartz coordinates.
     private static func quartzMouseLocation() -> CGPoint {
+        // `CGEvent.location` is already in Quartz coordinates.
         CGEvent(source: nil)?.location ?? .zero
     }
 
@@ -192,7 +290,7 @@ enum FinderActivationIntent {
     }
 
     /// The result of an accessibility hit test.
-    private struct Hit {
+    struct Hit {
         /// The element's role — `AXImage` for a desktop icon.
         let role: String
         /// The element's sub-role, when it has one.
@@ -221,15 +319,45 @@ enum FinderActivationIntent {
 
         /// True when the element is the desktop background — the container
         /// that covers the whole display.
-        func coversScreen(at point: CGPoint) -> Bool {
+        func coversScreen(displaySize: CGSize) -> Bool {
             guard role == "AXGroup" || role == "AXScrollArea" || role == "AXUnknown" else {
                 return false
             }
-            guard let bounds = displayBounds(containing: point), bounds.width > 0 else {
-                return false
-            }
-            return frame.width >= bounds.width * 0.9 && frame.height >= bounds.height * 0.9
+            guard displaySize.width > 0, displaySize.height > 0 else { return false }
+            return frame.width >= displaySize.width * 0.9 && frame.height >= displaySize.height * 0.9
         }
+    }
+
+    /// Decides the intent from the elements that were hit.
+    ///
+    /// Split out from `classify(at:)` so the decision can be exercised
+    /// without a live Finder — the hit testing needs a running system, the
+    /// decision does not.
+    ///
+    /// - Parameters:
+    ///   - dockHit: what the Dock's hit test found, if anything.
+    ///   - finderHit: what Finder's hit test found, if anything.
+    ///   - displaySize: the size of the display the click was on.
+    static func intent(dockHit: Hit?, finderHit: Hit?, displaySize: CGSize) -> Intent {
+        // The Dock sits on top of the desktop, so it has to be asked first —
+        // otherwise a Dock click would be reported as a click on the blank
+        // desktop underneath it.
+        if let dockHit, dockHit.isDockItem {
+            return .dock
+        }
+        guard let finderHit else {
+            // Without a hit test nothing can be said — let the normal path run.
+            return .content
+        }
+        if finderHit.isDesktopIcon {
+            return .content
+        }
+        if finderHit.coversScreen(displaySize: displaySize) {
+            return .blankDesktop
+        }
+        // Anything else (a Finder window, an unknown element) — follow the
+        // normal path and let the Finder context decide.
+        return .content
     }
 
     /// Runs the accessibility hit test at a Quartz point, restricted to one app.

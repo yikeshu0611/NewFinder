@@ -61,6 +61,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.installWatchAgent()
         }
         startFinderRedirectObserver()
+        FinderActivationIntent.startMonitoringClicks()
         registerExternalShowObservers()
 
         let stealFinder = CommandLine.arguments.contains("--steal-finder")
@@ -799,10 +800,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // folder in NF, so a stray click on the desktop would pop a window
         // open. The click is classified before any focus is stolen.
         //
+        // Only a *user click* can be a click on the blank desktop. Finder
+        // being activated programmatically — an app revealing a file — must be
+        // redirected even when the mouse rests on a blank spot, so a missing
+        // click falls through to the normal path.
+        //
         // The throttle IS applied here: the Finder poll timer runs every
         // 120 ms, and without a throttle the same click would be classified
         // (and logged) over and over while the pointer stayed still.
-        if frontIsFinder && isBlankDesktopClick() {
+        let intent = FinderActivationIntent.currentClickIntent() ?? .content
+        if frontIsFinder, intent == .blankDesktop {
             isRedirectingFinder = false
             // macOS sends several activation notifications for one click, and
             // the poll timer adds more — only report the first one.
@@ -862,10 +869,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
                 // `applyFinderContext` returns false when the screen belongs to
                 // Finder — NF must not steal the focus back in that case.
-                let shouldFocusNF = self.applyFinderContext(again)
+                let shouldFocusNF = self.applyFinderContext(again, intent: intent)
                 if shouldFocusNF {
                     self.forceActivateNewFinder()
                 }
+                // The click has been dealt with — a later activation must not
+                // be classified by it.
+                FinderActivationIntent.clearLastClick()
                 if again.selectURLs.isEmpty && again.folderURL == nil,
                    self.finderLooksLikeItHasBrowserWindows() || self.finderHasOpenWindows() {
                     self.noteFinderAutomationFailureIfNeeded()
@@ -874,7 +884,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        applyFinderContext(context)
+        applyFinderContext(context, intent: intent)
+        // The click has been dealt with — a later activation must not be
+        // classified by it.
+        FinderActivationIntent.clearLastClick()
         isRedirectingFinder = false
     }
 
@@ -929,15 +942,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .activate(options: [.activateIgnoringOtherApps])
     }
 
-    /// True when the click that just activated Finder landed on the blank
-    /// desktop rather than on something that carries a folder to show.
-    ///
-    /// Only the blank desktop is excluded — a click on a desktop icon, on the
-    /// Dock, or in a Finder window keeps its current behaviour.
-    private func isBlankDesktopClick() -> Bool {
-        FinderActivationIntent.currentIntent() == .blankDesktop
-    }
-
     /// Close Finder windows except those on `/Volumes/` (DMG installers, USB, etc.).
     /// Always filter by path — never `close every window` while a mount may still be appearing.
     private func closeFinderWindowsPreservingVolumes() {
@@ -946,10 +950,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Applies a Finder context to NF.
     ///
-    /// Returns `true` when NF should be brought to the front, `false` when the
-    /// screen belongs to Finder and must be handed back to it.
+    /// - Parameter intent: what the click that caused this was. The empty
+    ///   context is ambiguous on its own: a click on the Dock's Finder icon
+    ///   produces exactly the same "nothing selected, no window" state as a
+    ///   click on the blank desktop. The Dock click must open NF, the desktop
+    ///   click must not.
+    /// - Returns: `true` when NF should be brought to the front, `false` when the
+    ///   screen belongs to Finder and must be handed back to it.
     @discardableResult
-    private func applyFinderContext(_ context: FinderContext) -> Bool {
+    private func applyFinderContext(
+        _ context: FinderContext,
+        intent: FinderActivationIntent.Intent = .content
+    ) -> Bool {
         if finderContextInvolvesMountedVolume(context) {
             reactivateFinder()
             return false
@@ -978,13 +990,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyBrowser()?.window?.makeKeyAndOrderFront(nil)
         } else if let folder = context.folderURL {
             openNewWindow(at: folder)
+        } else if intent == .dock {
+            // A Dock click with no window and no selection — the user asked
+            // for Finder, and NF is the Finder replacement, so NF opens.
+            openNewWindow(
+                at: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop")
+            )
         } else {
-            // No selection and no folder — there is nothing to show. This used
-            // to open the Desktop folder, which meant that a click on the
-            // blank desktop (which produces exactly this empty context) popped
-            // an NF window open. Handing the screen back to Finder is the
-            // right answer: the user clicked the desktop, so the desktop is
-            // what they want.
+            // No selection and no folder, and the click was not on the Dock —
+            // it was on the blank desktop. There is nothing to show, and
+            // opening the Desktop folder here used to pop an NF window open
+            // for every stray click on the desktop. Handing the screen back to
+            // Finder is the right answer: the user clicked the desktop, so the
+            // desktop is what they want.
             PerfLog.log("[NF-FINDER] empty context — keeping Finder")
             reactivateFinder()
             return false

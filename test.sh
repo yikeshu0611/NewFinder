@@ -17,3 +17,13 @@ swiftc \
   -o "$BUILD_DIR/SwipeDetectorTests"
 
 "$BUILD_DIR/SwipeDetectorTests"
+
+swiftc \
+  -O \
+  "$ROOT_DIR/Sources/FinderActivationIntent.swift" \
+  "$TEST_DIR/FinderActivationIntent/main.swift" \
+  -framework AppKit \
+  -framework ApplicationServices \
+  -o "$BUILD_DIR/FinderActivationIntentTests"
+
+"$BUILD_DIR/FinderActivationIntentTests"
