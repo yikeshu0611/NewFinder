@@ -47,6 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = buildMainMenu()
         installWindowShortcutMonitor()
         updateTrackpadGestureMonitor()
+        startDoubleCommandDetector()
         StatusBarController.shared.install()
         // Claiming the folder types talks to Launch Services and blocks for
         // 100+ ms — keep it off the launch critical path so the window shows
@@ -1232,6 +1233,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Trackpad gesture
 
+    /// Starts the double-Command detector.
+    ///
+    /// The detector needs a `CGEvent` tap, which in turn needs the
+    ///「输入监控」permission — the same one the three-finger gesture needs.
+    /// If the permission is missing the tap simply never fires; the rest of
+    /// the app is unaffected.
+    private func startDoubleCommandDetector() {
+        DoubleCommandDetector.start()
+        DoubleCommandDetector.shared?.onDoubleCommand = { [weak self] in
+            self?.showAppSwitcher(nil)
+        }
+    }
+
     /// Starts or stops the three-finger-swipe gesture monitor to match the
     /// setting in Settings → 快捷键.
     func updateTrackpadGestureMonitor() {
@@ -1396,6 +1410,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let goToItem = NSMenuItem(title: "转到", action: nil, keyEquivalent: "")
         let goToMenu = NSMenu(title: "转到")
+        let switcher = goToMenu.addItem(
+            withTitle: "启动程序 (双击 ⌘)",
+            action: #selector(showAppSwitcher(_:)),
+            keyEquivalent: ""
+        )
+        switcher.target = self
         let activity = goToMenu.addItem(
             withTitle: "活动监视器",
             action: #selector(goToActivityMonitor(_:)),
@@ -1483,6 +1503,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func goToQuitApps(_ sender: Any?) {
         suppressFinderRedirectUntil = Date().addingTimeInterval(1.0)
         QuitAppsWindowController.shared.show()
+    }
+
+    /// Opens the launcher with the running apps and the installed apps.
+    @objc func showAppSwitcher(_ sender: Any?) {
+        // The window takes the focus, so the Finder redirect has to stay
+        // quiet for a moment.
+        suppressFinderRedirectUntil = Date().addingTimeInterval(1.0)
+        AppSwitcherWindowController.shared.toggle()
     }
 
     @objc private func goToUninstallSoftware(_ sender: Any?) {

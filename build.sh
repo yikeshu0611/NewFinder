@@ -40,6 +40,8 @@ SOURCES=(
   "$ROOT_DIR/Sources/TrackpadGestureMonitor.swift"
   "$ROOT_DIR/Sources/SwipeDetector.swift"
   "$ROOT_DIR/Sources/TrackpadGesturePreferences.swift"
+  "$ROOT_DIR/Sources/DoubleCommandDetector.swift"
+  "$ROOT_DIR/Sources/AppSwitcherWindowController.swift"
   "$ROOT_DIR/Sources/FinderActivationIntent.swift"
   "$ROOT_DIR/Sources/ShowDesktopAction.swift"
   "$ROOT_DIR/Sources/WatchAgentMain.swift"

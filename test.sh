@@ -27,3 +27,16 @@ swiftc \
   -o "$BUILD_DIR/FinderActivationIntentTests"
 
 "$BUILD_DIR/FinderActivationIntentTests"
+
+swiftc \
+  -O \
+  "$ROOT_DIR/Sources/PerfLog.swift" \
+  "$ROOT_DIR/Sources/DoubleCommandDetector.swift" \
+  "$TEST_DIR/DoubleCommand/main.swift" \
+  -import-objc-header "$ROOT_DIR/Sources/NativeHelpers.h" \
+  "$ROOT_DIR/Sources/NativeHelpers.m" \
+  -framework AppKit \
+  -framework CoreGraphics \
+  -o "$BUILD_DIR/DoubleCommandTests"
+
+"$BUILD_DIR/DoubleCommandTests"
