@@ -1,7 +1,7 @@
 import AppKit
 import CoreGraphics
 
-/// Recognises a double or triple tap of the Command key.
+/// Recognises a double or triple tap of the Option key.
 ///
 /// The state machine is separated from the event tap so it can be exercised
 /// without a live tap — the tap needs the system and the permissions, the
@@ -19,7 +19,7 @@ import CoreGraphics
 /// deadline is reached (`flushPendingDoubleTap`) and everything is decided
 /// against the timestamps of the events themselves. That matters because the
 /// event timestamps and the wall clock are not guaranteed to agree.
-final class CommandTapRecognizer {
+final class OptionTapRecognizer {
 
     /// The maximum gap between two presses for them to count as part of the
     /// same gesture.
@@ -35,9 +35,9 @@ final class CommandTapRecognizer {
     /// The presses seen so far, with their timestamps.
     private var pressTimes: [Date] = []
 
-    /// Set while the Command key is held down, so that holding it does not
+    /// Set while the Option key is held down, so that holding it does not
     /// look like a second press.
-    private var commandIsDown = false
+    private var optionIsDown = false
 
     /// The moment the pending double tap has to be resolved by, if there is
     /// one waiting for a possible third press.
@@ -51,16 +51,16 @@ final class CommandTapRecognizer {
     /// Feeds one flags change into the state machine.
     ///
     /// - Parameters:
-    ///   - commandDown: whether the Command key is held.
-    ///   - shiftDown / controlDown / optionDown: the other modifiers. A
-    ///     modified Command press is a different shortcut and must not
+    ///   - optionDown: whether the Option key is held.
+    ///   - shiftDown / controlDown / commandDown: the other modifiers. A
+    ///     modified Option press is a different shortcut and must not
     ///     trigger the gesture.
     ///   - now: the moment of the event.
     func process(
-        commandDown: Bool,
+        optionDown: Bool,
         shiftDown: Bool = false,
         controlDown: Bool = false,
-        optionDown: Bool = false,
+        commandDown: Bool = false,
         now: Date = Date()
     ) {
         // A pending double tap that is already due fires before anything
@@ -68,12 +68,12 @@ final class CommandTapRecognizer {
         // instead of turning the old one into a triple tap.
         flushPendingDoubleTap(at: now)
 
-        // A Command press on its own.
-        let isPlainCommand = commandDown && !shiftDown && !controlDown && !optionDown
+        // An Option press on its own.
+        let isPlainOption = optionDown && !shiftDown && !controlDown && !commandDown
 
-        if isPlainCommand && !commandIsDown {
-            // Command went down — this is one press of the gesture.
-            commandIsDown = true
+        if isPlainOption && !optionIsDown {
+            // Option went down — this is one press of the gesture.
+            optionIsDown = true
 
             // A press that is far away from the previous one starts a new
             // gesture, and any pending double tap is now void.
@@ -104,9 +104,9 @@ final class CommandTapRecognizer {
             return
         }
 
-        if !commandDown && commandIsDown {
-            // Command came back up.
-            commandIsDown = false
+        if !optionDown && optionIsDown {
+            // Option came back up.
+            optionIsDown = false
         }
     }
 
@@ -124,14 +124,14 @@ final class CommandTapRecognizer {
     /// Forgets everything — used when the tap is removed.
     func reset() {
         pressTimes.removeAll()
-        commandIsDown = false
+        optionIsDown = false
         pendingDoubleTapDeadline = nil
     }
 }
 
-/// Detects a double or triple tap of the Command key.
+/// Detects a double or triple tap of the Option key.
 ///
-/// A bare Command press produces a **flagsChanged** event, not a keyDown —
+/// A bare Option press produces a **flagsChanged** event, not a keyDown —
 /// so the usual `NSEvent.addLocalMonitorForEvents(matching: .keyDown)` cannot
 /// see it at all. Two things follow from that:
 ///
@@ -140,20 +140,21 @@ final class CommandTapRecognizer {
 ///   application is frontmost. The same reasoning (and the same machinery)
 ///   is used by `TrackpadGestureMonitor` for the three-finger swipe.
 ///
-/// The tap is listen-only, so the Command key keeps working normally for the
+/// The tap is listen-only, so the Option key keeps working normally for the
 /// focused application.
-final class CommandTapDetector {
+final class OptionTapDetector {
 
-    /// Called on the main queue when the Command key is tapped twice or
+    /// Called on the main queue when the Option key is tapped twice or
     /// three times.
-    var onCommandTap: ((Int) -> Void)?
+    var onOptionTap: ((Int) -> Void)?
+
     /// The event mask — flags changes are all that is needed.
     private static let eventMask = CGEventMask(1 << (CGEventType.flagsChanged.rawValue))
 
     private var tap: CFMachPort?
 
     /// The state machine that recognises the taps.
-    private let recognizer = CommandTapRecognizer()
+    private let recognizer = OptionTapRecognizer()
 
     /// Timer that re-installs the tap once the permission is granted.
     ///
@@ -164,15 +165,15 @@ final class CommandTapDetector {
     /// Timer that resolves a pending double tap.
     private var resolutionTimer: Timer?
 
-    /// The detector is a singleton — there is only ever one Command key.
-    static var shared: CommandTapDetector?
+    /// The detector is a singleton — there is only ever one Option key.
+    static var shared: OptionTapDetector?
 
     // MARK: - Lifecycle
 
     /// Starts observing. Safe to call repeatedly; only the first call matters.
     static func start() {
         guard shared == nil else { return }
-        let detector = CommandTapDetector()
+        let detector = OptionTapDetector()
         shared = detector
         detector.installTap()
     }
@@ -188,7 +189,7 @@ final class CommandTapDetector {
         // The recognizer is the source of truth; the detector forwards what
         // it reports.
         recognizer.onTapCount = { [weak self] count in
-            self?.onCommandTap?(count)
+            self?.onOptionTap?(count)
         }
     }
 
@@ -199,7 +200,7 @@ final class CommandTapDetector {
     // MARK: - Tap
 
     private func installTap() {
-        // A session tap spans the whole login session, so the Command key is
+        // A session tap spans the whole login session, so the Option key is
         // seen no matter which application is frontmost. Listen-only means the
         // focused app still receives the key events untouched.
         let created = CGEvent.tapCreate(
@@ -208,7 +209,7 @@ final class CommandTapDetector {
             options: .listenOnly,
             eventsOfInterest: Self.eventMask,
             callback: { _, type, event, _ in
-                CommandTapDetector.handle(type: type, event: event)
+                OptionTapDetector.handle(type: type, event: event)
                 return Unmanaged.passUnretained(event)
             },
             userInfo: nil
@@ -218,14 +219,14 @@ final class CommandTapDetector {
             // Without the「输入监控」permission the tap is created but never
             // delivers events. The gesture simply does not fire; everything
             // else keeps working.
-            PerfLog.log("[NF-CMDTAP] tap creation failed")
+            PerfLog.log("[NF-OPTTAP] tap creation failed")
             return
         }
 
         NFAddMachPortSourceToCurrentRunLoop(created)
         CGEvent.tapEnable(tap: created, enable: true)
         tap = created
-        PerfLog.log("[NF-CMDTAP] tap installed")
+        PerfLog.log("[NF-OPTTAP] tap installed")
         startPermissionWatch()
     }
 
@@ -249,7 +250,7 @@ final class CommandTapDetector {
             // The old tap was created while the permission was missing.
             self.removeTap()
             self.installTap()
-            PerfLog.log("[NF-CMDTAP] permissions granted, tap reinstalled")
+            PerfLog.log("[NF-OPTTAP] permissions granted, tap reinstalled")
         }
     }
 
@@ -284,10 +285,10 @@ final class CommandTapDetector {
     private func process(_ event: CGEvent) {
         let flags = event.flags
         recognizer.process(
-            commandDown: flags.contains(.maskCommand),
+            optionDown: flags.contains(.maskAlternate),
             shiftDown: flags.contains(.maskShift),
             controlDown: flags.contains(.maskControl),
-            optionDown: flags.contains(.maskAlternate)
+            commandDown: flags.contains(.maskCommand)
         )
         schedulePendingResolution()
     }

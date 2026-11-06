@@ -16,6 +16,14 @@ class AppListWindowController: NSWindowController, NSTableViewDataSource, NSTabl
     /// The status line under the table.
     var statusLabel: NSTextField!
 
+    /// Called when the window is closed.
+    ///
+    /// Closing the launcher gives the focus back to whatever was in front
+    /// before it — often the Finder. That activation would be mistaken for
+    /// the user clicking in a Finder window, and NewFinder would open a
+    /// browser window of its own, which is not what the user asked for.
+    var onClose: (() -> Void)?
+
     /// A row in the table.
     struct AppListItem {
         /// The name shown in the table.
@@ -45,6 +53,7 @@ class AppListWindowController: NSWindowController, NSTableViewDataSource, NSTabl
         window.center()
         super.init(window: window)
         configureUI()
+        observeWindowClose()
     }
 
     @available(*, unavailable)
@@ -53,6 +62,12 @@ class AppListWindowController: NSWindowController, NSTableViewDataSource, NSTabl
     }
 
     // MARK: - Layout
+
+    /// The scroll view that holds the table.
+    ///
+    /// The subclasses need it to lay out their own header, so it is kept
+    /// around instead of being a local variable.
+    private(set) var scrollView: NSScrollView!
 
     private func configureUI() {
         guard let content = window?.contentView else { return }
@@ -71,31 +86,49 @@ class AppListWindowController: NSWindowController, NSTableViewDataSource, NSTabl
         column.title = "程序"
         table.addTableColumn(column)
 
-        let scroll = NSScrollView()
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.hasVerticalScroller = true
-        scroll.borderType = .bezelBorder
-        scroll.autohidesScrollers = true
-        scroll.documentView = table
+        scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasVerticalScroller = true
+        scrollView.borderType = .bezelBorder
+        scrollView.autohidesScrollers = true
+        scrollView.documentView = table
 
         statusLabel = NSTextField(labelWithString: "")
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        content.addSubview(scroll)
+        content.addSubview(scrollView)
         content.addSubview(statusLabel)
 
+        // The scroll view is pinned to the top of the content view; the
+        // subclasses that add a header (the search field) move its top edge
+        // down by adjusting `contentTopInset`.
         NSLayoutConstraint.activate([
-            scroll.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
-            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
-            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
-            scroll.bottomAnchor.constraint(equalTo: statusLabel.topAnchor, constant: -8),
+            scrollView.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            scrollView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            scrollView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            scrollView.bottomAnchor.constraint(equalTo: statusLabel.topAnchor, constant: -8),
 
             statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             statusLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
             statusLabel.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10)
         ])
+    }
+
+    /// Watches for the window being closed.
+    ///
+    /// The notification is used instead of `windowWillClose` because the
+    /// controller is not the window's delegate, and the window outlives a
+    /// single opening.
+    private func observeWindowClose() {
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            self?.onClose?()
+        }
     }
 
     // MARK: - Data
@@ -133,6 +166,8 @@ class AppListWindowController: NSWindowController, NSTableViewDataSource, NSTabl
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard items.indices.contains(row) else { return nil }
+
         let id = NSUserInterfaceItemIdentifier("applist.row")
         let cell: NSTableCellView
         if let reused = tableView.makeView(withIdentifier: id, owner: nil) as? NSTableCellView {
@@ -181,7 +216,7 @@ class AppListWindowController: NSWindowController, NSTableViewDataSource, NSTabl
 
 /// Lists the applications that are running right now.
 ///
-/// Opened by double-tapping the Command key. Clicking an application brings
+/// Opened by double-tapping the Option key. Clicking an application brings
 /// it to the front.
 final class RunningAppsWindowController: AppListWindowController {
 
@@ -221,8 +256,14 @@ final class RunningAppsWindowController: AppListWindowController {
                 ($0.localizedName ?? "").localizedStandardCompare($1.localizedName ?? "") == .orderedAscending
             }
             .map { app in
-                AppListItem(
-                    name: app.localizedName ?? app.bundleIdentifier ?? "未知程序",
+                // RStudio shows the open project in its window title, and two
+                // RStudio windows can have different projects open — so the
+                // project is part of the name.
+                let name = RStudioProject.isRStudio(app)
+                    ? RStudioProject.displayName(for: app)
+                    : (app.localizedName ?? app.bundleIdentifier ?? "未知程序")
+                return AppListItem(
+                    name: name,
                     icon: app.icon ?? NSImage(named: NSImage.applicationIconName)!,
                     running: app,
                     appURL: nil,
@@ -242,7 +283,7 @@ final class RunningAppsWindowController: AppListWindowController {
 
 /// Lists every application installed on the computer.
 ///
-/// Opened by triple-tapping the Command key. Clicking an application
+/// Opened by triple-tapping the Option key. Clicking an application
 /// launches it; an application that is already running is brought to the
 /// front instead of being launched a second time.
 final class InstalledAppsWindowController: AppListWindowController, NSSearchFieldDelegate {
@@ -277,12 +318,24 @@ final class InstalledAppsWindowController: AppListWindowController, NSSearchFiel
         searchField.action = #selector(searchChanged)
         content.addSubview(searchField)
 
-        guard let scroll = content.subviews.first(where: { $0 is NSScrollView }) else { return }
+        // The scroll view's top edge is moved down to make room for the
+        // search field. The original constraint is deactivated and replaced
+        // by one that starts below the field — pinning the field to the top
+        // of the content view and the scroll view to the bottom of the field
+        // would otherwise ask for a negative height.
+        for constraint in content.constraints where constraint.firstItem === scrollView {
+            if constraint.firstAttribute == .top {
+                constraint.isActive = false
+            }
+        }
+
         NSLayoutConstraint.activate([
             searchField.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
             searchField.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
             searchField.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
-            searchField.bottomAnchor.constraint(equalTo: scroll.topAnchor, constant: -8)
+            searchField.heightAnchor.constraint(equalToConstant: 22),
+
+            scrollView.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 8)
         ])
     }
 
@@ -291,6 +344,11 @@ final class InstalledAppsWindowController: AppListWindowController, NSSearchFiel
     /// Shows the window, refreshing the list.
     func show() {
         configureSearchFieldIfNeeded()
+        // A search left over from the previous time the window was open
+        // would silently hide everything that does not match it — the list
+        // would look empty while the status line counts all the programs.
+        // Every fresh opening starts from the full list.
+        searchField.stringValue = ""
         reload()
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)

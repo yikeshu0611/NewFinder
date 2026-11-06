@@ -47,7 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = buildMainMenu()
         installWindowShortcutMonitor()
         updateTrackpadGestureMonitor()
-        startDoubleCommandDetector()
+        startOptionTapDetector()
         StatusBarController.shared.install()
         // Claiming the folder types talks to Launch Services and blocks for
         // 100+ ms — keep it off the launch critical path so the window shows
@@ -68,8 +68,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let stealFinder = CommandLine.arguments.contains("--steal-finder")
         let revealFiles = Self.commandLineRevealURLs()
         let revealDir = Self.commandLineRevealDirectory()
+        let debugWindow = Self.commandLineDebugWindow()
 
-        if !revealFiles.isEmpty {
+        if let debugWindow {
+            // A test hook: open one of the auxiliary windows on its own, so
+            // its layout can be inspected without the gesture.
+            switch debugWindow {
+            case "quit":
+                QuitAppsWindowController.shared.show()
+            case "installed":
+                InstalledAppsWindowController.shared.show()
+            case "running":
+                RunningAppsWindowController.shared.show()
+            default:
+                break
+            }
+        } else if !revealFiles.isEmpty {
             // Cold launch from Chrome "Show in Finder" (via WatchAgent --reveal).
             reveal(revealFiles)
             bringUIToFront()
@@ -122,6 +136,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let index = args.firstIndex(of: "--reveal-dir"),
               index + 1 < args.count else { return nil }
         return URL(fileURLWithPath: args[index + 1]).standardizedFileURL
+    }
+
+    /// Opens a window for testing — `--open-quit-apps` opens the 退出程序
+    /// window, `--open-installed-apps` opens the 所有程序 window.
+    private static func commandLineDebugWindow() -> String? {
+        let args = CommandLine.arguments
+        if args.contains("--open-quit-apps") { return "quit" }
+        if args.contains("--open-installed-apps") { return "installed" }
+        if args.contains("--open-running-apps") { return "running" }
+        return nil
     }
 
     /// If another UI instance is already running, ask it to show and exit this process.
@@ -1233,7 +1257,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Trackpad gesture
 
-    /// Starts the Command-tap detector.
+    /// Starts the Option-tap detector.
     ///
     /// The detector needs a `CGEvent` tap, which in turn needs the
     ///「输入监控」permission — the same one the three-finger gesture needs.
@@ -1242,16 +1266,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///
     /// * double tap → the running applications
     /// * triple tap → all installed applications
-    private func startDoubleCommandDetector() {
-        CommandTapDetector.start()
-        CommandTapDetector.shared?.onCommandTap = { [weak self] count in
+    private func startOptionTapDetector() {
+        OptionTapDetector.start()
+        OptionTapDetector.shared?.onOptionTap = { [weak self] count in
             guard let self else { return }
             switch count {
             case 2:
-                PerfLog.log("[NF-CMDTAP] double command detected")
+                PerfLog.log("[NF-OPTTAP] double option detected")
                 self.showRunningApps(nil)
             case 3:
-                PerfLog.log("[NF-CMDTAP] triple command detected")
+                PerfLog.log("[NF-OPTTAP] triple option detected")
                 self.showInstalledApps(nil)
             default:
                 break
@@ -1424,13 +1448,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let goToItem = NSMenuItem(title: "转到", action: nil, keyEquivalent: "")
         let goToMenu = NSMenu(title: "转到")
         let runningApps = goToMenu.addItem(
-            withTitle: "正在运行的程序 (双击 ⌘)",
+            withTitle: "正在运行的程序 (双击 ⌥)",
             action: #selector(showRunningApps(_:)),
             keyEquivalent: ""
         )
         runningApps.target = self
         let installedApps = goToMenu.addItem(
-            withTitle: "所有程序 (三击 ⌘)",
+            withTitle: "所有程序 (三击 ⌥)",
             action: #selector(showInstalledApps(_:)),
             keyEquivalent: ""
         )
@@ -1529,13 +1553,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // The window takes the focus, so the Finder redirect has to stay
         // quiet for a moment.
         suppressFinderRedirectUntil = Date().addingTimeInterval(1.0)
+        RunningAppsWindowController.shared.onClose = { [weak self] in
+            self?.suppressFinderRedirectAfterLauncherClose()
+        }
         RunningAppsWindowController.shared.toggle()
     }
 
     /// Opens the list of all installed applications.
     @objc func showInstalledApps(_ sender: Any?) {
         suppressFinderRedirectUntil = Date().addingTimeInterval(1.0)
+        InstalledAppsWindowController.shared.onClose = { [weak self] in
+            self?.suppressFinderRedirectAfterLauncherClose()
+        }
         InstalledAppsWindowController.shared.toggle()
+    }
+
+    /// Keeps the Finder redirect quiet after a launcher window closes.
+    ///
+    /// Closing the launcher hands the focus back to the application that was
+    /// in front before it — often the Finder. That activation is not a click
+    /// in a Finder window, so redirecting it would open a NewFinder browser
+    /// window out of nowhere, right after the user dismissed the launcher.
+    private func suppressFinderRedirectAfterLauncherClose() {
+        suppressFinderRedirectUntil = Date().addingTimeInterval(1.0)
     }
 
     @objc private func goToUninstallSoftware(_ sender: Any?) {

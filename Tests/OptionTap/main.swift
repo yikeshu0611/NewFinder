@@ -1,6 +1,6 @@
 import AppKit
 
-// Exercises the Command tap state machine with synthetic flag changes, so
+// Exercises the Option tap state machine with synthetic flag changes, so
 // the gesture rules can be verified without a physical tap.
 //
 // The double tap is *deferred*: the recognizer cannot know whether a third
@@ -25,38 +25,38 @@ func check(_ condition: Bool, _ message: String) {
 /// Feeds one flags change into the recognizer and then resolves any pending
 /// double tap whose deadline has passed.
 func feed(
-    _ recognizer: CommandTapRecognizer,
+    _ recognizer: OptionTapRecognizer,
     at time: Date,
-    commandDown: Bool,
+    optionDown: Bool,
     shiftDown: Bool = false,
     controlDown: Bool = false,
-    optionDown: Bool = false
+    commandDown: Bool = false
 ) {
     recognizer.process(
-        commandDown: commandDown,
+        optionDown: optionDown,
         shiftDown: shiftDown,
         controlDown: controlDown,
-        optionDown: optionDown,
+        commandDown: commandDown,
         now: time
     )
     recognizer.flushPendingDoubleTap(at: time)
 }
 
 /// The moment a pending double tap is due, moved past so that it fires.
-func dueTime(for recognizer: CommandTapRecognizer, after time: Date) -> Date {
+func dueTime(for recognizer: OptionTapRecognizer, after time: Date) -> Date {
     guard let deadline = recognizer.pendingResolutionDeadline else { return time }
     return max(deadline, time).addingTimeInterval(0.01)
 }
 
-/// Replays a sequence of Command presses and returns the tap counts that
+/// Replays a sequence of Option presses and returns the tap counts that
 /// were reported.
 func tapCounts(
     presses: [TimeInterval],
     shiftDown: Bool = false,
     controlDown: Bool = false,
-    optionDown: Bool = false
+    commandDown: Bool = false
 ) -> [Int] {
-    let recognizer = CommandTapRecognizer()
+    let recognizer = OptionTapRecognizer()
     var reported: [Int] = []
     recognizer.onTapCount = { count in reported.append(count) }
 
@@ -67,16 +67,16 @@ func tapCounts(
         feed(
             recognizer,
             at: start.addingTimeInterval(press),
-            commandDown: true,
+            optionDown: true,
             shiftDown: shiftDown,
             controlDown: controlDown,
-            optionDown: optionDown
+            commandDown: commandDown
         )
         // Release.
         feed(
             recognizer,
             at: start.addingTimeInterval(press + 0.02),
-            commandDown: false
+            optionDown: false
         )
         now = start.addingTimeInterval(press + 0.02)
     }
@@ -128,7 +128,7 @@ do {
 
 print("== holding the key does not fire ==")
 do {
-    let recognizer = CommandTapRecognizer()
+    let recognizer = OptionTapRecognizer()
     var fired = false
     recognizer.onTapCount = { _ in fired = true }
     let start = Date()
@@ -137,33 +137,33 @@ do {
         feed(
             recognizer,
             at: start.addingTimeInterval(Double(step) * 0.1),
-            commandDown: true
+            optionDown: true
         )
     }
     recognizer.flushPendingDoubleTap(
         at: dueTime(for: recognizer, after: start.addingTimeInterval(0.3))
     )
-    check(!fired, "holding Command down never fires")
+    check(!fired, "holding Option down never fires")
 }
 
-print("== a modified Command press does not fire ==")
+print("== a modified Option press does not fire ==")
 do {
-    check(tapCounts(presses: [0, 0.15], shiftDown: true).isEmpty, "⌘⇧ does not trigger the gesture")
-    check(tapCounts(presses: [0, 0.15], controlDown: true).isEmpty, "⌘⌃ does not trigger the gesture")
-    check(tapCounts(presses: [0, 0.15], optionDown: true).isEmpty, "⌘⌥ does not trigger the gesture")
+    check(tapCounts(presses: [0, 0.15], shiftDown: true).isEmpty, "⌥⇧ does not trigger the gesture")
+    check(tapCounts(presses: [0, 0.15], controlDown: true).isEmpty, "⌥⌃ does not trigger the gesture")
+    check(tapCounts(presses: [0, 0.15], commandDown: true).isEmpty, "⌥⌘ does not trigger the gesture")
 }
 
 print("== a release does not count as a press ==")
 do {
-    let recognizer = CommandTapRecognizer()
+    let recognizer = OptionTapRecognizer()
     var fired = false
     recognizer.onTapCount = { _ in fired = true }
     let start = Date()
-    // Command goes down, up, and up again (a modifier change that did not
+    // Option goes down, up, and up again (a modifier change that did not
     // involve a press).
-    feed(recognizer, at: start, commandDown: true)
-    feed(recognizer, at: start.addingTimeInterval(0.05), commandDown: false)
-    feed(recognizer, at: start.addingTimeInterval(0.1), commandDown: false)
+    feed(recognizer, at: start, optionDown: true)
+    feed(recognizer, at: start.addingTimeInterval(0.05), optionDown: false)
+    feed(recognizer, at: start.addingTimeInterval(0.1), optionDown: false)
     recognizer.flushPendingDoubleTap(
         at: dueTime(for: recognizer, after: start.addingTimeInterval(0.1))
     )
@@ -172,13 +172,13 @@ do {
 
 print("== a reset cancels a pending double tap ==")
 do {
-    let recognizer = CommandTapRecognizer()
+    let recognizer = OptionTapRecognizer()
     var fired = false
     recognizer.onTapCount = { _ in fired = true }
     let start = Date()
-    feed(recognizer, at: start, commandDown: true)
-    feed(recognizer, at: start.addingTimeInterval(0.02), commandDown: false)
-    feed(recognizer, at: start.addingTimeInterval(0.15), commandDown: true)
+    feed(recognizer, at: start, optionDown: true)
+    feed(recognizer, at: start.addingTimeInterval(0.02), optionDown: false)
+    feed(recognizer, at: start.addingTimeInterval(0.15), optionDown: true)
     recognizer.reset()
     recognizer.flushPendingDoubleTap(
         at: dueTime(for: recognizer, after: start.addingTimeInterval(0.15))
