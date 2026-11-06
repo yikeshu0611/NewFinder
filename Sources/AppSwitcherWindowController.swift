@@ -1,61 +1,46 @@
 import AppKit
 
-/// A floating launcher with two tabs:
+/// The shared parts of the two launcher windows.
 ///
-/// 1. **正在运行** — the applications that are running right now. Clicking
-///    one brings it to the front.
-/// 2. **所有程序** — every application installed on the computer. Clicking
-///    one launches it.
-///
-/// It is opened by double-tapping the Command key, and it is also reachable
-/// from the status-bar menu, so the gesture is never the only way in.
-///
-/// The window is a plain `NSWindowController` singleton — it keeps itself
-/// alive, exactly like `QuitAppsWindowController`.
-final class AppSwitcherWindowController: NSWindowController,
-    NSTableViewDataSource,
-    NSTableViewDelegate,
-    NSSearchFieldDelegate {
+/// Both windows list applications in a table, with an icon and a name, and
+/// both act on a double click. Only the data and the action differ, so the
+/// table plumbing lives here.
+class AppListWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
 
-    static let shared = AppSwitcherWindowController()
+    /// The applications shown in the table.
+    private(set) var items: [AppListItem] = []
 
-    /// A running application, as listed in the first tab.
-    private struct RunningApp {
-        let application: NSRunningApplication
+    /// The table that shows the applications.
+    var table: NSTableView!
+
+    /// The status line under the table.
+    var statusLabel: NSTextField!
+
+    /// A row in the table.
+    struct AppListItem {
+        /// The name shown in the table.
         let name: String
-    }
-
-    /// An installed application, as listed in the second tab.
-    private struct InstalledApp {
-        let info: OpenWithCatalog.AppInfo
-        let name: String
+        /// The icon shown in the table.
         let icon: NSImage
-        /// True when the app is currently running — shown as a small dot so
-        /// the user can tell at a glance which apps are already open.
+        /// The running application this row stands for, if any.
+        let running: NSRunningApplication?
+        /// The bundle on disk, for an installed application.
+        let appURL: URL?
+        /// The bundle identifier, for an installed application.
+        let bundleIdentifier: String?
+        /// True when the application is currently running.
         let isRunning: Bool
     }
 
-    private var runningApps: [RunningApp] = []
-    private var installedApps: [InstalledApp] = []
-
-    /// The installed apps after the search filter has been applied.
-    private var filteredInstalledApps: [InstalledApp] = []
-
-    private var tabView: NSTabView!
-    private var runningTable: NSTableView!
-    private var installedTable: NSTableView!
-    private var searchField: NSSearchField!
-    private var statusLabel: NSTextField!
-
-    private init() {
+    init(title: String, size: NSSize) {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 520),
+            contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
-        window.title = "启动程序"
-        window.minSize = NSSize(width: 380, height: 340)
+        window.title = title
+        window.minSize = NSSize(width: 380, height: 300)
         window.isReleasedWhenClosed = false
         window.center()
         super.init(window: window)
@@ -67,132 +52,12 @@ final class AppSwitcherWindowController: NSWindowController,
         fatalError("init(coder:) has not been implemented")
     }
 
-    // MARK: - Showing
-
-    /// Shows the window, refreshing both tabs.
-    func show() {
-        reload()
-        showWindow(nil)
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        // Put the caret in the search field so the user can type right away.
-        window?.makeFirstResponder(searchField)
-    }
-
-    /// Brings the already-open window to the front instead of reloading it.
-    func toggle() {
-        if let window, window.isVisible {
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-        } else {
-            show()
-        }
-    }
-
     // MARK: - Layout
 
     private func configureUI() {
         guard let content = window?.contentView else { return }
 
-        tabView = NSTabView()
-        tabView.translatesAutoresizingMaskIntoConstraints = false
-        tabView.tabViewType = .topTabsBezelBorder
-        content.addSubview(tabView)
-
-        let runningItem = NSTabViewItem(identifier: "running")
-        runningItem.label = "正在运行"
-        runningItem.view = makeRunningTab()
-        tabView.addTabViewItem(runningItem)
-
-        let installedItem = NSTabViewItem(identifier: "installed")
-        installedItem.label = "所有程序"
-        installedItem.view = makeInstalledTab()
-        tabView.addTabViewItem(installedItem)
-
-        statusLabel = NSTextField(labelWithString: "")
-        statusLabel.font = .systemFont(ofSize: 11)
-        statusLabel.textColor = .secondaryLabelColor
-        statusLabel.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(statusLabel)
-
-        NSLayoutConstraint.activate([
-            tabView.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
-            tabView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
-            tabView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
-            tabView.bottomAnchor.constraint(equalTo: statusLabel.topAnchor, constant: -8),
-
-            statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            statusLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
-            statusLabel.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10)
-        ])
-    }
-
-    /// The first tab — the applications that are running right now.
-    private func makeRunningTab() -> NSView {
-        let container = NSView()
-
-        let hint = NSTextField(wrappingLabelWithString: "双击可以切换到该程序。")
-        hint.font = .systemFont(ofSize: 11)
-        hint.textColor = .secondaryLabelColor
-        hint.translatesAutoresizingMaskIntoConstraints = false
-
-        runningTable = makeTable(identifier: "switcher.running")
-        runningTable.doubleAction = #selector(activateRunningApp)
-        runningTable.target = self
-
-        let scroll = makeScrollView(document: runningTable)
-
-        container.addSubview(hint)
-        container.addSubview(scroll)
-
-        NSLayoutConstraint.activate([
-            hint.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
-            hint.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 4),
-            hint.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -4),
-
-            scroll.topAnchor.constraint(equalTo: hint.bottomAnchor, constant: 8),
-            scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor)
-        ])
-        return container
-    }
-
-    /// The second tab — every application installed on the computer.
-    private func makeInstalledTab() -> NSView {
-        let container = NSView()
-
-        searchField = NSSearchField()
-        searchField.translatesAutoresizingMaskIntoConstraints = false
-        searchField.placeholderString = "搜索程序"
-        searchField.delegate = self
-        searchField.target = self
-        searchField.action = #selector(searchChanged)
-
-        installedTable = makeTable(identifier: "switcher.installed")
-        installedTable.doubleAction = #selector(launchInstalledApp)
-        installedTable.target = self
-
-        let scroll = makeScrollView(document: installedTable)
-
-        container.addSubview(searchField)
-        container.addSubview(scroll)
-
-        NSLayoutConstraint.activate([
-            searchField.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
-            searchField.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 4),
-            searchField.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -4),
-
-            scroll.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 8),
-            scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor)
-        ])
-        return container
-    }
-
-    private func makeTable(identifier: String) -> NSTableView {
-        let table = NSTableView()
+        table = NSTableView()
         table.headerView = nil
         table.rowHeight = 26
         table.allowsMultipleSelection = false
@@ -200,158 +65,75 @@ final class AppSwitcherWindowController: NSWindowController,
         table.usesAlternatingRowBackgroundColors = true
         table.dataSource = self
         table.delegate = self
-        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(identifier))
+        table.target = self
+        table.doubleAction = #selector(itemActivated)
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("app"))
         column.title = "程序"
         table.addTableColumn(column)
-        return table
-    }
 
-    private func makeScrollView(document: NSView) -> NSScrollView {
         let scroll = NSScrollView()
         scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.hasVerticalScroller = true
         scroll.borderType = .bezelBorder
         scroll.autohidesScrollers = true
-        scroll.documentView = document
-        return scroll
+        scroll.documentView = table
+
+        statusLabel = NSTextField(labelWithString: "")
+        statusLabel.font = .systemFont(ofSize: 11)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        content.addSubview(scroll)
+        content.addSubview(statusLabel)
+
+        NSLayoutConstraint.activate([
+            scroll.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            scroll.bottomAnchor.constraint(equalTo: statusLabel.topAnchor, constant: -8),
+
+            statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            statusLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            statusLabel.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10)
+        ])
     }
 
     // MARK: - Data
 
-    private func reload() {
-        reloadRunningApps()
-        reloadInstalledApps()
-        updateStatus()
-    }
-
-    private func reloadRunningApps() {
-        let selfID = Bundle.main.bundleIdentifier
-        runningApps = NSWorkspace.shared.runningApplications
-            .filter { app in
-                app.activationPolicy == .regular
-                    && !app.isTerminated
-                    && app.bundleIdentifier != selfID
-            }
-            .sorted {
-                ($0.localizedName ?? "").localizedStandardCompare($1.localizedName ?? "") == .orderedAscending
-            }
-            .map { app in
-                RunningApp(
-                    application: app,
-                    name: app.localizedName ?? app.bundleIdentifier ?? "未知程序"
-                )
-            }
-        runningTable.reloadData()
-    }
-
-    private func reloadInstalledApps() {
-        let runningBundleIDs = Set(
-            NSWorkspace.shared.runningApplications.compactMap { $0.bundleIdentifier }
-        )
-
-        let all = OpenWithCatalog.allInstalledApps()
-        installedApps = all
-            .map { info in
-                let name = OpenWithCatalog.disambiguatedName(for: info, among: all)
-                return InstalledApp(
-                    info: info,
-                    name: name,
-                    icon: NSWorkspace.shared.icon(forFile: info.url.path),
-                    isRunning: info.bundleIdentifier.map { runningBundleIDs.contains($0) } ?? false
-                )
-            }
-            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-
-        applySearchFilter()
-    }
-
-    /// Applies the search field's text to the installed-apps list.
-    private func applySearchFilter() {
-        let query = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if query.isEmpty {
-            filteredInstalledApps = installedApps
-        } else {
-            filteredInstalledApps = installedApps.filter {
-                $0.name.localizedCaseInsensitiveContains(query)
-                    || ($0.info.bundleIdentifier?.localizedCaseInsensitiveContains(query) ?? false)
-            }
-        }
-        installedTable.reloadData()
-    }
-
-    private func updateStatus() {
-        let runningCount = runningApps.count
-        let installedCount = filteredInstalledApps.count
-        if installedCount == installedApps.count {
-            statusLabel.stringValue = "\(runningCount) 个正在运行 · \(installedCount) 个已安装程序"
-        } else {
-            statusLabel.stringValue = "\(runningCount) 个正在运行 · 找到 \(installedCount) / \(installedApps.count) 个程序"
-        }
-    }
-
-    // MARK: - Search
-
-    func controlTextDidChange(_ obj: Notification) {
-        applySearchFilter()
-        updateStatus()
-    }
-
-    @objc private func searchChanged() {
-        applySearchFilter()
-        updateStatus()
+    /// Replaces the contents of the table.
+    func setItems(_ newItems: [AppListItem], status: String) {
+        items = newItems
+        table.reloadData()
+        statusLabel.stringValue = status
     }
 
     // MARK: - Actions
 
-    /// Brings the selected running application to the front.
-    @objc private func activateRunningApp() {
-        let row = runningTable.selectedRow
-        guard runningApps.indices.contains(row) else { return }
-        let app = runningApps[row].application
-        app.activate(options: [.activateIgnoringOtherApps])
+    /// Called when a row is double-clicked. Subclasses override it.
+    @objc func itemActivated() {
+        let row = table.selectedRow
+        guard items.indices.contains(row) else { return }
+        activate(items[row])
     }
 
-    /// Launches the selected installed application.
-    @objc private func launchInstalledApp() {
-        let row = installedTable.selectedRow
-        guard filteredInstalledApps.indices.contains(row) else { return }
-        let app = filteredInstalledApps[row]
+    /// Performs the action for a row. Subclasses override it.
+    func activate(_ item: AppListItem) {}
 
-        // An app that is already running is brought to the front instead of
-        // being launched a second time.
-        if app.isRunning,
-           let running = NSWorkspace.shared.runningApplications.first(where: {
-               $0.bundleIdentifier == app.info.bundleIdentifier
-           }) {
-            running.activate(options: [.activateIgnoringOtherApps])
-            return
-        }
-
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        NSWorkspace.shared.openApplication(at: app.info.url, configuration: configuration) { _, error in
-            guard let error else { return }
-            DispatchQueue.main.async {
-                NSAlert(error: error).runModal()
-            }
-        }
+    /// The selected item, if any.
+    var selectedItem: AppListItem? {
+        let row = table.selectedRow
+        guard items.indices.contains(row) else { return nil }
+        return items[row]
     }
 
     // MARK: - Table data source
 
     func numberOfRows(in tableView: NSTableView) -> Int {
-        if tableView === runningTable {
-            return runningApps.count
-        }
-        if tableView === installedTable {
-            return filteredInstalledApps.count
-        }
-        return 0
+        items.count
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let identifier = tableView === runningTable ? "switcher.running" : "switcher.installed"
-        let id = NSUserInterfaceItemIdentifier(identifier)
+        let id = NSUserInterfaceItemIdentifier("applist.row")
         let cell: NSTableCellView
         if let reused = tableView.makeView(withIdentifier: id, owner: nil) as? NSTableCellView {
             cell = reused
@@ -379,18 +161,9 @@ final class AppSwitcherWindowController: NSWindowController,
                 text.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
             ])
         }
-
-        if tableView === runningTable {
-            guard runningApps.indices.contains(row) else { return nil }
-            let app = runningApps[row]
-            cell.imageView?.image = sizedIcon(app.application.icon)
-            cell.textField?.stringValue = app.name
-        } else {
-            guard filteredInstalledApps.indices.contains(row) else { return nil }
-            let app = filteredInstalledApps[row]
-            cell.imageView?.image = sizedIcon(app.icon)
-            cell.textField?.stringValue = app.name
-        }
+        let item = items[row]
+        cell.imageView?.image = Self.sizedIcon(item.icon)
+        cell.textField?.stringValue = item.name
         return cell
     }
 
@@ -398,20 +171,230 @@ final class AppSwitcherWindowController: NSWindowController,
     ///
     /// The icon objects that `NSWorkspace` hands out are shared, so their
     /// size must not be changed in place.
-    private func sizedIcon(_ icon: NSImage?) -> NSImage? {
+    static func sizedIcon(_ icon: NSImage?) -> NSImage? {
         guard let icon else { return NSImage(named: NSImage.applicationIconName) }
         let copy = icon.copy() as? NSImage ?? icon
         copy.size = NSSize(width: 18, height: 18)
         return copy
     }
+}
 
-    func tableViewSelectionDidChange(_ notification: Notification) {
-        if let tableView = notification.object as? NSTableView, tableView === runningTable {
-            // Selecting a running app clears the selection in the other tab,
-            // so the two tabs never look out of sync.
-            installedTable.deselectAll(nil)
-        } else if let tableView = notification.object as? NSTableView, tableView === installedTable {
-            runningTable.deselectAll(nil)
+/// Lists the applications that are running right now.
+///
+/// Opened by double-tapping the Command key. Clicking an application brings
+/// it to the front.
+final class RunningAppsWindowController: AppListWindowController {
+
+    static let shared = RunningAppsWindowController()
+
+    private init() {
+        super.init(title: "正在运行的程序", size: NSSize(width: 460, height: 460))
+    }
+
+    /// Shows the window, refreshing the list.
+    func show() {
+        reload()
+        showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Brings the already-open window to the front instead of reloading it.
+    func toggle() {
+        if let window, window.isVisible {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            show()
+        }
+    }
+
+    private func reload() {
+        let selfID = Bundle.main.bundleIdentifier
+        let running = NSWorkspace.shared.runningApplications
+            .filter { app in
+                app.activationPolicy == .regular
+                    && !app.isTerminated
+                    && app.bundleIdentifier != selfID
+            }
+            .sorted {
+                ($0.localizedName ?? "").localizedStandardCompare($1.localizedName ?? "") == .orderedAscending
+            }
+            .map { app in
+                AppListItem(
+                    name: app.localizedName ?? app.bundleIdentifier ?? "未知程序",
+                    icon: app.icon ?? NSImage(named: NSImage.applicationIconName)!,
+                    running: app,
+                    appURL: nil,
+                    bundleIdentifier: app.bundleIdentifier,
+                    isRunning: true
+                )
+            }
+
+        let status = running.isEmpty ? "没有其他正在运行的程序" : "\(running.count) 个正在运行的程序"
+        setItems(running, status: status)
+    }
+
+    override func activate(_ item: AppListItem) {
+        item.running?.activate(options: [.activateIgnoringOtherApps])
+    }
+}
+
+/// Lists every application installed on the computer.
+///
+/// Opened by triple-tapping the Command key. Clicking an application
+/// launches it; an application that is already running is brought to the
+/// front instead of being launched a second time.
+final class InstalledAppsWindowController: AppListWindowController, NSSearchFieldDelegate {
+
+    static let shared = InstalledAppsWindowController()
+
+    /// Every installed application.
+    private var installedApps: [AppListItem] = []
+
+    /// The applications after the search filter has been applied.
+    private var filteredApps: [AppListItem] = []
+
+    private var searchField: NSSearchField!
+
+    /// The search field is added lazily, because the base class builds the
+    /// layout before this subclass is initialised.
+    private var searchFieldAdded = false
+
+    private init() {
+        super.init(title: "所有程序", size: NSSize(width: 460, height: 520))
+    }
+
+    // MARK: - Layout
+
+    private func configureSearchField() {
+        guard let content = window?.contentView else { return }
+        searchField = NSSearchField()
+        searchField.translatesAutoresizingMaskIntoConstraints = false
+        searchField.placeholderString = "搜索程序"
+        searchField.delegate = self
+        searchField.target = self
+        searchField.action = #selector(searchChanged)
+        content.addSubview(searchField)
+
+        guard let scroll = content.subviews.first(where: { $0 is NSScrollView }) else { return }
+        NSLayoutConstraint.activate([
+            searchField.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
+            searchField.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            searchField.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            searchField.bottomAnchor.constraint(equalTo: scroll.topAnchor, constant: -8)
+        ])
+    }
+
+    // MARK: - Showing
+
+    /// Shows the window, refreshing the list.
+    func show() {
+        configureSearchFieldIfNeeded()
+        reload()
+        showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        // Put the caret in the search field so the user can type right away.
+        window?.makeFirstResponder(searchField)
+    }
+
+    /// Brings the already-open window to the front instead of reloading it.
+    func toggle() {
+        if let window, window.isVisible {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            show()
+        }
+    }
+
+    private func configureSearchFieldIfNeeded() {
+        guard !searchFieldAdded else { return }
+        searchFieldAdded = true
+        configureSearchField()
+    }
+
+    // MARK: - Data
+
+    private func reload() {
+        let runningBundleIDs = Set(
+            NSWorkspace.shared.runningApplications.compactMap { $0.bundleIdentifier }
+        )
+
+        let all = OpenWithCatalog.allInstalledApps()
+        installedApps = all
+            .map { info in
+                let name = OpenWithCatalog.disambiguatedName(for: info, among: all)
+                return AppListItem(
+                    name: name,
+                    icon: NSWorkspace.shared.icon(forFile: info.url.path),
+                    running: nil,
+                    appURL: info.url,
+                    bundleIdentifier: info.bundleIdentifier,
+                    isRunning: info.bundleIdentifier.map { runningBundleIDs.contains($0) } ?? false
+                )
+            }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+
+        applySearchFilter()
+    }
+
+    /// Applies the search field's text to the installed-apps list.
+    private func applySearchFilter() {
+        let query = searchField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if query.isEmpty {
+            filteredApps = installedApps
+        } else {
+            filteredApps = installedApps.filter {
+                $0.name.localizedCaseInsensitiveContains(query)
+                    || ($0.bundleIdentifier?.localizedCaseInsensitiveContains(query) ?? false)
+            }
+        }
+        updateStatus()
+    }
+
+    private func updateStatus() {
+        let status: String
+        if filteredApps.count == installedApps.count {
+            status = "\(installedApps.count) 个已安装程序"
+        } else {
+            status = "找到 \(filteredApps.count) / \(installedApps.count) 个程序"
+        }
+        setItems(filteredApps, status: status)
+    }
+
+    // MARK: - Search
+
+    func controlTextDidChange(_ obj: Notification) {
+        applySearchFilter()
+    }
+
+    @objc private func searchChanged() {
+        applySearchFilter()
+    }
+
+    // MARK: - Actions
+
+    override func activate(_ item: AppListItem) {
+        // An app that is already running is brought to the front instead of
+        // being launched a second time.
+        if item.isRunning, let bundleIdentifier = item.bundleIdentifier,
+           let running = NSWorkspace.shared.runningApplications.first(where: {
+               $0.bundleIdentifier == bundleIdentifier
+           }) {
+            running.activate(options: [.activateIgnoringOtherApps])
+            return
+        }
+
+        guard let appURL = item.appURL else { return }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.openApplication(at: appURL, configuration: configuration) { _, error in
+            guard let error else { return }
+            DispatchQueue.main.async {
+                NSAlert(error: error).runModal()
+            }
         }
     }
 }

@@ -1233,16 +1233,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Trackpad gesture
 
-    /// Starts the double-Command detector.
+    /// Starts the Command-tap detector.
     ///
     /// The detector needs a `CGEvent` tap, which in turn needs the
     ///「输入监控」permission — the same one the three-finger gesture needs.
     /// If the permission is missing the tap simply never fires; the rest of
     /// the app is unaffected.
+    ///
+    /// * double tap → the running applications
+    /// * triple tap → all installed applications
     private func startDoubleCommandDetector() {
-        DoubleCommandDetector.start()
-        DoubleCommandDetector.shared?.onDoubleCommand = { [weak self] in
-            self?.showAppSwitcher(nil)
+        CommandTapDetector.start()
+        CommandTapDetector.shared?.onCommandTap = { [weak self] count in
+            guard let self else { return }
+            switch count {
+            case 2:
+                PerfLog.log("[NF-CMDTAP] double command detected")
+                self.showRunningApps(nil)
+            case 3:
+                PerfLog.log("[NF-CMDTAP] triple command detected")
+                self.showInstalledApps(nil)
+            default:
+                break
+            }
         }
     }
 
@@ -1410,12 +1423,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let goToItem = NSMenuItem(title: "转到", action: nil, keyEquivalent: "")
         let goToMenu = NSMenu(title: "转到")
-        let switcher = goToMenu.addItem(
-            withTitle: "启动程序 (双击 ⌘)",
-            action: #selector(showAppSwitcher(_:)),
+        let runningApps = goToMenu.addItem(
+            withTitle: "正在运行的程序 (双击 ⌘)",
+            action: #selector(showRunningApps(_:)),
             keyEquivalent: ""
         )
-        switcher.target = self
+        runningApps.target = self
+        let installedApps = goToMenu.addItem(
+            withTitle: "所有程序 (三击 ⌘)",
+            action: #selector(showInstalledApps(_:)),
+            keyEquivalent: ""
+        )
+        installedApps.target = self
         let activity = goToMenu.addItem(
             withTitle: "活动监视器",
             action: #selector(goToActivityMonitor(_:)),
@@ -1505,12 +1524,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         QuitAppsWindowController.shared.show()
     }
 
-    /// Opens the launcher with the running apps and the installed apps.
-    @objc func showAppSwitcher(_ sender: Any?) {
+    /// Opens the list of the applications that are running right now.
+    @objc func showRunningApps(_ sender: Any?) {
         // The window takes the focus, so the Finder redirect has to stay
         // quiet for a moment.
         suppressFinderRedirectUntil = Date().addingTimeInterval(1.0)
-        AppSwitcherWindowController.shared.toggle()
+        RunningAppsWindowController.shared.toggle()
+    }
+
+    /// Opens the list of all installed applications.
+    @objc func showInstalledApps(_ sender: Any?) {
+        suppressFinderRedirectUntil = Date().addingTimeInterval(1.0)
+        InstalledAppsWindowController.shared.toggle()
     }
 
     @objc private func goToUninstallSoftware(_ sender: Any?) {
