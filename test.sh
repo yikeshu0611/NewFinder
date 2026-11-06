@@ -11,9 +11,9 @@ mkdir -p "$BUILD_DIR"
 
 swiftc \
   -O \
-  "$ROOT_DIR/Sources/SwipeDownDetector.swift" \
+  "$ROOT_DIR/Sources/SwipeDetector.swift" \
   "$TEST_DIR/main.swift" \
   -framework AppKit \
-  -o "$BUILD_DIR/SwipeDownDetectorTests"
+  -o "$BUILD_DIR/SwipeDetectorTests"
 
-"$BUILD_DIR/SwipeDownDetectorTests"
+"$BUILD_DIR/SwipeDetectorTests"

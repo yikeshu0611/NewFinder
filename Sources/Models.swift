@@ -223,6 +223,7 @@ final class AppSettings {
         static let skipInitialSort = "skipInitialSort"
         static let showLoadTime = "showLoadTime"
         static let threeFingerSwipeShowDesktop = "threeFingerSwipeShowDesktop"
+        static let threeFingerSwipeRestoreWindows = "threeFingerSwipeRestoreWindows"
     }
 
     /// Content zoom 30%…500%. Default 100. Adjusted via menu-bar slider.
@@ -297,6 +298,15 @@ final class AppSettings {
     var threeFingerSwipeShowDesktop: Bool {
         get { defaults.bool(forKey: Keys.threeFingerSwipeShowDesktop) }
         set { defaults.set(newValue, forKey: Keys.threeFingerSwipeShowDesktop) }
+    }
+
+    /// Swipe up with three fingers on the trackpad to bring back the apps that
+    /// the swipe-down gesture hid.
+    ///
+    /// Off by default — it needs the same permissions as the swipe down.
+    var threeFingerSwipeRestoreWindows: Bool {
+        get { defaults.bool(forKey: Keys.threeFingerSwipeRestoreWindows) }
+        set { defaults.set(newValue, forKey: Keys.threeFingerSwipeRestoreWindows) }
     }
 
     /// Built-in New types (canonical keys). Display name for `dir` is「文件夹」.

@@ -18,6 +18,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var suppressFinderRedirectUntil: Date?
     /// While a DMG /Volumes window is in use — do not steal at all (prevents Finder↔NF ping-pong).
     private var leaveFinderAloneUntil: Date?
+    /// True while NewFinder's own windows are pushed away by the swipe-down
+    /// gesture — the swipe-up gesture brings them back.
+    private var ownWindowsHiddenForDesktop = false
     private var finderWindowPollTimer: Timer?
     private var windowShortcutMonitor: Any?
     private var pendingRedirectWorkItem: DispatchWorkItem?
@@ -1165,13 +1168,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Starts or stops the three-finger-swipe gesture monitor to match the
     /// setting in Settings → 快捷键.
     func updateTrackpadGestureMonitor() {
-        guard AppSettings.shared.threeFingerSwipeShowDesktop else {
+        let settings = AppSettings.shared
+        guard settings.threeFingerSwipeShowDesktop || settings.threeFingerSwipeRestoreWindows else {
             TrackpadGestureMonitor.stop()
             return
         }
+        // macOS's own three-finger vertical swipe is recognised by the window
+        // server before any event tap sees the frames, so it fires alongside
+        // ours and the two fight over the same swipe. It has to be off while
+        // the swipe up is in use.
+        if settings.threeFingerSwipeRestoreWindows {
+            TrackpadGesturePreferences.disableSystemGesture()
+        }
         TrackpadGestureMonitor.start()
-        TrackpadGestureMonitor.shared?.onSwipeDown = { [weak self] in
-            self?.performShowDesktop(nil)
+        TrackpadGestureMonitor.shared?.onSwipe = { [weak self] direction in
+            switch direction {
+            case .down:
+                guard settings.threeFingerSwipeShowDesktop else { return }
+                self?.performShowDesktop(nil)
+            case .up:
+                guard settings.threeFingerSwipeRestoreWindows else { return }
+                self?.performRestoreDesktop(nil)
+            }
         }
     }
 
@@ -1187,6 +1205,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         PerfLog.log("[NF-DESKTOP] done, frontmost=\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?")")
     }
 
+    /// 三指上滑动 → 恢复之前被隐藏的 App 界面.
+    @objc func performRestoreDesktop(_ sender: Any?) {
+        guard ShowDesktopAction.hasSomethingToRestore else {
+            PerfLog.log("[NF-DESKTOP] nothing to restore")
+            return
+        }
+        // The restored app is taking the focus, so the Finder redirect has to
+        // stay quiet for a moment.
+        suppressFinderRedirectUntil = Date().addingTimeInterval(1.0)
+        PerfLog.log("[NF-DESKTOP] restore requested")
+        ShowDesktopAction.restore { [weak self] in
+            self?.restoreOwnWindowsForDesktop()
+        }
+        PerfLog.log("[NF-DESKTOP] restored, frontmost=\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?")")
+    }
+
     /// Pushes NewFinder's own windows out of the way so the desktop is
     /// visible. They are ordered out, not closed, so the session survives.
     private func hideOwnWindowsForDesktop() {
@@ -1195,6 +1229,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.orderOut(nil)
         }
         NSApp.hide(nil)
+        ownWindowsHiddenForDesktop = true
+    }
+
+    /// Brings NewFinder's own windows back after they were pushed away by the
+    /// swipe-down gesture.
+    private func restoreOwnWindowsForDesktop() {
+        guard ownWindowsHiddenForDesktop else { return }
+        ownWindowsHiddenForDesktop = false
+        for controller in windowControllers {
+            guard let window = controller.window else { continue }
+            window.orderFrontRegardless()
+        }
+        NSApp.unhide(nil)
     }
 
     /// Shared chrome menu for the toolbar gear and status-item (显示 / 窗口 / 缩放 / 更新 / 设置).
@@ -1263,6 +1310,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: ""
         )
         showDesktop.target = self
+
+        // Brings back what「显示桌面」hid — the same action the three-finger
+        // swipe up fires.
+        let restoreDesktop = menu.addItem(
+            withTitle: "恢复之前的界面",
+            action: #selector(performRestoreDesktop(_:)),
+            keyEquivalent: ""
+        )
+        restoreDesktop.target = self
 
         let settings = menu.addItem(
             withTitle: "设置",

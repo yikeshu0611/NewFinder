@@ -22,6 +22,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private var disableCommandMCheckbox: NSButton!
     private var disableCommandHCheckbox: NSButton!
     private var threeFingerSwipeCheckbox: NSButton!
+    private var threeFingerSwipeRestoreCheckbox: NSButton!
     private var gesturePermissionLabel: NSTextField!
     private var skipInitialSortCheckbox: NSButton!
     private var showLoadTimeCheckbox: NSButton!
@@ -365,7 +366,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         gestureTitle.font = .boldSystemFont(ofSize: 13)
         stack.addArrangedSubview(gestureTitle)
 
-        let gestureHint = NSTextField(wrappingLabelWithString: "三指向下滑动触控板，隐藏所有 App 并显示桌面。需要「辅助功能」和「输入监控」权限才能识别手势；若无法触发，请到「系统设置 → 隐私与安全性」中为 NewFinder 开启这两项权限。")
+        let gestureHint = NSTextField(wrappingLabelWithString: "三指上下滑动触控板：三指向下滑动隐藏所有 App 并显示桌面，三指上滑动恢复之前的界面。需要「辅助功能」和「输入监控」权限才能识别手势；若无法触发，请到「系统设置 → 隐私与安全性」中为 NewFinder 开启这两项权限。\n\n注意：macOS 自带的三指上下滑（调度中心）会与本手势冲突，开启「三指上滑动」后会自动关闭它；如需恢复，可在「系统设置 → 触控板」中重新开启。")
         gestureHint.font = .systemFont(ofSize: 11)
         gestureHint.textColor = .secondaryLabelColor
         gestureHint.preferredMaxLayoutWidth = 500
@@ -377,6 +378,13 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             action: #selector(toggleThreeFingerSwipe)
         )
         stack.addArrangedSubview(threeFingerSwipeCheckbox)
+
+        threeFingerSwipeRestoreCheckbox = NSButton(
+            checkboxWithTitle: "三指上滑动 → 恢复之前的界面",
+            target: self,
+            action: #selector(toggleThreeFingerSwipeRestore)
+        )
+        stack.addArrangedSubview(threeFingerSwipeRestoreCheckbox)
 
         let gestureRow = NSStackView()
         gestureRow.orientation = .horizontal
@@ -394,11 +402,18 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             action: #selector(openInputMonitoringSettings)
         )
         openInputMonitoringSettings.bezelStyle = .rounded
+        let openTrackpadSettings = NSButton(
+            title: "打开「触控板」设置…",
+            target: self,
+            action: #selector(openTrackpadSettings)
+        )
+        openTrackpadSettings.bezelStyle = .rounded
         gesturePermissionLabel = NSTextField(labelWithString: "")
         gesturePermissionLabel.font = .systemFont(ofSize: 11)
         gesturePermissionLabel.textColor = .secondaryLabelColor
         gestureRow.addArrangedSubview(openListenSettings)
         gestureRow.addArrangedSubview(openInputMonitoringSettings)
+        gestureRow.addArrangedSubview(openTrackpadSettings)
         gestureRow.addArrangedSubview(gesturePermissionLabel)
         stack.addArrangedSubview(gestureRow)
         updateGesturePermissionLabel()
@@ -462,6 +477,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         disableCommandMCheckbox.state = settings.disableCommandMMinimize ? .on : .off
         disableCommandHCheckbox.state = settings.disableCommandHHide ? .on : .off
         threeFingerSwipeCheckbox.state = settings.threeFingerSwipeShowDesktop ? .on : .off
+        threeFingerSwipeRestoreCheckbox.state = settings.threeFingerSwipeRestoreWindows ? .on : .off
         updateGesturePermissionLabel()
         skipInitialSortCheckbox.state = settings.skipInitialSort ? .on : .off
         showLoadTimeCheckbox.state = settings.showLoadTime ? .on : .off
@@ -793,6 +809,21 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         notifyChange()
     }
 
+    @objc private func toggleThreeFingerSwipeRestore() {
+        settings.threeFingerSwipeRestoreWindows = threeFingerSwipeRestoreCheckbox.state == .on
+        // macOS's own three-finger vertical swipe is recognised before the
+        // event tap sees the frames, so it fires alongside ours and the two
+        // fight over the same swipe. It has to be off for the swipe up to work.
+        if settings.threeFingerSwipeRestoreWindows {
+            TrackpadGesturePreferences.disableSystemGesture()
+        } else {
+            TrackpadGesturePreferences.restoreSystemGesture()
+        }
+        AppDelegate.shared.updateTrackpadGestureMonitor()
+        updateGesturePermissionLabel()
+        notifyChange()
+    }
+
     /// Opens「系统设置 → 隐私与安全性 → 辅助功能」so the user can grant the
     /// permission the gesture needs.
     @objc private func openAccessibilitySettings() {
@@ -807,6 +838,17 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     @objc private func openInputMonitoringSettings() {
         guard let url = URL(
             string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
+        ) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    /// Opens「系统设置 → 触控板」so the user can adjust the system's own
+    /// gestures. The built-in three-finger vertical swipe has to be off for
+    /// the swipe up to work — it is handled by the window server before the
+    /// event tap ever sees the frames.
+    @objc private func openTrackpadSettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.trackpad"
         ) else { return }
         NSWorkspace.shared.open(url)
     }

@@ -1,8 +1,16 @@
 import AppKit
 
-/// The decision logic of the three-finger swipe-down gesture, kept free of
-/// AppKit and of any event plumbing so it can be reasoned about (and tested)
-/// on its own.
+/// The direction of a three-finger swipe on the trackpad.
+enum SwipeDirection {
+    /// The fingers moved towards the top of the trackpad.
+    case up
+    /// The fingers moved towards the bottom of the trackpad.
+    case down
+}
+
+/// The decision logic of the three-finger swipe gesture, kept free of AppKit
+/// and of any event plumbing so it can be reasoned about (and tested) on its
+/// own.
 ///
 /// The rules it encodes come from how macOS delivers gesture frames:
 ///
@@ -13,8 +21,8 @@ import AppKit
 ///   picked up by an unrelated finger later and produce a meaningless — usually
 ///   off-axis — distance.
 /// * `normalizedPosition` has a bottom-left origin, so a swipe *down* is a
-///   **negative** y change.
-struct SwipeDownDetector {
+///   **negative** y change and a swipe *up* a **positive** one.
+struct SwipeDetector {
 
     /// One finger of the current gesture, reduced to what detection needs.
     struct Touch {
@@ -49,15 +57,16 @@ struct SwipeDownDetector {
     /// Set while the gesture fires so a single swipe cannot fire twice.
     private var didFire = false
 
-    /// Feeds one frame of touches in and reports whether the gesture fires.
-    mutating func handle(_ touches: [Touch]) -> Bool {
+    /// Feeds one frame of touches in and reports the direction of the gesture
+    /// when it fires, or `nil` while the gesture is still inconclusive.
+    mutating func handle(_ touches: [Touch]) -> SwipeDirection? {
         let down = touches.filter { $0.isDown }
         let fingersDown = down.count
 
         // A single finger is pointer mode — not a gesture. End the session.
         guard fingersDown > 1 else {
             reset()
-            return false
+            return nil
         }
 
         // Forget fingers that left the pad. Identities are recycled, so a stale
@@ -84,11 +93,18 @@ struct SwipeDownDetector {
                 // session is *not* forgiven — only raising the fingers clears
                 // that.
                 didFire = false
+            } else {
+                // All three fingers are down and at least one of them is new —
+                // this is the beginning of a fresh gesture, so the previous
+                // one may fire again. Without this the detector would stay
+                // latched after a single swipe and never report the next one.
+                didFire = false
+                swipeStillPossible = true
             }
         }
 
-        guard fingersDown == Self.requiredFingers else { return false }
-        guard !didFire, swipeStillPossible else { return false }
+        guard fingersDown == Self.requiredFingers else { return nil }
+        guard !didFire, swipeStillPossible else { return nil }
 
         // Measure the travel of every finger since the gesture began.
         var distances: [NSPoint] = []
@@ -96,21 +112,26 @@ struct SwipeDownDetector {
             guard let position = touch.position, let start = startPositions[touch.id] else { continue }
             distances.append(NSPoint(x: position.x - start.x, y: position.y - start.y))
         }
-        guard !distances.isEmpty else { return false }
+        guard !distances.isEmpty else { return nil }
 
         for distance in distances {
             if abs(distance.x) >= Self.maxSwipeDistanceInWrongDirection {
                 // Travelled sideways — this is not our gesture.
                 swipeStillPossible = false
-                return false
+                return nil
             }
         }
-        guard distances.allSatisfy({ abs($0.y) >= Self.minSwipeDistance }) else { return false }
-        guard distances.allSatisfy({ $0.y < 0 }) else { return false }
+        guard distances.allSatisfy({ abs($0.y) >= Self.minSwipeDistance }) else { return nil }
 
-        // Swipe down confirmed.
+        // All the fingers have to travel the *same* way, otherwise the gesture
+        // is a scuffle rather than a swipe.
+        let allUp = distances.allSatisfy { $0.y > 0 }
+        let allDown = distances.allSatisfy { $0.y < 0 }
+        guard allUp || allDown else { return nil }
+
+        // Swipe confirmed.
         didFire = true
-        return true
+        return allUp ? .up : .down
     }
 
     /// Clears all state, so the next gesture starts clean.

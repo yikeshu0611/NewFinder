@@ -1,7 +1,7 @@
 import AppKit
 import CoreGraphics
 
-/// Detects a three-finger swipe down on the trackpad and reports it.
+/// Detects a three-finger swipe on the trackpad and reports its direction.
 ///
 /// How it works
 /// ------------
@@ -21,20 +21,20 @@ import CoreGraphics
 /// permissions being granted for the *current* code signature — see the
 /// permission check in `installTap()`.
 ///
-/// The decision itself lives in `SwipeDownDetector`, which is pure and can be
+/// The decision itself lives in `SwipeDetector`, which is pure and can be
 /// exercised without a trackpad.
 final class TrackpadGestureMonitor {
 
-    /// Called on the main queue when the gesture completes.
-    var onSwipeDown: (() -> Void)?
+    /// Called on the main queue when the swipe completes.
+    var onSwipe: ((SwipeDirection) -> Void)?
 
     /// The gesture state machine.
-    private var detector = SwipeDownDetector()
+    private var detector = SwipeDetector()
 
     private var tap: CFMachPort?
 
     /// The tap callbacks run on a private thread, so `detector` is only ever
-    /// touched there — no locking needed. `onSwipeDown` hops to the main queue.
+    /// touched there — no locking needed. `onSwipe` hops to the main queue.
     static var shared: TrackpadGestureMonitor?
 
     /// Timer that re-installs the tap once the「输入监控」permission is granted.
@@ -283,7 +283,7 @@ final class TrackpadGestureMonitor {
         }
     }
 
-    private static func decodeTouchesOnMainThread(from cgEvent: CGEvent) -> [SwipeDownDetector.Touch] {
+    private static func decodeTouchesOnMainThread(from cgEvent: CGEvent) -> [SwipeDetector.Touch] {
         guard let nsEvent = NSEvent(cgEvent: cgEvent) else { return [] }
         // Only indirect touches are trackpad fingers. Direct ones come from a
         // touchscreen and have no `normalizedPosition`.
@@ -292,7 +292,7 @@ final class TrackpadGestureMonitor {
             var position = NSPoint.zero
             let readable = NFReadNormalizedPosition(touch, &position)
             let phase = touch.phase
-            return SwipeDownDetector.Touch(
+            return SwipeDetector.Touch(
                 id: "\(touch.identity)",
                 position: readable ? position : nil,
                 isBegan: phase == .began,
@@ -302,13 +302,13 @@ final class TrackpadGestureMonitor {
     }
 
     /// Feeds one frame of touches into the detector.
-    private func handleTouches(_ touches: [SwipeDownDetector.Touch]) {
+    private func handleTouches(_ touches: [SwipeDetector.Touch]) {
         frameCounter += 1
 
-        guard detector.handle(touches) else { return }
-        PerfLog.log("[NF-GESTURE] three-finger swipe down")
+        guard let direction = detector.handle(touches) else { return }
+        PerfLog.log("[NF-GESTURE] three-finger swipe \(direction == .up ? "up" : "down")")
         DispatchQueue.main.async { [weak self] in
-            self?.onSwipeDown?()
+            self?.onSwipe?(direction)
         }
     }
 }
