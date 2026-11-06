@@ -38,6 +38,17 @@ final class TrackpadGestureMonitor {
     /// was created before the grant stays silent — so it has to be replaced.
     private var permissionTimer: Timer?
 
+    /// Timer that re-enables the tap when the system disables it.
+    private var tapWatchdogTimer: Timer?
+
+    /// Total number of touch frames received — used to tell a live tap from a
+    /// disabled one.
+    private var frameCounter = 0
+    /// The frame counter at the last watchdog check.
+    private var lastFrameCount = 0
+    /// Set when the system reports that it disabled the tap.
+    private var tapWasDisabled = false
+
     // MARK: - Lifecycle
 
     /// Starts observing. Safe to call repeatedly; only the first call matters.
@@ -119,6 +130,49 @@ final class TrackpadGestureMonitor {
         tap = created
         PerfLog.log("[NF-GESTURE] tap installed")
         startPermissionWatch()
+        startTapWatchdog()
+    }
+
+    /// Re-enables the tap if the system disabled it.
+    ///
+    /// macOS disables an event tap that takes too long to service its callback.
+    /// The tap's callback returns immediately, but the *conversion* of the event
+    /// to `NSEvent` was originally done with `DispatchQueue.main.sync`, which
+    /// blocked the callback while the main thread ran — and the main thread of
+    /// this app regularly blocks for hundreds of milliseconds (the Finder
+    /// polling runs AppleScript against Finder every 0.12 s). The window
+    /// server therefore saw the tap as unresponsive and disabled it, after
+    /// which the gesture was silently dead.
+    ///
+    /// Two mechanisms keep the tap alive:
+    ///
+    /// 1. The callback no longer waits for the main thread at all.
+    /// 2. The system notifies us about a disable through the
+    ///    `tapDisabledByTimeout` / `tapDisabledByUserInput` event types, which
+    ///    are handled in `handle(type:event:)`.
+    ///
+    /// The watchdog below is the safety net for the case where the disable
+    /// notification itself is missed. It watches the *frame counter* rather
+    /// than `CGEvent.tapIsEnabled`, because that API reports `false` for a
+    /// listen-only tap that is perfectly alive.
+    private func startTapWatchdog() {
+        tapWatchdogTimer?.invalidate()
+        tapWatchdogTimer = nil
+        tapWatchdogTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            guard let self, let tap = self.tap else { return }
+            // Frames arrived since the last check → the tap is delivering.
+            guard self.lastFrameCount == self.frameCounter else {
+                self.lastFrameCount = self.frameCounter
+                return
+            }
+            // No frames at all — that is expected when nobody touches the
+            // trackpad, so nothing can be concluded. Only a *previous* disable
+            // makes this worth acting on.
+            guard self.tapWasDisabled else { return }
+            self.tapWasDisabled = false
+            CGEvent.tapEnable(tap: tap, enable: true)
+            PerfLog.log("[NF-GESTURE] tap was disabled — re-enabled")
+        }
     }
 
     /// Watches for the permissions being granted and swaps the tap for a fresh
@@ -154,6 +208,8 @@ final class TrackpadGestureMonitor {
     private func removeTap() {
         permissionTimer?.invalidate()
         permissionTimer = nil
+        tapWatchdogTimer?.invalidate()
+        tapWatchdogTimer = nil
         if let tap {
             CGEvent.tapEnable(tap: tap, enable: false)
             CFMachPortInvalidate(tap)
@@ -166,31 +222,52 @@ final class TrackpadGestureMonitor {
 
     /// The tap callback. Static because the C function pointer has no context.
     private static func handle(type: CGEventType, event: CGEvent) {
+        // The system tells us when it disables the tap (the callback took too
+        // long, or the user interacted). Both must re-enable the tap, or the
+        // gesture stays dead for the rest of the session.
+        switch type {
+        case .tapDisabledByTimeout:
+            PerfLog.log("[NF-GESTURE] tap disabled by timeout — re-enabling")
+            shared?.tapWasDisabled = true
+            if let tap = shared?.tap {
+                CGEvent.tapEnable(tap: tap, enable: true)
+            }
+            return
+        case .tapDisabledByUserInput:
+            PerfLog.log("[NF-GESTURE] tap disabled by user input — re-enabling")
+            shared?.tapWasDisabled = true
+            if let tap = shared?.tap {
+                CGEvent.tapEnable(tap: tap, enable: true)
+            }
+            return
+        default:
+            break
+        }
+
         guard type.rawValue == 29 else { return }
         guard let monitor = shared else { return }
         monitor.process(event)
     }
 
     private func process(_ cgEvent: CGEvent) {
-        // `NSEvent(cgEvent:)` must run on the main thread or AppKit crashes.
-        // The tap callback is not on the main thread, so the conversion is
-        // deferred; the touch data is copied out of the event first.
-        let touches = Self.decodeTouches(from: cgEvent)
+        // The tap callback runs on a private thread, and the window server
+        // disables a tap whose callback takes too long. Waiting for the main
+        // thread here would be exactly that — the main thread of this app
+        // regularly blocks for hundreds of milliseconds (the Finder polling
+        // runs AppleScript against Finder on a 0.12 s timer).
+        //
+        // So the event is *handed over* to the main thread without waiting for
+        // it. `NSEvent(cgEvent:)` is only safe on the main thread, and it
+        // reads the touch list lazily — the `NSTouch` objects would go stale
+        // once the callback returned — so the touch data is read on the main
+        // thread, but the tap callback itself returns immediately.
+        //
+        // The frames are delivered in order, so the detector still sees a
+        // consistent sequence even though the work happens a little later.
         DispatchQueue.main.async { [weak self] in
+            let touches = Self.decodeTouchesOnMainThread(from: cgEvent)
             self?.handleTouches(touches)
         }
-    }
-
-    private static func decodeTouches(from cgEvent: CGEvent) -> [SwipeDownDetector.Touch] {
-        // `NSEvent(cgEvent:)` is only safe on the main thread.
-        guard Thread.isMainThread else {
-            var result: [SwipeDownDetector.Touch] = []
-            DispatchQueue.main.sync {
-                result = decodeTouchesOnMainThread(from: cgEvent)
-            }
-            return result
-        }
-        return decodeTouchesOnMainThread(from: cgEvent)
     }
 
     private static func decodeTouchesOnMainThread(from cgEvent: CGEvent) -> [SwipeDownDetector.Touch] {
@@ -213,6 +290,8 @@ final class TrackpadGestureMonitor {
 
     /// Feeds one frame of touches into the detector.
     private func handleTouches(_ touches: [SwipeDownDetector.Touch]) {
+        frameCounter += 1
+
         guard detector.handle(touches) else { return }
         PerfLog.log("[NF-GESTURE] three-finger swipe down")
         DispatchQueue.main.async { [weak self] in
