@@ -16,6 +16,11 @@ import CoreGraphics
 /// as a finger is down — a well-known AppKit trap. We only ever observe, never
 /// swallow, so the focused app still receives the gesture.
 ///
+/// The tap spans the whole login session, so the frames arrive regardless of
+/// which app is frontmost. This does depend on the「输入监控」/「辅助功能」
+/// permissions being granted for the *current* code signature — see the
+/// permission check in `installTap()`.
+///
 /// The decision itself lives in `SwipeDownDetector`, which is pure and can be
 /// exercised without a trackpad.
 final class TrackpadGestureMonitor {
@@ -89,6 +94,11 @@ final class TrackpadGestureMonitor {
         //
         // Both prompts are raised here so the user is not left with a gesture
         // that silently does nothing.
+        //
+        // A permission that was granted to an *earlier* code signature is
+        // silently ignored by macOS — the tap then stays silent even though
+        // the switch in System Settings looks enabled. That is why the state
+        // is read here and logged, and why the settings UI shows it.
         if !NFHasAccessibilityAccess() {
             NFRequestAccessibilityAccess()
             PerfLog.log("[NF-GESTURE] accessibility permission requested")
@@ -105,6 +115,9 @@ final class TrackpadGestureMonitor {
         // A *session* tap is what sees the trackpad frames. The tap is
         // listen-only, so the focused app still receives the gesture and the
         // window server never waits for our callback.
+        //
+        // A session tap spans the whole login session, not just NewFinder's
+        // own windows — so the frames arrive no matter which app is frontmost.
         let created = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,

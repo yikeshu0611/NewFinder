@@ -127,6 +127,10 @@ cp "$APP_DIR/Contents/MacOS/$APP_NAME" "$WATCH_APP/Contents/MacOS/NewFinderWatch
 #
 # The identity is addressed by its SHA hash: several certificates share the
 # same common name, and codesign refuses an ambiguous name.
+#
+# The chosen hash is recorded in `.signing-identity`. If a later build picks a
+# *different* certificate, the granted permissions silently stop matching and
+# the gesture dies — so the change is reported loudly.
 SIGN_IDENTITY="${NF_CODESIGN_IDENTITY:-}"
 if [[ -z "$SIGN_IDENTITY" ]]; then
   SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
@@ -135,6 +139,19 @@ if [[ -z "$SIGN_IDENTITY" ]]; then
     | grep -oE '[A-F0-9]{40}' \
     | head -1)"
 fi
+
+SIGN_IDENTITY_FILE="$ROOT_DIR/.signing-identity"
+if [[ -n "$SIGN_IDENTITY" && -f "$SIGN_IDENTITY_FILE" ]]; then
+  PREVIOUS_IDENTITY="$(cat "$SIGN_IDENTITY_FILE" 2>/dev/null || true)"
+  if [[ -n "$PREVIOUS_IDENTITY" && "$PREVIOUS_IDENTITY" != "$SIGN_IDENTITY" ]]; then
+    echo "WARNING: signing certificate changed ($PREVIOUS_IDENTITY -> $SIGN_IDENTITY)."
+    echo "         The 辅助功能 / 输入监控 permissions granted for the old build no"
+    echo "         longer apply. The user has to re-enable them in"
+    echo "         系统设置 → 隐私与安全性, otherwise the trackpad gesture"
+    echo "         silently stops working."
+  fi
+fi
+[[ -n "$SIGN_IDENTITY" ]] && echo "$SIGN_IDENTITY" > "$SIGN_IDENTITY_FILE"
 
 if [[ -n "$SIGN_IDENTITY" ]]; then
   if codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_DIR" 2>/dev/null; then

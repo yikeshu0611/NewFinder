@@ -2,6 +2,10 @@
 build/
 dist/
 
+# Local record of the signing identity used for the last build. It is only a
+# hint for `build.sh` to warn about permission-breaking certificate changes.
+.signing-identity
+
 # macOS
 .DS_Store
 
