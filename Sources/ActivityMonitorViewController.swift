@@ -27,6 +27,7 @@ final class ActivityMonitorViewController: NSViewController, NSTableViewDataSour
     private var refreshTimer: Timer?
     private var isRefreshing = false
     private var isActive = false
+    private var lastSystem: SystemStats?
 
     private var tableView: NSTableView!
     private var searchField: NSSearchField!
@@ -268,7 +269,6 @@ final class ActivityMonitorViewController: NSViewController, NSTableViewDataSour
         let filledCount = max(0, Int(filledBytes) / MemoryLayout<pid_t>.size)
 
         var totalCPU: Double = 0
-        var totalResident: UInt64 = 0
 
         for index in 0..<filledCount {
             let pid = pids[index]
@@ -300,7 +300,6 @@ final class ActivityMonitorViewController: NSViewController, NSTableViewDataSour
             let memory = UInt64(task.pti_resident_size)
 
             totalCPU += cpuPercent
-            totalResident += memory
 
             rows.append(ProcessRow(
                 pid: pid,
@@ -313,12 +312,14 @@ final class ActivityMonitorViewController: NSViewController, NSTableViewDataSour
             ))
         }
 
-        let memoryTotal = ProcessInfo.processInfo.physicalMemory
+        // The memory of the whole machine comes from the shared helper, so
+        // the summary and the status bar always show the same number.
+        let memory = MemoryUsage.usedAndTotal()
         let system = SystemStats(
             processCount: rows.count,
             cpuPercent: totalCPU,
-            memoryUsedBytes: totalResident,
-            memoryTotalBytes: memoryTotal
+            memoryUsedBytes: memory.used,
+            memoryTotalBytes: memory.total
         )
         return SampleResult(rows: rows, nextCPU: nextCPU, system: system)
     }
@@ -412,14 +413,21 @@ final class ActivityMonitorViewController: NSViewController, NSTableViewDataSour
     }
 
     private func updateSummary(system: SystemStats) {
-        let memUsed = Self.formatBytes(system.memoryUsedBytes)
-        let memTotal = Self.formatBytes(system.memoryTotalBytes)
-        let cpuText = String(
-            format: "%.0f%%",
-            min(system.cpuPercent, Double(ProcessInfo.processInfo.activeProcessorCount) * 100)
-        )
-        let text =
-            "进程 \(system.processCount) · 显示 \(filteredRows.count) · CPU \(cpuText) · 内存 \(memUsed) / \(memTotal)"
+        lastSystem = system
+        // 只显示选中进程的信息，整体统计不再显示。
+        let selected = selectedRows()
+        let text: String
+        if selected.isEmpty {
+            text = "未选中进程"
+        } else {
+            let selectedCPU = selected.reduce(0.0) { $0 + $1.cpuPercent }
+            let selectedMemory = selected.reduce(UInt64(0)) { $0 &+ $1.memoryBytes }
+            let selectedCPUText = String(
+                format: "%.0f%%",
+                min(selectedCPU, Double(ProcessInfo.processInfo.activeProcessorCount) * 100)
+            )
+            text = "已选 \(selected.count) 个 CPU \(selectedCPUText) 内存 \(Self.formatBytes(selectedMemory))"
+        }
         summaryLabel.stringValue = text
         onSummaryChange?(text)
     }
@@ -603,6 +611,7 @@ final class ActivityMonitorViewController: NSViewController, NSTableViewDataSour
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         updateActionButtons()
+        refreshSummaryIfNeeded()
     }
 
     func controlTextDidChange(_ obj: Notification) {
@@ -612,13 +621,12 @@ final class ActivityMonitorViewController: NSViewController, NSTableViewDataSour
             ascending: sortAscending,
             preserveSelection: true
         )
-        let parts = summaryLabel.stringValue.components(separatedBy: " · ")
-        if let prefix = parts.first {
-            let rest = parts.dropFirst(2).joined(separator: " · ")
-            let text = "\(prefix) · 显示 \(filteredRows.count)" + (rest.isEmpty ? "" : " · \(rest)")
-            summaryLabel.stringValue = text
-            onSummaryChange?(text)
-        }
+        refreshSummaryIfNeeded()
+    }
+
+    private func refreshSummaryIfNeeded() {
+        guard let system = lastSystem else { return }
+        updateSummary(system: system)
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {

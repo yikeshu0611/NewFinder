@@ -45,6 +45,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     private var versionLabel: ClickableStatusLabel!
     private var loadTimeLabel: NSTextField!
     private var systemUsageLabel: ClickableStatusLabel!
+    /// The compression that is running right now, if any.
+    private var compressProgress: ArchiveProgress?
     private var autocompletePanel: NSPanel?
     private var autocompleteList: NSTableView?
     private var autocompleteCandidates: [String] = []
@@ -440,6 +442,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         }
         contentController.onDirectoryNeedsReload = { [weak self] in
             self?.reloadAfterMutation()
+        }
+        contentController.onCompressProgress = { [weak self] progress in
+            self?.showCompressProgress(progress)
         }
         contentController.onOpenArchives = { [weak self] urls in
             self?.openArchivesInTabs(urls)
@@ -2797,6 +2802,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             bytes += item.fileSize ?? 0
         }
         return FileOperations.formatFileSize(bytes)
+    }
+
+    /// The compression has its own window, so the status bar only needs to
+    /// go back to its usual text when the work is over.
+    private func showCompressProgress(_ progress: ArchiveProgress?) {
+        guard progress == nil else { return }
+        compressProgress = nil
+        if !activeTab.isCompareTab {
+            updateStatus(selection: contentController.selectedItems)
+        }
     }
 
     // MARK: - Directory watching

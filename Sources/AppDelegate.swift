@@ -12,6 +12,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowControllers: [BrowserWindowController] = []
     private var dmgInstallWindows: [DMGInstallWindowController] = []
     private var archiveWindows: [ArchiveWindowController] = []
+    /// The compression progress windows. They float above the browser
+    /// windows, so they are put back in front whenever NF comes forward.
+    private var progressWindows: [ArchiveProgressWindow] = []
     private var isRedirectingFinder = false
     private var lastFinderRedirectAt: Date?
     /// Ignore Finder activation storms right after we steal focus (policy / close-window churn).
@@ -106,6 +109,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             showFrontBrowserOrOpenDesktop()
             bringUIToFront()
         }
+
+        Self.runDesktopGestureFromCommandLine()
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -146,6 +151,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if args.contains("--open-installed-apps") { return "installed" }
         if args.contains("--open-running-apps") { return "running" }
         return nil
+    }
+
+    /// The delay before the gesture runs.
+    ///
+    /// Long enough for the window list to settle after the launch — the
+    /// stacking order is read from the windows on screen, and right after
+    /// the launch they are still moving into place.
+    private static let gestureDelay: TimeInterval = 1.5
+
+    /// Runs the show-desktop / restore gesture for testing.
+    ///
+    /// `--show-desktop` hides every app, `--restore-desktop` brings them
+    /// back. The two can be given together, with the restore scheduled a
+    /// moment later, so the whole round trip can be watched.
+    ///
+    /// `--show-desktop-twice` hides the apps twice, which is what two
+    /// swipes down in a row do — the second one finds everything already
+    /// hidden. It checks that the apps are still restored afterwards.
+    ///
+    /// The restore is deliberately scheduled much later than the hide: hiding
+    /// is asynchronous, so a restore that comes too early would find the
+    /// apps still on their way out and would not put them back in order.
+    private static func runDesktopGestureFromCommandLine() {
+        let args = CommandLine.arguments
+        let show = args.contains("--show-desktop")
+        let showTwice = args.contains("--show-desktop-twice")
+        let restore = args.contains("--restore-desktop")
+        guard show || showTwice || restore else { return }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + gestureDelay) {
+            if show || showTwice {
+                NSApp.sendAction(#selector(AppDelegate.performShowDesktop(_:)), to: nil, from: nil)
+            }
+            if showTwice {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    NSApp.sendAction(#selector(AppDelegate.performShowDesktop(_:)), to: nil, from: nil)
+                }
+            }
+            if restore {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                    NSApp.sendAction(#selector(AppDelegate.performRestoreDesktop(_:)), to: nil, from: nil)
+                }
+            }
+        }
     }
 
     /// If another UI instance is already running, ask it to show and exit this process.
@@ -501,6 +550,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         archiveWindows.removeAll { $0 === controller }
     }
 
+    /// Keeps a compression progress window on top of the browser windows.
+    func registerProgressWindow(_ controller: ArchiveProgressWindow) {
+        progressWindows.removeAll { $0 === controller }
+        progressWindows.append(controller)
+    }
+
+    func progressWindowDidClose(_ controller: ArchiveProgressWindow) {
+        progressWindows.removeAll { $0 === controller }
+    }
+
     /// Open/focus the in-browser code compare tab for a workspace (比对1…比对10).
     func openCompareInKeyBrowser(workspace index: Int) {
         if let browser = keyBrowser() {
@@ -723,9 +782,107 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard AppSettings.shared.redirectFinderClicks else { return }
         guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
               app.bundleIdentifier == "com.apple.finder" else { return }
-        if shouldSuppressRedirect() { return }
+        if shouldSuppressRedirect() {
+            PerfLog.log("[NF-FINDER] Finder 被激活，但正在抑制重定向")
+            return
+        }
         // Immediate redirect for WeChat-style "Show in Finder" operations — no settle delay.
         scheduleFinderRedirect(settle: 0)
+    }
+    // MARK: - Fast reveal
+
+    /// Handles "Show in Finder" from another app, e.g. the folder button in
+    /// Chrome's download list.
+    ///
+    /// The app asks the *real* Finder to show the file, so Finder opens a
+    /// window and comes to the front for a moment. NF then has to take over.
+    ///
+    /// Reading what Finder is showing takes an AppleScript round trip. The
+    /// full script also lists every open window, and that listing has to wait
+    /// for Finder's main thread — which is busy opening the very window the
+    /// reveal asked for. The wait was what the user saw as a two-second
+    /// freeze.
+    ///
+    /// Only the selection and the front window are read here, which answers
+    /// right away.
+    ///
+    /// - Returns: `true` when the file was found and shown in NF.
+    private func handleRevealFastPath() -> Bool {
+        // Finder may not have updated its selection yet when the
+        // notification arrives, so the selection is read again after a
+        // short wait. The wait is short — the point of this path is speed.
+        for _ in 0..<3 {
+            let context = readFinderSelection()
+
+            if let selected = context.selectURLs.first {
+                PerfLog.log("[NF-FINDER] fast reveal — showing \(selected.lastPathComponent)")
+                reveal([selected])
+                closeFinderWindowOpenedByReveal(showing: selected.deletingLastPathComponent())
+                forceActivateNewFinder()
+                return true
+            }
+
+            // A folder was revealed — there is no file to select.
+            //
+            // The Desktop is not such a folder. On macOS the desktop is
+            // itself a Finder window, so a click on the blank desktop
+            // reports the Desktop as the front window's folder. Treating
+            // that as a reveal would pop a Desktop window open in NF for
+            // every stray click, which is what this path must not do.
+            if let folder = context.folderURL, !folder.isDesktopFolder {
+                PerfLog.log("[NF-FINDER] fast reveal — showing folder \(folder.lastPathComponent)")
+                reveal([folder])
+                closeFinderWindowOpenedByReveal(showing: folder)
+                forceActivateNewFinder()
+                return true
+            }
+            // Nothing yet — the reveal has not taken hold.
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+
+        PerfLog.log("[NF-FINDER] fast reveal — nothing selected")
+        return false
+    }
+
+    /// Closes the Finder window that the reveal opened.
+    ///
+    /// NF shows the file itself, so the window the real Finder opened is
+    /// just clutter — and it is still sitting behind NF, waiting to be
+    /// closed by hand.
+    ///
+    /// The window is closed through the accessibility API rather than with
+    /// AppleScript, because AppleScript has to wait for Finder's main
+    /// thread — and Finder is busy opening the very window that is to be
+    /// closed. That wait is what made "Show in Finder" freeze for two
+    /// seconds.
+    ///
+    /// The window may not be on screen yet when the reveal is noticed, so
+    /// the closing is tried again for a short while.
+    ///
+    /// - Parameter folder: the folder the reveal was showing. Only that
+    ///   window is closed — the windows the user had open before stay open.
+    private func closeFinderWindowOpenedByReveal(showing folder: URL) {
+        for attempt in 0..<4 {
+            if FinderWindowCloser.closeWindowShowing(folder: folder) {
+                PerfLog.log("[NF-FINDER] closed the Finder window the reveal opened")
+                return
+            }
+            // The window is not there yet — wait a moment for it.
+            if attempt < 3 {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.04))
+            }
+        }
+        PerfLog.log("[NF-FINDER] no Finder window to close")
+    }
+
+    /// Reads what Finder has selected, without touching its window list.
+    ///
+    /// The window list is the slow part, so it is left alone. Only the
+    /// selection and the front window are asked for, which answers quickly
+    /// even while Finder is busy.
+    private func readFinderSelection() -> FinderContext {
+        let (raw, _) = runAppleScript(FinderVolumeGuard.readSelectionScript)
+        return FinderContext(state: FinderVolumeGuard.parseFinderState(raw))
     }
 
     func updateFinderWindowPollTimer() {
@@ -761,6 +918,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Only when Finder is frontmost — a background DMG window must not yank focus from NF.
         guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.finder" else { return }
         guard finderLooksLikeItHasBrowserWindows() else { return }
+        PerfLog.log("[NF-FINDER] 轮询发现 Finder 在前台")
         scheduleFinderRedirect(settle: 0)
     }
 
@@ -805,7 +963,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let frontIsFinder = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.finder"
-        guard frontIsFinder || finderLooksLikeItHasBrowserWindows() else { return }
+        guard frontIsFinder || finderLooksLikeItHasBrowserWindows() else {
+            PerfLog.log("[NF-FINDER] 重定向放弃 — Finder 不在前台，也没有窗口")
+            return
+        }
 
         // During a DMG session: probe without stealing. Stay on installer if still on /Volumes/.
         if isLeavingFinderAloneForVolumes() {
@@ -819,25 +980,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // A click on the blank desktop activates Finder but produces no
-        // context at all — no selection, no window. Following the normal path
-        // would end in the "nothing to show" fallback and open the Desktop
-        // folder in NF, so a stray click on the desktop would pop a window
-        // open. The click is classified before any focus is stolen.
+        // The click is classified before any focus is stolen, so a stray
+        // click on the desktop does not pop an NF window open.
         //
-        // Only a *user click* can be a click on the blank desktop. Finder
-        // being activated programmatically — an app revealing a file — must be
-        // redirected even when the mouse rests on a blank spot, so a missing
-        // click falls through to the normal path.
-        //
-        // The throttle IS applied here: the Finder poll timer runs every
-        // 120 ms, and without a throttle the same click would be classified
-        // (and logged) over and over while the pointer stayed still.
+        // The classification is only a hint here. It is worked out from the
+        // spot under the pointer, and that spot can be a part of another
+        // app's window that the window list does not describe — the strip
+        // above a window, for instance. So the decision is confirmed by
+        // what Finder actually has to show: an app revealing a file leaves a
+        // selection (or a window) behind, and a click on the blank desktop
+        // leaves nothing at all.
         let intent = FinderActivationIntent.currentClickIntent() ?? .content
-        if frontIsFinder, intent == .blankDesktop {
+        let clickMayBeBlankDesktop = frontIsFinder && intent == .blankDesktop
+
+        isRedirectingFinder = true
+        lastFinderRedirectAt = Date()
+        // Closing Finder / activating NF can re-fire Finder notifications — pause briefly.
+        suppressFinderRedirectUntil = Date().addingTimeInterval(0.5)
+
+        // Fast path: an app that revealed a file ("Show in Finder") only needs
+        // the selection, and that answers right away. The full script also
+        // lists every open window, which has to wait for Finder's busy main
+        // thread and looked like a two-second hang.
+        if handleRevealFastPath() {
             isRedirectingFinder = false
-            // macOS sends several activation notifications for one click, and
-            // the poll timer adds more — only report the first one.
+            return
+        }
+
+        // Nothing was revealed. If the click looked like a click on the
+        // blank desktop, that is what it was — hand the screen back to
+        // Finder instead of opening the Desktop folder in NF.
+        if clickMayBeBlankDesktop {
+            isRedirectingFinder = false
             let isRepeat = FinderActivationIntent.isRepeatOfRecentBlankDesktopClick()
             lastFinderRedirectAt = Date()
             suppressFinderRedirectUntil = Date().addingTimeInterval(0.5)
@@ -845,35 +1019,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if !isRepeat {
                 PerfLog.log("[NF-FINDER] blank desktop click — not redirecting")
             }
+            reactivateFinder()
             return
         }
-
-        isRedirectingFinder = true
-        lastFinderRedirectAt = Date()
-        // Closing Finder / activating NF can re-fire Finder notifications — pause briefly.
-        suppressFinderRedirectUntil = Date().addingTimeInterval(0.5)
 
         // Switch focus first so the Finder flash is as short as possible (same as before).
         forceActivateNewFinder()
 
-        // ONE AppleScript round trip: read the selection / window targets AND close
-        // the Finder windows that are not on a mounted volume. Previously this was
-        // three separate scripts, each of which had to wait for Finder's main thread.
-        let context = readAndCloseFinderContext()
-        if finderContextInvolvesMountedVolume(context) || finderContextHasVolumeWindow(context) {
-            beginLeavingFinderAlone()
-            // Prefer NewFinder's installer UI over the fragile system Finder sheet.
-            if let volume = volumeURLForInstaller(from: context) {
-                _ = presentInstallerForMountedVolume(volume)
-                closeFinderWindowsPreservingVolumes()
-            } else {
-                reactivateFinder()
+        // The selection and the front window are read first. They answer
+        // right away, and they are what a reveal needs.
+        let context = readFinderSelection()
+        if finderContextInvolvesMountedVolume(context) {
+            // A volume is involved — the window list has to be read to tell
+            // which windows are on it, and the windows must survive.
+            let full = readAndCloseFinderContext()
+            if finderContextInvolvesMountedVolume(full) || finderContextHasVolumeWindow(full) {
+                beginLeavingFinderAlone()
+                // Prefer NewFinder's installer UI over the fragile system Finder sheet.
+                if let volume = volumeURLForInstaller(from: full) {
+                    _ = presentInstallerForMountedVolume(volume)
+                    closeFinderWindowsPreservingVolumes()
+                } else {
+                    reactivateFinder()
+                }
+                isRedirectingFinder = false
+                return
             }
             isRedirectingFinder = false
             return
         }
 
-        if context.selectURLs.isEmpty && context.folderURL == nil {
+        // The Desktop is not a folder that was revealed — on macOS the
+        // desktop is a Finder window in its own right, so it shows up as the
+        // front window's folder even when the user only clicked the blank
+        // desktop. Treating it as a reveal would pop a Desktop window open
+        // in NF for every stray click.
+        let revealedFolder = context.folderURL.flatMap { $0.isDesktopFolder ? nil : $0 }
+
+        if context.selectURLs.isEmpty && revealedFolder == nil {
             // First DMG open: mount + installer often arrive after Finder activates.
             // Do NOT close windows yet — wait and re-check for /Volumes/.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
@@ -1013,7 +1196,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if hasActiveBrowserWindow() {
             // NF already open: steal focus only; do not open Desktop / new tab from Finder dock click.
             keyBrowser()?.window?.makeKeyAndOrderFront(nil)
-        } else if let folder = context.folderURL {
+        } else if let folder = context.folderURL, !folder.isDesktopFolder {
             openNewWindow(at: folder)
         } else if intent == .dock {
             // A Dock click with no window and no selection — the user asked
@@ -1060,6 +1243,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.collectionBehavior.insert(.moveToActiveSpace)
             window.orderFrontRegardless()
             window.makeKeyAndOrderFront(nil)
+        }
+
+        // The compression progress window belongs on top of them all.
+        for controller in progressWindows {
+            controller.raiseToFront()
         }
 
         NSApp.unhide(nil)
@@ -1936,5 +2124,21 @@ private final class ClickToFocusTextField: NSTextField {
             // Mouse wheel: one event ≈ one notch → ±1.
             onScrollStep(dy > 0 ? 1 : -1)
         }
+    }
+}
+
+extension URL {
+    /// True when the URL points at the user's Desktop folder.
+    ///
+    /// On macOS the desktop is a Finder window in its own right, so a click
+    /// on the blank desktop reports the Desktop as the front window's
+    /// folder. That is not a "show me this folder" request, and it must not
+    /// be treated as one.
+    var isDesktopFolder: Bool {
+        let desktop = FileManager.default
+            .homeDirectoryForCurrentUser
+            .appendingPathComponent("Desktop", isDirectory: true)
+            .standardizedFileURL
+        return standardizedFileURL == desktop
     }
 }

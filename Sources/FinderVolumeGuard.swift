@@ -88,6 +88,39 @@ enum FinderVolumeGuard {
       end try
     """
 
+    /// Read only what a "Show in Finder" needs: the selected items and the
+    /// folder of the front window.
+    ///
+    /// The full script above also lists every open window, and that listing
+    /// has to wait for Finder's main thread — which is busy opening the very
+    /// window the reveal asked for. The wait was what made "Show in Finder"
+    /// freeze for two seconds.
+    ///
+    /// This script leaves the windows alone, so it answers right away.
+    static let readSelectionScript = """
+    with timeout of 1 second
+      tell application "Finder"
+        set out to ""
+        try
+          set sel to the selection
+          if (count of sel) > 0 then
+            repeat with s in sel
+              try
+                set out to out & "SEL " & (POSIX path of (s as alias)) & linefeed
+              end try
+            end repeat
+          end if
+        end try
+        try
+          if (count of Finder windows) > 0 then
+            set out to out & "DIR " & (POSIX path of ((target of front Finder window) as alias)) & linefeed
+          end if
+        end try
+        return out
+      end tell
+    end timeout
+    """
+
     /// Read everything NF needs from Finder in ONE round trip:
     ///   `SEL <path>` — each selected item
     ///   `DIR <path>` — target of the front Finder window
@@ -110,8 +143,12 @@ enum FinderVolumeGuard {
     ///
     /// Windows on `/Volumes/` are left alone, and if any such window exists
     /// nothing is closed at all (a DMG / USB window must survive).
+    ///
+    /// The timeout is short: Finder is often busy opening a window at this
+    /// moment, and the script would otherwise sit there for the full two
+    /// seconds before giving up. The caller falls back to a slower path.
     static let readAndCloseFinderStateScript = """
-    with timeout of 2 seconds
+    with timeout of 1 second
       tell application "Finder"
         \(readBody)
         if sawVolume is false then

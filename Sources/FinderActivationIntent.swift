@@ -66,6 +66,16 @@ enum FinderActivationIntent {
         let intent: Intent
         /// When the click happened.
         let date: Date
+        /// The app that owned the spot under the pointer when the click
+        /// happened.
+        ///
+        /// A click in another app — a right-click on a message in WeChat,
+        /// say — says nothing about Finder. Without this, such a click was
+        /// tested against Finder's elements, and the desktop behind that app
+        /// was found, so the click was taken for a click on the blank
+        /// desktop. The reveal that followed was then not redirected, and
+        /// the real Finder stayed on screen for seconds.
+        let owningAppBundleIdentifier: String?
     }
 
     /// How long a click stays relevant. Long enough to cover the delay
@@ -175,24 +185,93 @@ enum FinderActivationIntent {
         lastBlankDesktopAt = Date()
     }
 
-    /// Classifies the click that is currently under the mouse pointer.
-    ///
-    /// Used when no click was recorded (for instance when Finder was
-    /// activated by something other than a click) — the pointer position is
-    /// the best guess available then.
-    static func currentIntent() -> Intent {
-        if let click = recentClick() {
-            return click.intent
-        }
-        return classify(at: quartzMouseLocation())
-    }
-
     // MARK: - Recording
 
     private static func record(_ event: NSEvent) {
         let location = quartzLocation(of: event)
-        let intent = classify(at: location)
-        lastClick = Click(location: location, intent: intent, date: Date())
+        // Which app the click really belongs to.
+        //
+        // The frontmost app is not enough: clicking the desktop *is* what
+        // brings Finder to the front, so at the moment the click is
+        // recorded the previous app may still be in front. The app that
+        // owns the spot under the pointer is the one that got the click.
+        let owner = owningApplication(at: location)
+        let intent: Intent
+        if let owner, owner != "com.apple.finder" {
+            // The click landed in another app, so it cannot be a click on
+            // Finder's desktop or its windows.
+            intent = .content
+        } else {
+            // Finder owns the spot, or no app does — the click fell through
+            // to the desktop, which is Finder's own background.
+            intent = classify(at: location)
+        }
+        lastClick = Click(
+            location: location,
+            intent: intent,
+            date: Date(),
+            owningAppBundleIdentifier: owner
+        )
+    }
+
+    /// The bundle identifier of the app that owns the spot under the pointer.
+    ///
+    /// The window list is used, because the accessibility hit test answers
+    /// with the app's menu bar when nothing is under the pointer — and the
+    /// menu bar's frame is a thin strip at the top of the screen that does
+    /// not contain the point. A window's frame, on the other hand, says
+    /// exactly where the click landed.
+    ///
+    /// Only the frontmost app and Finder are asked. The window list reports
+    /// the windows of every running app as being on screen, even the ones
+    /// hidden behind others, so taking the topmost of them all would say
+    /// that the click belonged to some app in the background.
+    private static func owningApplication(at point: CGPoint) -> String? {
+        guard let windows = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly],
+            kCGNullWindowID
+        ) as? [[String: Any]] else { return nil }
+
+        if let frontApp = NSWorkspace.shared.frontmostApplication,
+           hasWindow(of: frontApp.processIdentifier, at: point, in: windows) {
+            return frontApp.bundleIdentifier
+        }
+
+        // Nothing of the frontmost app was there, so the click belonged to
+        // whatever is underneath — Finder's desktop, most often.
+        if let finderPID = NSRunningApplication
+            .runningApplications(withBundleIdentifier: "com.apple.finder")
+            .first?
+            .processIdentifier,
+           hasWindow(of: finderPID, at: point, in: windows) {
+            return "com.apple.finder"
+        }
+
+        return nil
+    }
+
+    /// True when the app owns a normal window that covers the point.
+    private static func hasWindow(
+        of pid: pid_t,
+        at point: CGPoint,
+        in windows: [[String: Any]]
+    ) -> Bool {
+        for window in windows {
+            guard let ownerPID = window[kCGWindowOwnerPID as String] as? pid_t,
+                  ownerPID == pid else { continue }
+            guard let layer = window[kCGWindowLayer as String] as? Int, layer >= 0 else { continue }
+            // The menu bar and the Dock are system chrome, not a window the
+            // app would take the click for.
+            let ownerName = window[kCGWindowOwnerName as String] as? String ?? ""
+            if ownerName == "程序坞" || ownerName == "Dock" { continue }
+            if layer == 24 { continue }
+            guard let bounds = window[kCGWindowBounds as String] as? [String: Any],
+                  let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { continue }
+            if rect.contains(point) {
+                return true
+            }
+        }
+        return false
     }
 
     // MARK: - Classification
@@ -203,11 +282,64 @@ enum FinderActivationIntent {
         let finderHit = applicationElement(for: "com.apple.finder")
             .flatMap { hitTest(application: $0, at: point) }
 
-        let displaySize = displayBounds(containing: point)?.size
-            ?? NSScreen.main?.frame.size
-            ?? .zero
+        // The accessibility hit test cannot be trusted to say whether the
+        // point is on the blank desktop, so the window list is asked too.
+        let onBlankDesktop = isOnBlankDesktop(at: point)
 
-        return intent(dockHit: dockHit, finderHit: finderHit, displaySize: displaySize)
+        return intent(
+            dockHit: dockHit,
+            finderHit: finderHit,
+            onBlankDesktop: onBlankDesktop
+        )
+    }
+
+    /// True when the point lies on Finder's blank desktop.
+    ///
+    /// The accessibility hit test is unreliable here: asked for a point on
+    /// the desktop it often answers with Finder's menu bar, whose frame is a
+    /// thin strip at the top of the screen and does not contain the point at
+    /// all. The window list is used instead.
+    ///
+    /// The desktop is the background that every window sits on. A point is on
+    /// the blank desktop when the background is under it and neither the
+    /// frontmost app nor Finder has a window there.
+    private static func isOnBlankDesktop(at point: CGPoint) -> Bool {
+        guard let windows = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly],
+            kCGNullWindowID
+        ) as? [[String: Any]] else { return false }
+
+        // A window of the app that was in front took the click.
+        if let frontApp = NSWorkspace.shared.frontmostApplication,
+           hasWindow(of: frontApp.processIdentifier, at: point, in: windows) {
+            return false
+        }
+
+        // So did a window of Finder — its browser windows, or the desktop
+        // icons that sit on the background.
+        if let finderPID = NSRunningApplication
+            .runningApplications(withBundleIdentifier: "com.apple.finder")
+            .first?
+            .processIdentifier,
+           hasWindow(of: finderPID, at: point, in: windows) {
+            return false
+        }
+
+        // Nothing was under the pointer but the background itself.
+        return hasBackground(at: point, in: windows)
+    }
+
+    /// True when the desktop background is under the point.
+    private static func hasBackground(at point: CGPoint, in windows: [[String: Any]]) -> Bool {
+        for window in windows {
+            guard let layer = window[kCGWindowLayer as String] as? Int, layer < 0 else { continue }
+            guard let bounds = window[kCGWindowBounds as String] as? [String: Any],
+                  let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { continue }
+            if rect.contains(point) {
+                return true
+            }
+        }
+        return false
     }
 
     // MARK: - Coordinates
@@ -253,31 +385,6 @@ enum FinderActivationIntent {
         return quartzLocation(cocoa: cocoa, primaryMaxY: primary.frame.maxY)
     }
 
-    /// The mouse position in Quartz coordinates.
-    private static func quartzMouseLocation() -> CGPoint {
-        // `CGEvent.location` is already in Quartz coordinates.
-        CGEvent(source: nil)?.location ?? .zero
-    }
-
-    /// The bounds of the display that contains a Quartz point.
-    ///
-    /// `CGDisplayBounds` is already in Quartz coordinates, so it lines up with
-    /// the accessibility frames.
-    private static func displayBounds(containing point: CGPoint) -> CGRect? {
-        var count: UInt32 = 0
-        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else {
-            return nil
-        }
-        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
-        guard CGGetActiveDisplayList(count, &displays, &count) == .success else { return nil }
-
-        for display in displays {
-            let bounds = CGDisplayBounds(display)
-            if bounds.contains(point) { return bounds }
-        }
-        return CGDisplayBounds(displays.first ?? 0)
-    }
-
     // MARK: - Accessibility plumbing
 
     /// The AX element of a running application, by bundle identifier.
@@ -317,15 +424,6 @@ enum FinderActivationIntent {
             }
         }
 
-        /// True when the element is the desktop background — the container
-        /// that covers the whole display.
-        func coversScreen(displaySize: CGSize) -> Bool {
-            guard role == "AXGroup" || role == "AXScrollArea" || role == "AXUnknown" else {
-                return false
-            }
-            guard displaySize.width > 0, displaySize.height > 0 else { return false }
-            return frame.width >= displaySize.width * 0.9 && frame.height >= displaySize.height * 0.9
-        }
     }
 
     /// Decides the intent from the elements that were hit.
@@ -337,13 +435,26 @@ enum FinderActivationIntent {
     /// - Parameters:
     ///   - dockHit: what the Dock's hit test found, if anything.
     ///   - finderHit: what Finder's hit test found, if anything.
-    ///   - displaySize: the size of the display the click was on.
-    static func intent(dockHit: Hit?, finderHit: Hit?, displaySize: CGSize) -> Intent {
+    ///   - onBlankDesktop: whether the click landed on Finder's blank
+    ///     desktop, as told by the window list.
+    static func intent(
+        dockHit: Hit?,
+        finderHit: Hit?,
+        onBlankDesktop: Bool = false
+    ) -> Intent {
         // The Dock sits on top of the desktop, so it has to be asked first —
         // otherwise a Dock click would be reported as a click on the blank
         // desktop underneath it.
         if let dockHit, dockHit.isDockItem {
             return .dock
+        }
+        // The window list says whether the click fell through to the bare
+        // desktop. That answer is trusted on its own: the accessibility hit
+        // test cannot tell the desktop apart from the menu bar, and getting
+        // that wrong made a "Show in Finder" from another app look like a
+        // click on the desktop, which stopped the hand-over.
+        if onBlankDesktop {
+            return .blankDesktop
         }
         guard let finderHit else {
             // Without a hit test nothing can be said — let the normal path run.
@@ -351,9 +462,6 @@ enum FinderActivationIntent {
         }
         if finderHit.isDesktopIcon {
             return .content
-        }
-        if finderHit.coversScreen(displaySize: displaySize) {
-            return .blankDesktop
         }
         // Anything else (a Finder window, an unknown element) — follow the
         // normal path and let the Finder context decide.

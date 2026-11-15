@@ -84,6 +84,7 @@ enum ArchiveSupport {
     static func compress(
         urls: [URL],
         options: ArchiveCompressOptions,
+        onProgress: ((ArchiveProgress) -> Void)? = nil,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
         let password = options.password.isEmpty ? nil : options.password
@@ -95,7 +96,8 @@ enum ArchiveSupport {
                     format: options.compressFormat,
                     password: password,
                     split: options.splitVolume,
-                    progress: { _ in }
+                    progress: { _ in },
+                    progressDetail: onProgress
                 )
                 await MainActor.run { completion(.success(())) }
             } catch {
@@ -149,6 +151,8 @@ enum ArchiveSupport {
         let entries = try listEntries(in: archive)
         let prefix = internalPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         var children: [String: FileItem] = [:]
+        /// The total size of the files in each folder.
+        var folderSizes: [String: Int64] = [:]
 
         for entry in entries {
             let path = entry.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -171,6 +175,11 @@ enum ArchiveSupport {
             let isDirectDirectory = parts.count > 1 || entry.isDirectory
             let childPath = prefix.isEmpty ? name : "\(prefix)/\(name)"
 
+            // The size of a folder is the sum of the files inside it.
+            if isDirectDirectory, let size = entry.size {
+                folderSizes[childPath, default: 0] += size
+            }
+
             if children[name] == nil {
                 children[name] = FileItem.archiveEntry(
                     archive: archive,
@@ -190,7 +199,20 @@ enum ArchiveSupport {
             }
         }
 
-        return children.values.sorted {
+        // Give the folders the size of what is inside them.
+        var result: [FileItem] = []
+        for (name, item) in children {
+            if item.isDirectory,
+               let entryPath = item.archiveEntryPath,
+               let size = folderSizes[entryPath],
+               size > 0 {
+                result.append(item.withFileSize(size))
+            } else {
+                result.append(item)
+            }
+        }
+
+        return result.sorted {
             $0.name.localizedStandardCompare($1.name) == .orderedAscending
         }
     }

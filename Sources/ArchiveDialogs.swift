@@ -50,6 +50,10 @@ enum ArchiveDialogs {
         let okBtn = NSButton(title: "压缩", target: nil, action: nil)
         okBtn.keyEquivalent = "\r"
         cancelBtn.keyEquivalent = "\u{1b}"
+        // The identifiers make the buttons reachable through the
+        // accessibility API, which is also how the tests press them.
+        okBtn.setAccessibilityIdentifier("archive.compress.confirm")
+        cancelBtn.setAccessibilityIdentifier("archive.compress.cancel")
 
         let views: [NSView] = [
             pathLabel, pathField, browseBtn, nameLabel, nameField,
@@ -215,6 +219,10 @@ enum ArchiveDialogs {
 
         // Retain handler for modal session
         objc_setAssociatedObject(panel, "handler", handler, .OBJC_ASSOCIATION_RETAIN)
+
+        // Put the focus in the name field, so the Return key starts the
+        // compression right away.
+        panel.initialFirstResponder = nameField
 
         let code = NSApp.runModal(for: panel)
         return code == .OK ? handler.result : nil

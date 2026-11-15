@@ -89,28 +89,7 @@ final class SystemUsageMonitor: NSObject {
     }
 
     private func readMemoryUsage() -> (used: UInt64, total: UInt64) {
-        let total = ProcessInfo.processInfo.physicalMemory
-        var vmStat = vm_statistics64()
-        var count = mach_msg_type_number_t(
-            MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size
-        )
-        let hostPort = mach_host_self()
-        let result = withUnsafeMutablePointer(to: &vmStat) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                host_statistics64(hostPort, HOST_VM_INFO64, $0, &count)
-            }
-        }
-        guard result == KERN_SUCCESS else { return (0, total) }
-
-        let pageSize = UInt64(vm_kernel_page_size)
-        // Wired + active + inactive + compressed approximates the in-use footprint;
-        // file-backed pages are reclaimable, so they are excluded.
-        let usedPages = UInt64(vmStat.wire_count)
-            &+ UInt64(vmStat.active_count)
-            &+ UInt64(vmStat.inactive_count)
-            &+ UInt64(vmStat.compressor_page_count)
-        let used = min(usedPages * pageSize, total)
-        return (used, total)
+        MemoryUsage.usedAndTotal()
     }
 
     private func readCPUTicks() -> (user: UInt32, system: UInt32, idle: UInt32)? {
@@ -156,13 +135,21 @@ final class SystemUsageMonitor: NSObject {
         return formatter.string(fromByteCount: Int64(clamping: bytes))
     }
 
+    /// Memory uses binary units (128 GiB shows as "128 GB"), which is how
+    /// macOS reports physical memory. Disk keeps decimal units above.
+    static func formatMemoryBytes(_ bytes: UInt64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .memory
+        formatter.allowsNonnumericFormatting = false
+        formatter.allowedUnits = [.useGB, .useTB, .useMB]
+        formatter.zeroPadsFractionDigits = false
+        return formatter.string(fromByteCount: Int64(clamping: bytes))
+    }
+
     static func formatText(_ snapshot: Snapshot) -> String {
         let disk = "\(formatBytes(snapshot.diskUsed))(\(formatBytes(snapshot.diskTotal)))"
-        // Memory usage as a percentage with two decimals, e.g. 54.10%.
-        let memoryPercent = snapshot.memoryTotal > 0
-            ? Double(snapshot.memoryUsed) / Double(snapshot.memoryTotal) * 100.0
-            : 0
-        let memory = String(format: "%.2f%%", memoryPercent)
+        // Memory as "used(total)", the same shape as the disk.
+        let memory = "\(formatMemoryBytes(snapshot.memoryUsed))(\(formatMemoryBytes(snapshot.memoryTotal)))"
         // CPU always shows two digits, e.g. 05%.
         let cpu = String(format: "%02d%%", Int(snapshot.cpuPercent.rounded()))
         return "硬盘 \(disk) · 内存 \(memory) · CPU \(cpu)"

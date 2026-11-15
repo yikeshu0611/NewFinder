@@ -40,3 +40,23 @@ swiftc \
   -o "$BUILD_DIR/OptionTapTests"
 
 "$BUILD_DIR/OptionTapTests"
+
+swiftc \
+  -O \
+  "$ROOT_DIR/Sources/AppStackOrder.swift" \
+  "$TEST_DIR/AppStackOrder/main.swift" \
+  -framework AppKit \
+  -framework CoreGraphics \
+  -o "$BUILD_DIR/AppStackOrderTests"
+
+"$BUILD_DIR/AppStackOrderTests"
+
+swiftc \
+  -O \
+  "$ROOT_DIR/Sources/AppStackRestore.swift" \
+  "$TEST_DIR/AppStackRestore/main.swift" \
+  -framework AppKit \
+  -framework ApplicationServices \
+  -o "$BUILD_DIR/AppStackRestoreTests"
+
+"$BUILD_DIR/AppStackRestoreTests"

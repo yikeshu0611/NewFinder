@@ -18,9 +18,6 @@ func check(_ condition: Bool, _ message: String) {
 typealias Intent = FinderActivationIntent.Intent
 typealias Hit = FinderActivationIntent.Hit
 
-/// The display size used in the tests.
-let display = CGSize(width: 1352, height: 878)
-
 /// A hit on a desktop icon — the AXImage of a 56×56 icon.
 let desktopIcon = Hit(role: "AXImage", subrole: "", frame: CGRect(x: 168, y: 42, width: 56, height: 56))
 /// A hit on the blank desktop — the full-screen container.
@@ -35,7 +32,7 @@ do {
     let intent = FinderActivationIntent.intent(
         dockHit: nil,
         finderHit: desktopBackground,
-        displaySize: display
+        onBlankDesktop: true
     )
     check(intent == .blankDesktop, "the full-screen desktop container is the blank desktop")
 }
@@ -45,7 +42,7 @@ do {
     let intent = FinderActivationIntent.intent(
         dockHit: nil,
         finderHit: desktopIcon,
-        displaySize: display
+        onBlankDesktop: false
     )
     check(intent == .content, "a desktop icon counts as content, so the redirect follows through")
 }
@@ -55,7 +52,7 @@ do {
     let intent = FinderActivationIntent.intent(
         dockHit: dockItem,
         finderHit: desktopBackground,
-        displaySize: display
+        onBlankDesktop: false
     )
     check(intent == .dock, "a Dock item wins over the desktop underneath it")
 }
@@ -65,7 +62,7 @@ do {
     let intent = FinderActivationIntent.intent(
         dockHit: nil,
         finderHit: finderList,
-        displaySize: display
+        onBlankDesktop: false
     )
     check(intent == .content, "a cell inside a Finder window counts as content")
 }
@@ -75,7 +72,7 @@ do {
     let intent = FinderActivationIntent.intent(
         dockHit: nil,
         finderHit: nil,
-        displaySize: display
+        onBlankDesktop: false
     )
     check(intent == .content, "a missing hit test falls back to content")
 }
@@ -88,7 +85,7 @@ do {
     let intent = FinderActivationIntent.intent(
         dockHit: nil,
         finderHit: small,
-        displaySize: display
+        onBlankDesktop: false
     )
     check(intent == .content, "a small group is content, not the desktop background")
 }
@@ -99,7 +96,7 @@ do {
     let intent = FinderActivationIntent.intent(
         dockHit: nil,
         finderHit: bigCell,
-        displaySize: display
+        onBlankDesktop: false
     )
     check(intent == .content, "a large cell is content, not a desktop icon")
 }

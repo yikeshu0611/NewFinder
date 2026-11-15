@@ -30,11 +30,17 @@ sips -z 1024 1024 "$ICON_PNG" --out "$ICONSET_DIR/icon_512x512@2x.png" >/dev/nul
 iconutil -c icns "$ICONSET_DIR" -o "$APP_DIR/Contents/Resources/AppIcon.icns"
 cp "$ICON_PNG" "$APP_DIR/Contents/Resources/AppIcon.png"
 
+# The progress reporters for the compression. They are small scripts that use
+# only the Python standard library, so they run on every Mac.
+cp "$ROOT_DIR/Tools/progress_zip.py" "$APP_DIR/Contents/Resources/progress_zip.py"
+cp "$ROOT_DIR/Tools/progress_tar.py" "$APP_DIR/Contents/Resources/progress_tar.py"
+
 SOURCES=(
   "$ROOT_DIR/Sources/main.swift"
   "$ROOT_DIR/Sources/AppDelegate.swift"
   "$ROOT_DIR/Sources/StatusBarController.swift"
   "$ROOT_DIR/Sources/SystemUsageMonitor.swift"
+  "$ROOT_DIR/Sources/MemoryUsage.swift"
   "$ROOT_DIR/Sources/ClickableStatusLabel.swift"
   "$ROOT_DIR/Sources/NewItemMenu.swift"
   "$ROOT_DIR/Sources/TrackpadGestureMonitor.swift"
@@ -44,7 +50,10 @@ SOURCES=(
   "$ROOT_DIR/Sources/RStudioProject.swift"
   "$ROOT_DIR/Sources/AppSwitcherWindowController.swift"
   "$ROOT_DIR/Sources/FinderActivationIntent.swift"
+  "$ROOT_DIR/Sources/FinderWindowCloser.swift"
   "$ROOT_DIR/Sources/ShowDesktopAction.swift"
+  "$ROOT_DIR/Sources/AppStackOrder.swift"
+  "$ROOT_DIR/Sources/AppStackRestore.swift"
   "$ROOT_DIR/Sources/WatchAgentMain.swift"
   "$ROOT_DIR/Sources/Models.swift"
   "$ROOT_DIR/Sources/PerfLog.swift"
@@ -53,6 +62,9 @@ SOURCES=(
   "$ROOT_DIR/Sources/ArchiveEngine.swift"
   "$ROOT_DIR/Sources/ArchiveSupport.swift"
   "$ROOT_DIR/Sources/ArchiveDialogs.swift"
+  "$ROOT_DIR/Sources/ArchiveJob.swift"
+  "$ROOT_DIR/Sources/ArchiveProgressWindow.swift"
+  "$ROOT_DIR/Sources/NFStyle.swift"
   "$ROOT_DIR/Sources/ArchiveWindowController.swift"
   "$ROOT_DIR/Sources/OpenWithSupport.swift"
   "$ROOT_DIR/Sources/CompareSession.swift"

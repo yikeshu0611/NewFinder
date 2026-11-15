@@ -259,14 +259,20 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate,
         progressIndicator.startAnimation(nil)
         statusLabel.stringValue = "正在读取压缩包…"
         let archive = archiveURL
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        Task.detached(priority: .userInitiated) { [weak self] in
             let result: Result<[ArchiveListEntry], Error>
+            var isDamaged = false
             do {
-                result = .success(try ArchiveSupport.listEntries(in: archive))
+                let entries = try ArchiveSupport.listEntries(in: archive)
+                // A zip that was cut short still lists the files that could
+                // be read, so the list is shown and the damage is said out
+                // loud rather than hidden behind an empty window.
+                isDamaged = await ArchiveEngine.isDamagedZipFile(archive)
+                result = .success(entries)
             } catch {
                 result = .failure(error)
             }
-            DispatchQueue.main.async {
+            await MainActor.run {
                 guard let self else { return }
                 self.isLoading = false
                 self.progressIndicator.stopAnimation(nil)
@@ -278,6 +284,9 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate,
                     self.outline.expandItem(self.rootNode, expandChildren: false)
                     self.selectTreePath(self.internalPath)
                     self.refreshFileList()
+                    if isDamaged {
+                        self.statusLabel.stringValue = "压缩包已损坏，只能看到一部分内容"
+                    }
                 case .failure(let error):
                     self.allEntries = []
                     self.items = []
@@ -330,6 +339,9 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate,
         guard table != nil else { return }
         let prefix = internalPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         var children: [String: FileItem] = [:]
+        /// The total size of the files in each folder.
+        var folderSizes: [String: Int64] = [:]
+
         for entry in allEntries {
             let path = entry.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             guard !path.isEmpty else { continue }
@@ -348,6 +360,12 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate,
             let name = String(first)
             let isDir = parts.count > 1 || entry.isDirectory
             let childPath = prefix.isEmpty ? name : "\(prefix)/\(name)"
+
+            // The size of a folder is the sum of the files inside it.
+            if isDir, let size = entry.size {
+                folderSizes[childPath, default: 0] += size
+            }
+
             if children[name] == nil {
                 children[name] = FileItem.archiveEntry(
                     archive: archiveURL,
@@ -366,7 +384,21 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate,
                 )
             }
         }
-        items = children.values.sorted {
+
+        // Give the folders the size of what is inside them.
+        var result: [FileItem] = []
+        for (name, item) in children {
+            if item.isDirectory,
+               let entryPath = item.archiveEntryPath,
+               let size = folderSizes[entryPath],
+               size > 0 {
+                result.append(item.withFileSize(size))
+            } else {
+                result.append(item)
+            }
+        }
+
+        items = result.sorted {
             if $0.isDirectory != $1.isDirectory { return $0.isDirectory && !$1.isDirectory }
             return $0.name.localizedStandardCompare($1.name) == .orderedAscending
         }
@@ -687,7 +719,13 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate,
                 cell.imageView?.image = icon
             }
         case "size":
-            cell.textField?.stringValue = item.isDirectory ? "--" : FileOperations.formatFileSize(item.fileSize)
+            // A folder shows the size of what is inside it. It is blank when
+            // the archive does not say how big the contents are.
+            if let size = item.fileSize, size > 0 {
+                cell.textField?.stringValue = FileOperations.formatFileSize(size)
+            } else {
+                cell.textField?.stringValue = "--"
+            }
         case "kind":
             if item.isDirectory {
                 cell.textField?.stringValue = "文件夹"

@@ -21,6 +21,8 @@ final class ContentViewController: NSViewController {
     var onHistoryFilterChanged: ((Int) -> Void)?
     /// Called after compress/extract so the browser can reload the folder.
     var onDirectoryNeedsReload: (() -> Void)?
+    /// Reports the compression progress so the status bar can show it.
+    var onCompressProgress: ((ArchiveProgress?) -> Void)?
     /// Open one or more archives in Chrome-style tabs.
     var onOpenArchives: (([URL]) -> Void)?
     /// Current window directory (drop onto empty area / non-folder rows).
@@ -384,8 +386,15 @@ final class ContentViewController: NSViewController {
         let archiveSeparator = NSMenuItem.separator()
         archiveSeparator.identifier = NewItemMenu.archiveTrailingSeparatorID
         menu.addItem(archiveSeparator)
-        menu.addItem(withTitle: "压缩…", action: #selector(contextCompress), keyEquivalent: "")
-        menu.addItem(withTitle: "解压…", action: #selector(contextExtract), keyEquivalent: "")
+        // The identifiers make the archive items reachable through the
+        // accessibility API, and the key equivalent makes ⌘K work.
+        let compressItem = NSMenuItem(title: "压缩…", action: #selector(contextCompress), keyEquivalent: "k")
+        compressItem.keyEquivalentModifierMask = [.command]
+        compressItem.identifier = NSUserInterfaceItemIdentifier("contextMenu.compress")
+        menu.addItem(compressItem)
+        let extractItem = NSMenuItem(title: "解压…", action: #selector(contextExtract), keyEquivalent: "")
+        extractItem.identifier = NSUserInterfaceItemIdentifier("contextMenu.extract")
+        menu.addItem(extractItem)
         menu.addItem(withTitle: "打开压缩包窗口", action: #selector(contextOpenArchive), keyEquivalent: "")
         menu.addItem(NSMenuItem.separator())
         menu.addItem(withTitle: "赋予修改权限", action: #selector(contextMakeWritable), keyEquivalent: "")
@@ -1827,6 +1836,10 @@ final class ContentViewController: NSViewController {
                 case "p":
                     onGoClipboardPathRequest?()
                     return nil
+                case "k":
+                    // Compress the selection.
+                    triggerCompress()
+                    return nil
                 default:
                     break
                 }
@@ -2208,25 +2221,77 @@ final class ContentViewController: NSViewController {
 
     @objc private func contextCompress() {
         ensureClickedRowSelected()
+        triggerCompress()
+    }
+
+    /// Compresses the current selection.
+    private func triggerCompress() {
         let urls = selectedItems.map(\.url)
         guard !urls.isEmpty else { return }
         let base = urls.first?.deletingLastPathComponent() ?? URL(fileURLWithPath: NSHomeDirectory())
         guard let options = ArchiveDialogs.runCompressDialog(for: urls, relativeTo: base) else { return }
-        ArchiveSupport.compress(urls: urls, options: options) { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .success:
-                if options.deleteSource {
-                    let archivePath = options.archiveURL.standardizedFileURL.path
-                    let toTrash = urls.filter { $0.standardizedFileURL.path != archivePath }
-                    if !toTrash.isEmpty {
-                        do { try FileOperations.moveToTrash(toTrash) }
-                        catch { self.presentArchiveError(title: "压缩成功，但删除原文件失败", error: error) }
+
+        // The compression runs in its own window, which shows how far along
+        // it is and can pause or cancel it.
+        let totalBytes = ArchiveEngine.totalSize(of: urls)
+        let job = ArchiveJob(destinationURL: options.archiveURL, totalBytes: totalBytes)
+        let progressWindow = ArchiveProgressWindow(job: job)
+
+        job.onProgress = { [weak progressWindow] progress in
+            DispatchQueue.main.async {
+                progressWindow?.update(progress: progress)
+            }
+        }
+        job.onFileProgress = { [weak progressWindow] file in
+            DispatchQueue.main.async {
+                progressWindow?.update(file: file)
+            }
+        }
+        job.onFinish = { [weak self] result in
+            DispatchQueue.main.async {
+                switch result {
+                case .success:
+                    progressWindow.finish()
+                case .failure(let error):
+                    progressWindow.cancel()
+                    progressWindow.close()
+                    // A cancelled job is not an error the user needs to read.
+                    if case ArchiveError.cancelled = error {
+                        return
+                    }
+                    self?.presentArchiveError(title: "压缩失败", error: error)
+                }
+                self?.onCompressProgress?(nil)
+                self?.onDirectoryNeedsReload?()
+            }
+        }
+
+        // The modal dialog has just closed, so the window is shown on the
+        // next turn of the run loop. That way it does not flash while the
+        // dialog is still being put away.
+        DispatchQueue.main.async {
+            progressWindow.start()
+            job.start(
+                items: urls,
+                format: options.compressFormat,
+                password: options.password.isEmpty ? nil : options.password,
+                split: options.splitVolume
+            )
+        }
+
+        // The source files are removed only after the archive is complete.
+        if options.deleteSource {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let archivePath = options.archiveURL.standardizedFileURL.path
+                let toTrash = urls.filter { $0.standardizedFileURL.path != archivePath }
+                guard !toTrash.isEmpty else { return }
+                do {
+                    try FileOperations.moveToTrash(toTrash)
+                } catch {
+                    DispatchQueue.main.async {
+                        self?.presentArchiveError(title: "压缩成功，但删除原文件失败", error: error)
                     }
                 }
-                self.onDirectoryNeedsReload?()
-            case .failure(let error):
-                self.presentArchiveError(title: "压缩失败", error: error)
             }
         }
     }
@@ -2285,6 +2350,11 @@ final class ContentViewController: NSViewController {
         alert.messageText = title
         alert.informativeText = error.localizedDescription
         alert.alertStyle = .warning
+        // A long message would make the dialog grow out of the screen, so
+        // it is kept short.
+        if alert.informativeText.count > 400 {
+            alert.informativeText = String(alert.informativeText.prefix(400)) + "…"
+        }
         alert.runModal()
     }
 
@@ -2507,7 +2577,13 @@ extension ContentViewController: NSTableViewDataSource, NSTableViewDelegate {
             cell.imageView?.image = nil
             applyCutAppearance(to: cell, item: item, nameColumn: false)
         case "size":
-            cell.textField?.stringValue = item.isDirectory ? "--" : FileOperations.formatFileSize(item.fileSize)
+            // A folder in an archive shows the size of what is inside it.
+            // A folder on disk shows nothing, the way the Finder does.
+            if let size = item.fileSize, size > 0, !item.isDirectory || item.isArchiveEntry {
+                cell.textField?.stringValue = FileOperations.formatFileSize(size)
+            } else {
+                cell.textField?.stringValue = "--"
+            }
             cell.imageView?.image = nil
             applyCutAppearance(to: cell, item: item, nameColumn: false)
         case "kind":
