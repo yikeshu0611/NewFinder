@@ -69,6 +69,7 @@ SOURCES=(
   "$ROOT_DIR/Sources/NFStyle.swift"
   "$ROOT_DIR/Sources/ArchiveWindowController.swift"
   "$ROOT_DIR/Sources/OpenWithSupport.swift"
+  "$ROOT_DIR/Sources/OpenWithPicker.swift"
   "$ROOT_DIR/Sources/CompareSession.swift"
   "$ROOT_DIR/Sources/TextDiffEngine.swift"
   "$ROOT_DIR/Sources/CompareViewController.swift"
@@ -89,6 +90,7 @@ SOURCES=(
   "$ROOT_DIR/Sources/TemperatureSensorReader.swift"
   "$ROOT_DIR/Sources/TemperatureViewController.swift"
   "$ROOT_DIR/Sources/UpdateChecker.swift"
+  "$ROOT_DIR/Sources/AutoUpdateController.swift"
   "$ROOT_DIR/Sources/BookmarksUI.swift"
   "$ROOT_DIR/Sources/FavoritesSidebarViewController.swift"
 )

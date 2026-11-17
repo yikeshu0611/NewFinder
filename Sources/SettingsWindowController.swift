@@ -16,7 +16,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private var versionLabel: NSTextField!
     private var updateStatusLabel: NSTextField!
     private var checkUpdateButton: NSButton!
-    private var downloadUpdateButton: NSButton!
+    private var autoUpdateCheckbox: NSButton!
     private var wechatDualOpenButton: NSButton!
     private var wechatDualOpenStatusLabel: NSTextField!
     private var disableCommandMCheckbox: NSButton!
@@ -26,7 +26,6 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private var gesturePermissionLabel: NSTextField!
     private var skipInitialSortCheckbox: NSButton!
     private var showLoadTimeCheckbox: NSButton!
-    private var pendingRelease: UpdateChecker.ReleaseInfo?
     /// Polls the「辅助功能」permission so the gesture hint stays accurate.
     private var permissionTimer: Timer?
 
@@ -200,12 +199,14 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         versionLabel = NSTextField(labelWithString: UpdateChecker.currentVersion)
         versionLabel.font = .systemFont(ofSize: 12)
         versionLabel.textColor = .secondaryLabelColor
-        downloadUpdateButton = NSButton(title: "下载更新", target: self, action: #selector(downloadUpdate))
-        downloadUpdateButton.bezelStyle = .rounded
-        downloadUpdateButton.isHidden = true
+        autoUpdateCheckbox = NSButton(
+            checkboxWithTitle: "每 30 天自动检查更新",
+            target: self,
+            action: #selector(toggleAutoCheckUpdates)
+        )
         updateRow.addArrangedSubview(checkUpdateButton)
         updateRow.addArrangedSubview(versionLabel)
-        updateRow.addArrangedSubview(downloadUpdateButton)
+        updateRow.addArrangedSubview(autoUpdateCheckbox)
         stack.addArrangedSubview(updateRow)
 
         updateStatusLabel = NSTextField(wrappingLabelWithString: "")
@@ -482,6 +483,14 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         skipInitialSortCheckbox.state = settings.skipInitialSort ? .on : .off
         showLoadTimeCheckbox.state = settings.showLoadTime ? .on : .off
         versionLabel.stringValue = UpdateChecker.currentVersion
+        autoUpdateCheckbox.state = settings.autoCheckUpdates ? .on : .off
+        if let last = settings.lastUpdateCheckAt {
+            let fmt = DateFormatter()
+            fmt.dateFormat = "yyyy-MM-dd"
+            setUpdateStatus("上次检查：\(fmt.string(from: last))（每 30 天自动检查）")
+        } else {
+            setUpdateStatus("尚未检查过，点击「检查更新」或等待自动检查。")
+        }
         rebuildTypeRows()
     }
 
@@ -492,55 +501,30 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     @objc private func checkForUpdates() {
         checkUpdateButton.isEnabled = false
-        downloadUpdateButton.isHidden = true
-        pendingRelease = nil
         setUpdateStatus("正在检查更新…")
 
         UpdateChecker.fetchLatest { [weak self] result in
             guard let self else { return }
             self.checkUpdateButton.isEnabled = true
+            AppSettings.shared.markUpdateCheckedNow()
             switch result {
             case .failure:
                 self.setUpdateStatus("检查失败，请确认网络连接后重试。")
             case .success(let release):
                 let current = UpdateChecker.currentVersion
                 if UpdateChecker.isVersion(release.version, newerThan: current) {
-                    self.pendingRelease = release
-                    self.setUpdateStatus("发现新版本 \(release.version)。")
-                    self.downloadUpdateButton.isHidden = false
+                    self.setUpdateStatus("发现新版本 \(release.version)，正在打开更新窗口…")
+                    AutoUpdateController.shared.check(manual: true)
                 } else {
-                    self.setUpdateStatus("已是最新版本。")
+                    self.setUpdateStatus("已是最新版本（\(current)）。")
                 }
             }
         }
     }
 
-    @objc private func downloadUpdate() {
-        guard let release = pendingRelease else { return }
-        checkUpdateButton.isEnabled = false
-        downloadUpdateButton.isEnabled = false
-        setUpdateStatus("正在下载 \(release.version)…")
-
-        UpdateChecker.download(release) { [weak self] result in
-            guard let self else { return }
-            self.checkUpdateButton.isEnabled = true
-            self.downloadUpdateButton.isEnabled = true
-            switch result {
-            case .failure:
-                self.setUpdateStatus("下载失败，请稍后重试或在 GitHub Releases 手动下载。")
-            case .success(let dmgURL):
-                NSWorkspace.shared.open(dmgURL)
-                self.setUpdateStatus("已打开安装包，请拖入「应用程序」完成更新。")
-                let alert = NSAlert()
-                alert.messageText = "更新包已下载"
-                alert.informativeText = """
-                已打开 \(dmgURL.lastPathComponent)。
-                将 NewFinder 拖入「应用程序」文件夹覆盖旧版本，然后重新打开即可。
-                """
-                alert.addButton(withTitle: "好")
-                alert.runModal()
-            }
-        }
+    @objc private func toggleAutoCheckUpdates() {
+        settings.autoCheckUpdates = autoUpdateCheckbox.state == .on
+        notifyChange()
     }
 
     private func rebuildTypeRows() {

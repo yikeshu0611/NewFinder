@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 
 enum UpdateChecker {
     static let repository = "yikeshu0611/NewFinder"
@@ -47,33 +47,117 @@ enum UpdateChecker {
     }
 
     static func download(_ release: ReleaseInfo, completion: @escaping (Result<URL, Error>) -> Void) {
-        var request = URLRequest(url: release.downloadURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 120)
-        request.setValue("NewFinder-UpdateChecker", forHTTPHeaderField: "User-Agent")
+        _ = download(release, progress: { _ in }, completion: completion)
+    }
 
-        URLSession.shared.downloadTask(with: request) { tempURL, _, error in
-            if let error {
-                DispatchQueue.main.async { completion(.failure(error)) }
-                return
-            }
-            guard let tempURL else {
-                DispatchQueue.main.async { completion(.failure(CocoaError(.fileReadUnknown))) }
-                return
-            }
-            let fileName = release.downloadURL.lastPathComponent.isEmpty
+    /// 带进度的下载，用于更新弹窗/设置页的进度条。返回 task 可用于取消。
+    @discardableResult
+    static func download(
+        _ release: ReleaseInfo,
+        progress: @escaping (Double) -> Void,
+        completion: @escaping (Result<URL, Error>) -> Void
+    ) -> URLSessionTask? {
+        let delegate = DownloadDelegate(
+            progress: progress,
+            completion: completion,
+            fileName: release.downloadURL.lastPathComponent.isEmpty
                 ? "NewFinder-\(release.version).dmg"
                 : release.downloadURL.lastPathComponent
-            let dest = FileManager.default.temporaryDirectory
-                .appendingPathComponent(fileName)
+        )
+        // session 强引用 delegate，delegate 强引用 session，打破循环靠 finish 后 invalidate。
+        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        delegate.session = session
+        var request = URLRequest(url: release.downloadURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 600)
+        request.setValue("NewFinder-UpdateChecker", forHTTPHeaderField: "User-Agent")
+        let task = session.downloadTask(with: request)
+        delegate.task = task
+        task.resume()
+        return task
+    }
+
+    private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+        var session: URLSession?
+        var task: URLSessionDownloadTask?
+        let progress: (Double) -> Void
+        let completion: (Result<URL, Error>) -> Void
+        let fileName: String
+
+        init(progress: @escaping (Double) -> Void, completion: @escaping (Result<URL, Error>) -> Void, fileName: String) {
+            self.progress = progress
+            self.completion = completion
+            self.fileName = fileName
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            downloadTask: URLSessionDownloadTask,
+            didWriteData bytesWritten: Int64,
+            totalBytesWritten: Int64,
+            totalBytesExpectedToWrite: Int64
+        ) {
+            guard totalBytesExpectedToWrite > 0 else { return }
+            let fraction = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
+            DispatchQueue.main.async { self.progress(min(1, max(0, fraction))) }
+        }
+
+        func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+            let dest = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
             do {
                 if FileManager.default.fileExists(atPath: dest.path) {
                     try FileManager.default.removeItem(at: dest)
                 }
-                try FileManager.default.moveItem(at: tempURL, to: dest)
-                DispatchQueue.main.async { completion(.success(dest)) }
+                try FileManager.default.moveItem(at: location, to: dest)
+                DispatchQueue.main.async { self.completion(.success(dest)) }
             } catch {
-                DispatchQueue.main.async { completion(.failure(error)) }
+                DispatchQueue.main.async { self.completion(.failure(error)) }
             }
-        }.resume()
+            session.finishTasksAndInvalidate()
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            if let error {
+                DispatchQueue.main.async { self.completion(.failure(error)) }
+                session.finishTasksAndInvalidate()
+            }
+        }
+    }
+
+    /// 挂载 dmg 并把里面的 NewFinder.app 装到 /Applications（覆盖旧版）。
+    /// 返回安装后的 app 路径。调用方负责 detach 失败时的清理。
+    static func installDMGToApplications(_ dmgURL: URL, progress: ((Double, String) -> Void)? = nil) throws -> URL {
+        let mounted = try DMGInstallSupport.attach(dmgURL: dmgURL)
+        defer { DMGInstallSupport.detach(mounted) }
+        let apps = DMGInstallSupport.findApps(in: mounted.mountURL)
+        // 优先 NewFinder.app，否则取第一个。
+        let app = apps.first(where: { $0.lastPathComponent == "NewFinder.app" }) ?? apps.first
+        guard let app else {
+            throw NSError(
+                domain: "NewFinder.Update",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "安装包中没有找到 NewFinder.app"]
+            )
+        }
+        return try DMGInstallSupport.installApp(app, toApplications: true, progress: progress)
+    }
+
+    /// 安装完成后重启到 /Applications 的新版本。
+    /// 当前是开发目录的 build 包时只打开安装包，不自动重启，避免把调试进程杀掉。
+    static func relaunchInstalledApp(at installedURL: URL) {
+        let currentPath = Bundle.main.bundleURL.standardizedFileURL.path
+        let isDevBuild = currentPath.contains("/build/") || !currentPath.hasPrefix("/Applications/")
+        if isDevBuild {
+            // 开发包：装好就行，不杀掉当前进程。
+            NSWorkspace.shared.open(installedURL)
+            return
+        }
+        // 用小脚本等旧进程退出后再拉起新版，避免覆盖运行中包时的竞态。
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.promptsUserIfNeeded = true
+        NSWorkspace.shared.openApplication(at: installedURL, configuration: configuration) { _, _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                NSApp.terminate(nil)
+            }
+        }
     }
 
     private static func parseReleaseJSON(_ data: Data) throws -> ReleaseInfo {

@@ -2062,16 +2062,18 @@ final class ContentViewController: NSViewController {
         let urls = openWithTargetURLs()
         guard !urls.isEmpty else { return }
 
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.directoryURL = URL(fileURLWithPath: "/Applications")
-        panel.prompt = "打开"
-        panel.message = "选择用来打开的应用程序"
-        panel.allowedContentTypes = [.application]
-        guard panel.runModal() == .OK, let appURL = panel.url else { return }
-        openURLs(urls, withApp: appURL)
+        OpenWithPickerWindowController.show(
+            for: urls,
+            onOpen: { [weak self] appURL in
+                self?.openURLs(urls, withApp: appURL)
+            },
+            onOpenDefault: { [weak self] appURL in
+                OpenWithCatalog.setDefaultApp(appURL, for: urls) { [weak self] _ in
+                    self?.openURLs(urls, withApp: appURL)
+                    self?.rebuildOpenWithSubmenu()
+                }
+            }
+        )
     }
 
     private func openWithTargetURLs() -> [URL] {
@@ -2155,49 +2157,49 @@ final class ContentViewController: NSViewController {
             return
         }
 
-        let sections = OpenWithCatalog.sectionedApps(for: primary)
-        let namePool = [sections.currentDefault].compactMap { $0 }
-            + sections.history
-            + sections.recommended
+        let (historyApps, defaultURL) = OpenWithCatalog.historyApps(for: primary)
+        let namePool = historyApps
 
-        func addSection(_ apps: [OpenWithCatalog.AppInfo]) {
-            for app in apps {
-                let item = NSMenuItem()
-                item.isEnabled = true
-                let row = OpenWithRowView(frame: NSRect(
-                    x: 0, y: 0,
-                    width: OpenWithRowView.rowWidth,
-                    height: OpenWithRowView.rowHeight
-                ))
-                row.appURL = app.url
-                let title = OpenWithCatalog.disambiguatedName(for: app, among: namePool)
-                let icon = NSWorkspace.shared.icon(forFile: app.url.path)
-                row.configure(name: title, icon: icon)
-                row.onOpen = { [weak self] in
-                    self?.openURLs(urls, withApp: app.url)
-                }
-                item.view = row
-                submenu.addItem(item)
+        for app in historyApps {
+            let item = NSMenuItem()
+            item.isEnabled = true
+            let row = OpenWithRowView(frame: NSRect(
+                x: 0, y: 0,
+                width: OpenWithRowView.rowWidth,
+                height: OpenWithRowView.rowHeight
+            ))
+            row.appURL = app.url
+            let title = OpenWithCatalog.disambiguatedName(for: app, among: namePool)
+            let icon = NSWorkspace.shared.icon(forFile: app.url.path)
+            let isDefault = app.url.standardizedFileURL == defaultURL
+            row.configure(name: title, icon: icon, isDefault: isDefault)
+            row.onOpen = { [weak self] in
+                self?.openURLs(urls, withApp: app.url)
             }
+            row.onDelete = { [weak self] in
+                AppSettings.shared.forgetOpenWithApp(
+                    bundleID: app.bundleIdentifier ?? "",
+                    path: app.url.path,
+                    forFile: primary
+                )
+                self?.rebuildOpenWithSubmenu()
+            }
+            row.onSetDefault = { [weak self] in
+                guard let self else { return }
+                OpenWithCatalog.setDefaultApp(app.url, for: urls) { [weak self] _ in
+                    self?.rebuildOpenWithSubmenu()
+                }
+            }
+            item.view = row
+            submenu.addItem(item)
         }
 
-        var didAddApps = false
-        if let current = sections.currentDefault {
-            addSection([current])
-            didAddApps = true
-        }
-        if !sections.history.isEmpty {
-            if didAddApps { submenu.addItem(NSMenuItem.separator()) }
-            addSection(sections.history)
-            didAddApps = true
-        }
-        if !sections.recommended.isEmpty {
-            if didAddApps { submenu.addItem(NSMenuItem.separator()) }
-            addSection(sections.recommended)
-            didAddApps = true
-        }
-
-        if didAddApps {
+        if !historyApps.isEmpty {
+            submenu.addItem(NSMenuItem.separator())
+        } else {
+            let empty = NSMenuItem(title: "暂无使用记录，用「其他…」打开一次后会记在这里", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            submenu.addItem(empty)
             submenu.addItem(NSMenuItem.separator())
         }
         let other = NSMenuItem(

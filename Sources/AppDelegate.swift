@@ -158,6 +158,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         Self.runDesktopGestureFromCommandLine()
+        AutoUpdateController.shared.scheduleAutoCheckIfNeeded()
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -2082,61 +2083,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func checkForUpdatesFromMenu(_ sender: Any?) {
-        UpdateChecker.fetchLatest { [weak self] result in
-            guard self != nil else { return }
-            switch result {
-            case .failure(let error):
-                let alert = NSAlert()
-                alert.messageText = "检查更新失败"
-                alert.informativeText = error.localizedDescription
-                alert.alertStyle = .warning
-                alert.addButton(withTitle: "好")
-                alert.runModal()
-            case .success(let release):
-                let current = UpdateChecker.currentVersion
-                if UpdateChecker.isVersion(release.version, newerThan: current) {
-                    let alert = NSAlert()
-                    alert.messageText = "发现新版本 \(release.version)"
-                    alert.informativeText = release.releaseNotes.isEmpty
-                        ? "当前版本 \(current)。是否下载更新包？"
-                        : release.releaseNotes
-                    alert.addButton(withTitle: "下载更新")
-                    alert.addButton(withTitle: "取消")
-                    if alert.runModal() == .alertFirstButtonReturn {
-                        self?.downloadUpdateFromMenu(release)
-                    }
-                } else {
-                    let alert = NSAlert()
-                    alert.messageText = "已是最新版本"
-                    alert.informativeText = "当前版本 \(current)"
-                    alert.addButton(withTitle: "好")
-                    alert.runModal()
-                }
-            }
-        }
+        AutoUpdateController.shared.check(manual: true)
     }
 
     private func downloadUpdateFromMenu(_ release: UpdateChecker.ReleaseInfo) {
-        UpdateChecker.download(release) { result in
-            switch result {
-            case .failure(let error):
-                let alert = NSAlert()
-                alert.messageText = "下载失败"
-                alert.informativeText = error.localizedDescription
-                alert.addButton(withTitle: "好")
-                alert.runModal()
-            case .success(let dmgURL):
-                NSWorkspace.shared.open(dmgURL)
-                let alert = NSAlert()
-                alert.messageText = "更新包已下载"
-                alert.informativeText = """
-                已打开 \(dmgURL.lastPathComponent)。
-                将 NewFinder 拖入「应用程序」文件夹覆盖旧版本，然后重新打开即可。
-                """
-                alert.addButton(withTitle: "好")
-                alert.runModal()
-            }
-        }
+        AutoUpdateController.shared.check(manual: true)
     }
 }
 

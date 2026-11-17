@@ -238,6 +238,8 @@ final class AppSettings {
         static let showLoadTime = "showLoadTime"
         static let threeFingerSwipeShowDesktop = "threeFingerSwipeShowDesktop"
         static let threeFingerSwipeRestoreWindows = "threeFingerSwipeRestoreWindows"
+        static let autoCheckUpdates = "autoCheckUpdates"
+        static let lastUpdateCheckAt = "lastUpdateCheckAt"
     }
 
     /// Content zoom 30%…500%. Default 100. Adjusted via menu-bar slider.
@@ -321,6 +323,32 @@ final class AppSettings {
     var threeFingerSwipeRestoreWindows: Bool {
         get { defaults.bool(forKey: Keys.threeFingerSwipeRestoreWindows) }
         set { defaults.set(newValue, forKey: Keys.threeFingerSwipeRestoreWindows) }
+    }
+
+    /// 每 30 天自动检查一次更新。默认开启。
+    var autoCheckUpdates: Bool {
+        get {
+            if defaults.object(forKey: Keys.autoCheckUpdates) == nil { return true }
+            return defaults.bool(forKey: Keys.autoCheckUpdates)
+        }
+        set { defaults.set(newValue, forKey: Keys.autoCheckUpdates) }
+    }
+
+    /// 上次（自动或手动）检查更新的时间。
+    var lastUpdateCheckAt: Date? {
+        get { defaults.object(forKey: Keys.lastUpdateCheckAt) as? Date }
+        set { defaults.set(newValue, forKey: Keys.lastUpdateCheckAt) }
+    }
+
+    /// 是否到了 30 天自动检查的时间。
+    func shouldAutoCheckUpdates() -> Bool {
+        guard autoCheckUpdates else { return false }
+        guard let last = lastUpdateCheckAt else { return true }
+        return Date().timeIntervalSince(last) >= 30 * 24 * 3600
+    }
+
+    func markUpdateCheckedNow() {
+        lastUpdateCheckAt = Date()
     }
 
     /// Built-in New types (canonical keys). Display name for `dir` is「文件夹」.
@@ -640,6 +668,47 @@ final class AppSettings {
         list.insert(key, at: 0)
         byType[typeKey] = Array(list.prefix(15))
         openWithAppHistoryByType = byType
+    }
+
+    /// 从「打开方式」历史中移除某个 app（行右侧 ✕）。
+    /// 同时清理全局历史、设为默认历史，以及当前文件类型的历史，
+    /// 否则空历史会回退到 defaultHistory 把已删除的 app 复活。
+    func forgetOpenWithApp(bundleID: String, path: String, forFile fileURL: URL? = nil) {
+        let key = bundleID.isEmpty ? path : bundleID
+        guard !key.isEmpty else { return }
+
+        // 直接写 defaults，避免 openWithAppHistory 的 defaultHistory 回退。
+        let stored = defaults.stringArray(forKey: Keys.openWithAppHistory) ?? []
+        defaults.set(Array(stored.filter { $0 != key }.prefix(30)), forKey: Keys.openWithAppHistory)
+        openWithDefaultHistory = openWithDefaultHistory.filter { $0 != key }
+
+        var byType = openWithAppHistoryByType
+        if let fileURL {
+            let typeKey = Self.openWithTypeKey(for: fileURL)
+            if let list = byType[typeKey] {
+                let filtered = list.filter { $0 != key }
+                if filtered.isEmpty {
+                    byType.removeValue(forKey: typeKey)
+                } else {
+                    byType[typeKey] = filtered
+                }
+                openWithAppHistoryByType = byType
+            }
+        } else {
+            var changed = false
+            for k in byType.keys {
+                let filtered = (byType[k] ?? []).filter { $0 != key }
+                if filtered.count != (byType[k] ?? []).count {
+                    changed = true
+                    if filtered.isEmpty {
+                        byType.removeValue(forKey: k)
+                    } else {
+                        byType[k] = filtered
+                    }
+                }
+            }
+            if changed { openWithAppHistoryByType = byType }
+        }
     }
 
     /// Global recent open history (folders + files), most-recent first. Persisted.
