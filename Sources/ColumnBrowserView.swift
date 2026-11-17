@@ -13,6 +13,10 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
     /// Right-click → 新建: create a new item of the given type
     /// (`nil` extension = folder) inside the clicked column's folder.
     var onCreateNewItemRequest: ((URL, String?) -> Void)?
+    /// Right-click → 删除: move the selected item to Trash.
+    var onTrashRequest: (() -> Void)?
+    /// Right-click → 删除（彻底）: permanently delete the selected item.
+    var onDeleteImmediatelyRequest: (() -> Void)?
 
     private let scrollView = NSScrollView()
     private let columnsStack = NSStackView()
@@ -314,6 +318,14 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
             tag: index
         )
         menu.addItem(newItem)
+        let trashItem = NSMenuItem(title: "删除", action: #selector(columnContextTrash(_:)), keyEquivalent: "")
+        trashItem.target = self
+        trashItem.tag = index
+        menu.addItem(trashItem)
+        let deleteItem = NSMenuItem(title: "删除（彻底）", action: #selector(columnContextDeleteImmediately(_:)), keyEquivalent: "")
+        deleteItem.target = self
+        deleteItem.tag = index
+        menu.addItem(deleteItem)
         table.menu = menu
         columnMenus.append(menu)
 
@@ -603,6 +615,27 @@ final class ColumnBrowserView: NSView, NSTableViewDataSource, NSTableViewDelegat
         )
     }
 
+    @objc private func columnContextTrash(_ sender: NSMenuItem) {
+        ensureColumnClickedRowSelected(sender)
+        onTrashRequest?()
+    }
+
+    @objc private func columnContextDeleteImmediately(_ sender: NSMenuItem) {
+        ensureColumnClickedRowSelected(sender)
+        onDeleteImmediatelyRequest?()
+    }
+
+    private func ensureColumnClickedRowSelected(_ sender: NSMenuItem) {
+        let columnIndex = sender.tag
+        guard columnIndex >= 0, columnIndex < columnTables.count else { return }
+        let table = columnTables[columnIndex]
+        let row = table.clickedRow
+        guard row >= 0 else { return }
+        let rows = items(inColumn: columnIndex)
+        guard rows.indices.contains(row) else { return }
+        handleClick(column: columnIndex, row: row)
+    }
+
     /// The column whose menu is about to open (the menu carries its column index).
     private func columnIndex(for menu: NSMenu) -> Int? {
         columnMenus.firstIndex { $0 === menu }
@@ -845,6 +878,14 @@ extension ColumnBrowserView: NSMenuDelegate {
         )
         newItem.isEnabled = true
         newItem.isHidden = false
+        let hasSelection = selectedItems.first != nil
+        for item in menu.items {
+            if item.action == #selector(columnContextTrash(_:)) || item.action == #selector(columnContextDeleteImmediately(_:)) {
+                item.tag = index
+                item.isHidden = false
+                item.isEnabled = hasSelection
+            }
+        }
     }
 }
 

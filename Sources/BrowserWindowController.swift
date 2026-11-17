@@ -147,6 +147,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         )
         NotificationCenter.default.addObserver(
             self,
+            selector: #selector(handleContentDeleteImmediately),
+            name: .contentRequestDeleteImmediately,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
             selector: #selector(settingsChanged),
             name: SettingsWindowController.didChangeNotification,
             object: nil
@@ -176,6 +182,18 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             return
         }
         moveToTrash(nil)
+    }
+
+    @objc private func handleContentDeleteImmediately(_ note: Notification) {
+        guard let sender = note.object as? ContentViewController else { return }
+        if sender === contentController {
+            focusedColumnIndex = 0
+        } else if let idx = extraPanes.firstIndex(where: { $0.contentController === sender }) {
+            focusedColumnIndex = idx + 1
+        } else {
+            return
+        }
+        deleteImmediately(nil)
     }
 
     @available(*, unavailable)
@@ -3260,6 +3278,36 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         let urls = list.selectedItems.map(\.url.standardizedFileURL)
         guard !urls.isEmpty else { NSSound.beep(); return }
         let nextURL = list.selectionURLAfterRemovingSelected()
+        confirmAndDeleteImmediately(urls: urls, nextURL: nextURL, messageTitle: urls.count == 1 ? "彻底删除「\(urls[0].lastPathComponent)」？" : "彻底删除 \(urls.count) 个项目？")
+    }
+
+    /// 右键 → 删除（彻底）：不经过废纸篓，直接永久删除（需二次确认）。
+    @objc func deleteImmediately(_ sender: Any?) {
+        let dir = activeBrowserDirectory
+        let list = activeContentController
+        if FileOperations.isTrashDirectory(dir) {
+            deleteForeverFromTrash(sender)
+            return
+        }
+        if FileOperations.isApplicationsDirectory(dir) {
+            uninstallSelectedApps(sender)
+            return
+        }
+        let urls = list.selectedItems.filter({ !$0.isArchiveEntry }).map(\.url.standardizedFileURL)
+        guard !urls.isEmpty else { NSSound.beep(); return }
+        let nextURL = list.selectionURLAfterRemovingSelected()
+        confirmAndDeleteImmediately(urls: urls, nextURL: nextURL, messageTitle: urls.count == 1 ? "彻底删除「\(urls[0].lastPathComponent)」？" : "彻底删除 \(urls.count) 个项目？")
+    }
+
+    private func confirmAndDeleteImmediately(urls: [URL], nextURL: URL?, messageTitle: String) {
+        let list = activeContentController
+        let alert = NSAlert()
+        alert.messageText = messageTitle
+        alert.informativeText = "文件将直接从磁盘删除，不经过废纸篓，此操作无法撤销。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "彻底删除")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
         do {
             try FileOperations.permanentlyDelete(urls)
             list.noteRemovedURLs(urls)

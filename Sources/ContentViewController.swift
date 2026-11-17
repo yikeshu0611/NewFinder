@@ -328,6 +328,14 @@ final class ContentViewController: NSViewController {
         columnBrowser.onCreateNewItemRequest = { [weak self] directory, extensionName in
             self?.createNewItem(in: directory, extensionName: extensionName)
         }
+        columnBrowser.onTrashRequest = { [weak self] in
+            guard let self else { return }
+            NotificationCenter.default.post(name: .contentRequestTrash, object: self)
+        }
+        columnBrowser.onDeleteImmediatelyRequest = { [weak self] in
+            guard let self else { return }
+            NotificationCenter.default.post(name: .contentRequestDeleteImmediately, object: self)
+        }
         root.addSubview(columnBrowser)
 
         view = root
@@ -409,6 +417,8 @@ final class ContentViewController: NSViewController {
         menu.addItem(NSMenuItem.separator())
         menu.addItem(withTitle: "赋予修改权限", action: #selector(contextMakeWritable), keyEquivalent: "")
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(withTitle: "删除", action: #selector(contextTrash), keyEquivalent: "")
+        menu.addItem(withTitle: "删除（彻底）", action: #selector(contextDeleteImmediately), keyEquivalent: "")
         menu.addItem(withTitle: "拷贝当前地址", action: #selector(contextCopyPath), keyEquivalent: "")
         listView.menu = menu
 
@@ -2228,6 +2238,10 @@ final class ContentViewController: NSViewController {
         NotificationCenter.default.post(name: .contentRequestTrash, object: self)
     }
 
+    @objc private func contextDeleteImmediately() {
+        NotificationCenter.default.post(name: .contentRequestDeleteImmediately, object: self)
+    }
+
     @objc private func contextGetInfo() {
         guard let item = selectedItems.first else { return }
         let values = try? item.url.resourceValues(forKeys: [
@@ -2597,6 +2611,16 @@ extension ContentViewController: NSMenuDelegate {
             case #selector(contextCopyPath):
                 item.isHidden = false
                 item.isEnabled = true
+            case #selector(contextTrash),
+                 #selector(contextDeleteImmediately):
+                // 废纸篓（放回原处/彻底删除）、应用（卸载…）、历史页由各自的专属项负责，这里隐藏。
+                if isShowingHistory || isShowingApplications || isShowingTrash {
+                    item.isHidden = true
+                } else {
+                    let deletable = selectedItems.contains(where: { !$0.isArchiveEntry })
+                    item.isHidden = !deletable
+                    item.isEnabled = deletable
+                }
             case #selector(contextRevealInEnclosingFolder):
                 let canReveal = (isShowingSearchResults || isShowingHistory)
                     && selectedItems.contains(where: { !$0.isArchiveEntry })
@@ -2620,6 +2644,7 @@ extension ContentViewController: NSMenuDelegate {
 
 extension Notification.Name {
     static let contentRequestTrash = Notification.Name("NewFinder.contentRequestTrash")
+    static let contentRequestDeleteImmediately = Notification.Name("NewFinder.contentRequestDeleteImmediately")
     static let uiZoomDidChange = Notification.Name("NewFinder.uiZoomDidChange")
 }
 
