@@ -10,6 +10,16 @@ struct FileItem: Hashable {
     let fileSize: Int64?
     let modificationDate: Date?
     let creationDate: Date?
+    /// 「添加日期」— the date the item was added to its current folder.
+    ///
+    /// macOS has no dedicated attribute for this, so the creation (birth) date
+    /// is used as the closest equivalent. In the Trash the trashed entry's
+    /// own birth date is the moment it was deleted — exactly what「添加日期」
+    /// means there. Falls back to the modification date when birth is unknown.
+    var addedDate: Date? { creationDate ?? modificationDate }
+    /// For trashed items: the path the item had before it was moved to the
+    /// Trash. `nil` for everything that lives in a normal folder.
+    var originalPath: String? = nil
     /// Non-nil when this row is inside an opened archive tab.
     let archiveEntryPath: String?
 
@@ -93,7 +103,7 @@ struct FileItem: Hashable {
     }
 
     func withFileSize(_ size: Int64?) -> FileItem {
-        FileItem(
+        var copy = FileItem(
             url: url,
             name: name,
             isDirectory: isDirectory,
@@ -104,11 +114,13 @@ struct FileItem: Hashable {
             creationDate: creationDate,
             archiveEntryPath: archiveEntryPath
         )
+        copy.originalPath = originalPath
+        return copy
     }
 
     /// Copy with size / modification date replaced (used by progressive listing).
     func withAttributes(size: Int64?, modified: Date?) -> FileItem {
-        FileItem(
+        var copy = FileItem(
             url: url,
             name: name,
             isDirectory: isDirectory,
@@ -119,6 +131,8 @@ struct FileItem: Hashable {
             creationDate: creationDate,
             archiveEntryPath: archiveEntryPath
         )
+        copy.originalPath = originalPath
+        return copy
     }
 
     static func archiveEntry(

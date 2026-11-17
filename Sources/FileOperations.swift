@@ -265,7 +265,7 @@ enum FileOperations {
                 let extensionName = Self.fileExtension(of: item.name)
                 let isPackage = item.isPackage
                     || (stat.isDirectory && packageExtensions.contains(extensionName))
-                local.append(FileItem(
+                var enriched = FileItem(
                     url: item.url,
                     name: item.name,
                     isDirectory: stat.isDirectory && !isPackage,
@@ -273,9 +273,11 @@ enum FileOperations {
                     isHidden: stat.isHidden || item.isHidden,
                     fileSize: (stat.isDirectory && !isPackage) ? nil : stat.size,
                     modificationDate: stat.modified,
-                    creationDate: nil,
+                    creationDate: stat.added,
                     archiveEntryPath: nil
-                ))
+                )
+                enriched.originalPath = item.originalPath
+                local.append(enriched)
             }
             for (offset, index) in (lower..<upper).enumerated() {
                 result[index] = local[offset]
@@ -308,6 +310,8 @@ enum FileOperations {
         var isHidden = false
         var size: Int64 = 0
         var modified: Date?
+        /// File creation (birth) date — shown as「添加日期」.
+        var added: Date?
     }
 
     // MARK: - Overlapped metadata pass
@@ -441,6 +445,11 @@ enum FileOperations {
                     var flags = buffer.st_flags
                     var size = Int64(buffer.st_size)
                     var modified = Date(timeIntervalSince1970: Double(buffer.st_mtimespec.tv_sec) + Double(buffer.st_mtimespec.tv_nsec) / 1e9)
+                    var added: Date? = nil
+                    let birthSec = buffer.st_birthtimespec.tv_sec
+                    if birthSec > 0 {
+                        added = Date(timeIntervalSince1970: Double(birthSec) + Double(buffer.st_birthtimespec.tv_nsec) / 1e9)
+                    }
                     if (mode & S_IFMT) == S_IFLNK {
                         // Follow the link so folders / sizes match what Finder shows.
                         var target = Darwin.stat()
@@ -449,6 +458,12 @@ enum FileOperations {
                             flags = target.st_flags
                             size = Int64(target.st_size)
                             modified = Date(timeIntervalSince1970: Double(target.st_mtimespec.tv_sec) + Double(target.st_mtimespec.tv_nsec) / 1e9)
+                            let tBirthSec = target.st_birthtimespec.tv_sec
+                            if tBirthSec > 0 {
+                                added = Date(timeIntervalSince1970: Double(tBirthSec) + Double(target.st_birthtimespec.tv_nsec) / 1e9)
+                            } else {
+                                added = nil
+                            }
                         }
                     }
                     value.succeeded = true
@@ -456,6 +471,7 @@ enum FileOperations {
                     value.isHidden = (flags & UInt32(UF_HIDDEN)) != 0
                     value.size = size
                     value.modified = modified
+                    value.added = added
                 }
                 result[index] = value
             }
@@ -485,11 +501,24 @@ enum FileOperations {
                 isHidden: isHidden,
                 fileSize: (isDirectory && !looksLikePackage) ? nil : (stat.succeeded ? stat.size : nil),
                 modificationDate: stat.modified,
-                creationDate: nil,
+                creationDate: stat.added,
                 archiveEntryPath: nil
             ))
         }
         return items
+    }
+
+    /// Attach original locations for items listed from the Trash.
+    ///
+    /// `TrashPutBackStore` remembers where NewFinder-moved items came from.
+    /// Items trashed elsewhere have no record — their path stays `nil`.
+    static func attachTrashOriginalPaths(_ items: [FileItem]) -> [FileItem] {
+        guard !items.isEmpty else { return items }
+        return items.map { item in
+            var copy = item
+            copy.originalPath = TrashPutBackStore.shared.originalURL(for: item.url)?.path
+            return copy
+        }
     }
 
     /// Confirms package status for plain folders (bundles without a known extension).
@@ -504,7 +533,7 @@ enum FileOperations {
             let values = try? items[index].url.resourceValues(forKeys: [.isPackageKey])
             guard values?.isPackage == true else { continue }
             let item = items[index]
-            items[index] = FileItem(
+            var patched = FileItem(
                 url: item.url,
                 name: item.name,
                 isDirectory: false,
@@ -515,6 +544,8 @@ enum FileOperations {
                 creationDate: item.creationDate,
                 archiveEntryPath: item.archiveEntryPath
             )
+            patched.originalPath = item.originalPath
+            items[index] = patched
         }
     }
 
@@ -1140,7 +1171,11 @@ enum FileOperations {
             throw NSError(
                 domain: "NewFinder",
                 code: 2,
-                userInfo: [NSLocalizedDescriptionKey: failures.joined(separator: "\n")]
+                userInfo: [
+                    NSLocalizedDescriptionKey: failures.joined(separator: "\n"),
+                    // The caller still wants to reveal the items that *did* restore.
+                    "restoredURLs": restored.map(\.standardizedFileURL),
+                ]
             )
         }
         return restored
@@ -1519,7 +1554,7 @@ enum FileOperations {
 
 /// Remembers original paths for items NewFinder moves to Trash.
 /// Finder’s AppleScript `put away` was removed on modern macOS.
-private final class TrashPutBackStore {
+final class TrashPutBackStore {
     static let shared = TrashPutBackStore()
 
     private let defaultsKey = "NewFinder.trashPutBackMap"

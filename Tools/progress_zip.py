@@ -285,14 +285,14 @@ def report_file(name, original, compressed):
     )
 
 
-def report_file_progress(name, done, compressed):
+def report_file_progress(name, done, original, compressed):
     """Prints how far along one file is, and how big it is in the archive.
 
-    The three numbers are the bytes that have been read, the bytes that
-    have been read in total and the bytes the file takes in the archive.
+    The four numbers are the bytes that have been read, the bytes the file
+    had before it was compressed and the bytes it takes in the archive.
     """
     print(
-        "FILEPROGRESS %s %d %d" % (name, done, compressed),
+        "FILEPROGRESS %s %d %d %d" % (name, done, original, compressed),
         flush=True,
     )
 
@@ -352,7 +352,7 @@ def compress_job(job):
                     percent = int(job.done * 100 / job.original) if job.original else 100
                     if percent != last_reported:
                         last_reported = percent
-                        report_file_progress(job.name, job.done, job.compressed)
+                        report_file_progress(job.name, job.done, job.original, job.compressed)
 
             # The tail of the deflate stream has to be flushed.
             piece = compressor.flush()

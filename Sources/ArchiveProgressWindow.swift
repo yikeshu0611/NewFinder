@@ -1,15 +1,56 @@
 import AppKit
 
-/// The window that shows how far along a compression is.
+/// The window that shows how far along a compression or an extraction is.
 ///
-/// It has its own progress bar, a list of the files that are being
-/// compressed, and buttons to pause the work or to cancel it. Every row of
-/// the list says how far along that file is, how big it was, how big it
-/// became and how much smaller it got. It is styled like the rest of
-/// NewFinder.
+/// It has its own progress bar, a list of the files that are being worked
+/// on, and buttons to pause the work or to cancel it. Every row of the
+/// list says how far along that file is, how big it was and how big it is
+/// in the archive. It is styled like the rest of NewFinder.
 final class ArchiveProgressWindow: NSWindowController, NSWindowDelegate {
+    /// What the window is showing.
+    enum Mode {
+        /// The files are being compressed.
+        case compress
+        /// The files are being taken out of an archive.
+        case extract
+
+        /// The name of the work, shown in the title.
+        var title: String {
+            switch self {
+            case .compress: return "正在压缩"
+            case .extract: return "正在解压"
+            }
+        }
+
+        /// The heading of the column with the size before the work.
+        var originalTitle: String {
+            switch self {
+            case .compress: return "原始大小"
+            case .extract: return "解压后"
+            }
+        }
+
+        /// The heading of the column with the size in the archive.
+        var archivedTitle: String {
+            switch self {
+            case .compress: return "压缩后"
+            case .extract: return "压缩包内"
+            }
+        }
+
+        /// The heading of the column with the ratio.
+        var ratioTitle: String {
+            switch self {
+            case .compress: return "压缩率"
+            case .extract: return "压缩率"
+            }
+        }
+    }
+
     /// The compression that is running. The window drives it.
     private let job: ArchiveJob
+    /// What the window is showing.
+    private let mode: Mode
 
     /// The size of the window. It is wide enough for the name, the numbers
     /// and the size of the archive all on one line, and tall enough for a
@@ -46,8 +87,9 @@ final class ArchiveProgressWindow: NSWindowController, NSWindowDelegate {
     /// stopping anything.
     private var isFinished = false
 
-    init(job: ArchiveJob) {
+    init(job: ArchiveJob, mode: Mode = .compress) {
         self.job = job
+        self.mode = mode
 
         // A panel that floats above the browser windows. It is a plain
         // titled window on purpose: a `utilityWindow` is squeezed down to
@@ -58,7 +100,7 @@ final class ArchiveProgressWindow: NSWindowController, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "正在压缩"
+        window.title = mode.title
         window.isReleasedWhenClosed = false
         // The size is fixed, so the panel does not shrink to the content.
         window.setContentSize(Self.contentSize)
@@ -110,7 +152,7 @@ final class ArchiveProgressWindow: NSWindowController, NSWindowDelegate {
         chromeView.translatesAutoresizingMaskIntoConstraints = false
         body.addSubview(chromeView)
 
-        let titleLabel = NSTextField(labelWithString: "正在压缩")
+        let titleLabel = NSTextField(labelWithString: mode.title)
         titleLabel.font = .systemFont(ofSize: 13, weight: .medium)
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         chromeView.addSubview(titleLabel)
@@ -194,19 +236,19 @@ final class ArchiveProgressWindow: NSWindowController, NSWindowDelegate {
         fileTable.addTableColumn(percentColumn)
 
         let originalColumn = NSTableColumn(identifier: .init("original"))
-        originalColumn.title = "原始大小"
+        originalColumn.title = mode.originalTitle
         originalColumn.width = 72
         originalColumn.minWidth = 60
         fileTable.addTableColumn(originalColumn)
 
         let compressedColumn = NSTableColumn(identifier: .init("compressed"))
-        compressedColumn.title = "压缩后"
+        compressedColumn.title = mode.archivedTitle
         compressedColumn.width = 72
         compressedColumn.minWidth = 60
         fileTable.addTableColumn(compressedColumn)
 
         let ratioColumn = NSTableColumn(identifier: .init("ratio"))
-        ratioColumn.title = "压缩率"
+        ratioColumn.title = mode.ratioTitle
         ratioColumn.width = 52
         ratioColumn.minWidth = 46
         fileTable.addTableColumn(ratioColumn)
@@ -380,9 +422,16 @@ final class ArchiveProgressWindow: NSWindowController, NSWindowDelegate {
         let total = Self.formatBytes(progress.totalBytes)
         detailLabel.stringValue = "\(done) / \(total)"
 
-        // The size of the file on disk, which grows while the work runs.
-        let written = Self.sizeOnDisk(of: job.destinationURL)
-        fileSizeLabel.stringValue = written > 0 ? Self.formatBytes(written) : ""
+        switch mode {
+        case .compress:
+            // The size of the file on disk, which grows while the work runs.
+            let written = Self.sizeOnDisk(of: job.destinationURL)
+            fileSizeLabel.stringValue = written > 0 ? Self.formatBytes(written) : ""
+        case .extract:
+            // The archive does not grow, so its size is shown as it is.
+            let size = Self.sizeOnDisk(of: job.destinationURL)
+            fileSizeLabel.stringValue = size > 0 ? Self.formatBytes(size) : ""
+        }
     }
 
     /// Updates the row of one file.

@@ -53,6 +53,8 @@ enum FinderActivationIntent {
         /// The user clicked the Dock — Finder is being asked for something,
         /// so the redirect must follow through.
         case dock
+        /// The user clicked the Trash in the Dock — open NF's Trash UI.
+        case dockTrash
         /// The user clicked a desktop icon, a Finder window, or anything else
         /// that produced context — follow the normal path.
         case content
@@ -98,6 +100,10 @@ enum FinderActivationIntent {
     /// The monitor that watches for clicks. Held so it can be removed again.
     private static var globalMonitor: Any?
     private static var localMonitor: Any?
+
+    /// Called on the main thread the moment the Dock's Trash tile is
+    /// left-clicked (mouse-down) — before Finder has drawn anything.
+    static var onDockTrashMouseDown: (() -> Void)?
 
     // MARK: - Public API
 
@@ -189,6 +195,36 @@ enum FinderActivationIntent {
 
     private static func record(_ event: NSEvent) {
         let location = quartzLocation(of: event)
+        // The Dock sits above every app window, so it is asked first. Some
+        // apps (WPS Office in particular) use borderless full-size windows
+        // whose frame extends behind the Dock — a plain rect-containment
+        // test against the frontmost app would then claim a click on the
+        // Dock's Finder icon for that app, the click would be classified as
+        // `.content` instead of `.dock`, and the redirect would take the
+        // slow AppleScript path (several synchronous round trips plus
+        // sleeps on the main thread) before NF comes forward. That is the
+        // visible stutter when switching from WPS.
+        if let dockIntent = dockIntent(at: location) {
+            lastClick = Click(
+                location: location,
+                intent: dockIntent,
+                date: Date(),
+                owningAppBundleIdentifier: "com.apple.dock"
+            )
+            // Trash tile left-clicked: preempt before Finder draws anything.
+            // The redirect used to run only after Finder's activation
+            // notification arrived — by then Finder's own Trash window had
+            // already painted one frame, which is the visible flash. Hiding
+            // Finder + showing NF's Trash here, on mouse-down, wins that race:
+            // Finder's window then opens while Finder is hidden (invisible),
+            // and the later redirect just closes it in the background.
+            if dockIntent == .dockTrash, event.type == .leftMouseDown {
+                DispatchQueue.main.async {
+                    onDockTrashMouseDown?()
+                }
+            }
+            return
+        }
         // Which app the click really belongs to.
         //
         // The frontmost app is not enough: clicking the desktop *is* what
@@ -212,6 +248,82 @@ enum FinderActivationIntent {
             date: Date(),
             owningAppBundleIdentifier: owner
         )
+    }
+
+    /// The Dock intent for a click: `.dockTrash` when the Trash tile was hit,
+    /// `.dock` when any other Dock item was hit, `nil` when the click was
+    /// not on the Dock at all.
+    ///
+    /// The Dock is always composited above app windows, so any click inside
+    /// its rect goes to the Dock — even when the frontmost app (WPS Office
+    /// in particular) uses a borderless full-size window whose frame extends
+    /// behind the Dock. A plain "frontmost window contains the point" test
+    /// would then credit the click to that app and the redirect would miss
+    /// the fast Dock path.
+    private static func dockIntent(at point: CGPoint) -> Intent? {
+        guard let windows = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly],
+            kCGNullWindowID
+        ) as? [[String: Any]] else { return nil }
+        // Find the Dock's own windows by owner name rather than by bundle
+        // lookup — the Dock does not always show up in
+        // `NSRunningApplication.runningApplications`, and relying on that
+        // lookup is what missed the Dock click when WPS was in front.
+        var dockPID: pid_t?
+        var insideDockRect = false
+        for window in windows {
+            let ownerName = window[kCGWindowOwnerName as String] as? String ?? ""
+            guard ownerName == "Dock" || ownerName == "程序坞" else { continue }
+            if let pid = window[kCGWindowOwnerPID as String] as? pid_t {
+                dockPID = pid
+            }
+            guard let bounds = window[kCGWindowBounds as String] as? [String: Any],
+                  let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { continue }
+            if rect.width < 2 || rect.height < 2 { continue }
+            if rect.contains(point) {
+                insideDockRect = true
+            }
+        }
+        // Ask the Dock itself what is under the pointer — this tells Finder
+        // apart from Trash. Use the PID seen in the window list when available.
+        let dockElement: AXUIElement?
+        if let dockPID {
+            dockElement = AXUIElementCreateApplication(dockPID)
+        } else {
+            dockElement = applicationElement(for: "com.apple.dock")
+        }
+        if let dockElement {
+            if let hit = hitTest(application: dockElement, at: point) {
+                if hit.isTrashDockItem {
+                    return .dockTrash
+                }
+                if hit.isDockItem {
+                    return .dock
+                }
+                // The Dock itself says the point is not on one of its
+                // items — trust it. Falling back to the window rect here
+                // turned clicks in other apps into Dock clicks whenever a
+                // Dock-owned window happened to cover the point (a vertical
+                // Dock's reported rect can span the strip its neighbours
+                // click in, e.g. WeChat's right-edge menus). A reveal that
+                // followed was then treated as a Dock click and NF just
+                // showed the Desktop instead of the file.
+                return nil
+            }
+            // The hit test answered nothing even though the Dock element
+            // exists. With Accessibility permission that means the point is
+            // not on Dock UI — only without permission is the rect a
+            // usable fallback.
+            if NFHasAccessibilityAccess() {
+                return nil
+            }
+        }
+        // Hit test unavailable (no Accessibility permission): a click
+        // inside the Dock's own rect is still a Dock click.
+        if insideDockRect {
+            return .dock
+        }
+        return nil
     }
 
     /// The bundle identifier of the app that owns the spot under the pointer.
@@ -404,10 +516,38 @@ enum FinderActivationIntent {
         let subrole: String
         /// The element's frame, in Quartz coordinates.
         let frame: CGRect
+        /// The element's title / description (Dock item names live here).
+        let title: String
+        let detail: String
+
+        init(role: String, subrole: String, frame: CGRect, title: String = "", detail: String = "") {
+            self.role = role
+            self.subrole = subrole
+            self.frame = frame
+            self.title = title
+            self.detail = detail
+        }
 
         /// True when the element is a Dock item.
         var isDockItem: Bool {
             role == "AXDockItem" || subrole == "AXApplicationDockItem" || subrole == "AXDockItem"
+        }
+
+        /// True when the Dock item is the Trash (废纸篓/Trash/垃圾桶).
+        var isTrashDockItem: Bool {
+            guard isDockItem else { return false }
+            let text = (title + " " + detail).lowercased()
+            return text.contains("废纸篓")
+                || text.contains("垃圾")
+                || text.contains("trash")
+                || text.contains("ゴミ箱")
+                || text.contains("휴지통")
+                || text.contains("papierkorb")
+                || text.contains("corbeille")
+                || text.contains("papelera")
+                || text.contains("cestino")
+                || text.contains("prullenbak")
+                || text.contains("lixeira")
         }
 
         /// True when the element is a desktop icon rather than the background.
@@ -445,6 +585,9 @@ enum FinderActivationIntent {
         // The Dock sits on top of the desktop, so it has to be asked first —
         // otherwise a Dock click would be reported as a click on the blank
         // desktop underneath it.
+        if let dockHit, dockHit.isTrashDockItem {
+            return .dockTrash
+        }
         if let dockHit, dockHit.isDockItem {
             return .dock
         }
@@ -483,11 +626,17 @@ enum FinderActivationIntent {
         AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef)
         var subroleRef: CFTypeRef?
         AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subroleRef)
+        var titleRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &titleRef)
+        var descRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXDescriptionAttribute as CFString, &descRef)
 
         return Hit(
             role: (roleRef as? String) ?? "",
             subrole: (subroleRef as? String) ?? "",
-            frame: frame(of: element)
+            frame: frame(of: element),
+            title: (titleRef as? String) ?? "",
+            detail: (descRef as? String) ?? ""
         )
     }
 

@@ -10,21 +10,14 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private var helpers: [AnyObject] = []
 
     func install() {
-        guard statusItem == nil else { return }
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = item.button {
-            let image = NSImage(systemSymbolName: "folder.fill", accessibilityDescription: "NewFinder")
-            image?.isTemplate = true
-            button.image = image
-            button.toolTip = "NewFinder（单击显示，右键菜单）"
-            button.target = self
-            button.action = #selector(statusItemClicked(_:))
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        // 用户要求：顶部右上角不再展示 NF 图标。
+        // 之前这里会创建一个 NSStatusItem（文件夹图标），现在改为不创建；
+        // 如果之前已经创建过（比如热更新），顺手移除掉。
+        if let item = statusItem {
+            NSStatusBar.system.removeStatusItem(item)
+            statusItem = nil
         }
-
-        statusMenu.delegate = self
-        statusItem = item
-        rebuildMenu(statusMenu)
+        return
     }
 
     func refreshZoomTitle(_ percent: Int? = nil) {

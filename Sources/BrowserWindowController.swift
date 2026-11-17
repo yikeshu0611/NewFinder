@@ -440,8 +440,17 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         contentController.onCommitRename = { [weak self] item, newName in
             self?.commitRename(item, to: newName)
         }
-        contentController.onDirectoryNeedsReload = { [weak self] in
-            self?.reloadAfterMutation()
+        contentController.onDirectoryNeedsReload = { [weak self] select in
+            guard let self else { return }
+            // The archive may be saved to a different folder than the one
+            // on screen — jump there so the new file can be selected.
+            if let target = select.first?.standardizedFileURL,
+               target.deletingLastPathComponent() != self.currentDirectory.standardizedFileURL {
+                self.pendingSelectURLs = select.map(\.standardizedFileURL)
+                self.navigate(to: target.deletingLastPathComponent())
+            } else {
+                self.reloadAfterMutation(select: select)
+            }
         }
         contentController.onCompressProgress = { [weak self] progress in
             self?.showCompressProgress(progress)
@@ -1223,9 +1232,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             self?.focusExtraPane(pane)
             self?.commitRename(item, to: name)
         }
-        pane.onDirectoryNeedsReload = { [weak self] in
-            self?.reloadContents(preservingOutline: true)
-            self?.reloadAllExtraPanes()
+        pane.onDirectoryNeedsReload = { [weak self] select in
+            guard let self else { return }
+            // Keep the main column in sync; only take the selection when
+            // the archive landed in the main column's folder.
+            let forMain = select.filter {
+                $0.standardizedFileURL.deletingLastPathComponent()
+                    == self.currentDirectory.standardizedFileURL
+            }
+            self.reloadAfterMutation(select: forMain)
+            self.reloadAllExtraPanes(select: select)
         }
         pane.onPerformFileDrop = { [weak self] urls, destination, copying in
             self?.handleFileDrop(urls: urls, destination: destination, copying: copying)
@@ -1288,9 +1304,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         return extraPanes[i]
     }
 
-    private func reloadAllExtraPanes() {
+    private func reloadAllExtraPanes(select: [URL] = []) {
+        let targets = select.map(\.standardizedFileURL)
         for pane in extraPanes {
-            pane.reloadContents()
+            // Only the pane showing the archive's folder takes the
+            // selection; the others just refresh.
+            let mine = targets.filter {
+                $0.deletingLastPathComponent() == pane.directory.standardizedFileURL
+            }
+            pane.reloadContents(select: mine)
         }
     }
 
@@ -2084,6 +2106,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
             if !needsAttributes {
                 items = FileOperations.enrichWithAttributes(items, in: directory)
             }
+            if inTrash {
+                items = FileOperations.attachTrashOriginalPaths(items)
+            }
             DispatchQueue.main.async {
                 guard let self else { return }
                 guard generation == self.contentLoadGeneration else { return }
@@ -2152,9 +2177,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
     /// Fill in sizes / dates for a huge folder after its rows are already visible.
     private func scheduleAttributeFill(items: [FileItem], directory: URL, generation: Int) {
         attributeFillWorkItem?.cancel()
+        let inTrash = FileOperations.isTrashDirectory(directory.standardizedFileURL)
         var work: DispatchWorkItem!
         work = DispatchWorkItem { [weak self] in
-            let enriched = FileOperations.enrichWithAttributes(items, in: directory)
+            var enriched = FileOperations.enrichWithAttributes(items, in: directory)
+            if inTrash {
+                enriched = FileOperations.attachTrashOriginalPaths(enriched)
+            }
             DispatchQueue.main.async {
                 guard let self, generation == self.contentLoadGeneration else { return }
                 self.contentController.applyFileAttributes(enriched)
@@ -3151,29 +3180,77 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSTex
         guard FileOperations.isTrashDirectory(dir) else { return }
         let urls = list.selectedItems.map(\.url.standardizedFileURL)
         guard !urls.isEmpty else { NSSound.beep(); return }
-        let nextURL = list.selectionURLAfterRemovingSelected()
         do {
-            let restored = try FileOperations.putBackFromTrash(urls)
+            let restored = try FileOperations.putBackFromTrash(urls).map(\.standardizedFileURL)
             list.noteRemovedURLs(urls)
-            if let pane = focusedExtraPane() {
-                suppressDirectoryWatchUntil = Date().addingTimeInterval(1.2)
-                reloadContents(preservingOutline: true)
-                reloadAllExtraPanes()
-                if let next = nextURL {
-                    pane.contentController.select(urls: [next])
-                }
-            } else {
-                reloadAfterMutation(select: nextURL.map { [$0] } ?? [])
+            guard !restored.isEmpty else {
+                reloadAfterMutation()
+                return
             }
-            if let first = restored.first {
-                // Optionally reveal first restored item’s parent in a new tab is noisy;
-                // status feedback is enough.
-                _ = first
-            }
+            // Keep the Trash tab untouched — reveal the restored files in a new
+            // tab next to it (or focus an existing tab already showing that folder).
+            refreshTrashListingAfterPutBack(list: list)
+            revealRestoredInNewTab(restored)
         } catch {
+            // Partial success still reveals what was restored — `putBackFromTrash`
+            // carries those URLs on the error when some items failed.
+            let nsError = error as NSError
+            let restored = (nsError.userInfo["restoredURLs"] as? [URL] ?? []).map(\.standardizedFileURL)
+            if !restored.isEmpty {
+                list.noteRemovedURLs(urls)
+                refreshTrashListingAfterPutBack(list: list)
+                revealRestoredInNewTab(restored)
+            } else {
+                reloadAfterMutation()
+            }
             showError(error)
-            reloadAfterMutation()
         }
+    }
+
+    /// Refresh the Trash listing in place after a put-back, without navigating away.
+    private func refreshTrashListingAfterPutBack(list: ContentViewController) {
+        if let pane = focusedExtraPane(), list === pane.contentController {
+            pane.reloadContents()
+            reloadAllExtraPanes()
+        } else {
+            // Main column shows the Trash: reload it now so switching back to
+            // this tab later shows the rows already gone. The reload is async;
+            // opening the new tab right after cancels it, but the tab reloads
+            // fresh when selected again — either way nothing is lost.
+            suppressDirectoryWatchUntil = Date().addingTimeInterval(1.2)
+            reloadContents(preservingOutline: true)
+            reloadAllExtraPanes()
+        }
+    }
+
+    /// Open the restored location in a new tab (never overwriting the Trash tab)
+    /// and select the restored files there.
+    private func revealRestoredInNewTab(_ restored: [URL]) {
+        guard !restored.isEmpty else { return }
+        // Multiple items may restore to different folders — stay with the
+        // first one's parent and select every restored item that landed in it.
+        let firstParent = restored[0].deletingLastPathComponent().standardizedFileURL
+        let selectInParent = restored.filter { $0.deletingLastPathComponent().standardizedFileURL == firstParent }
+        if let existing = tabs.first(where: {
+            !$0.isArchiveTab && !$0.isSpecialContentTab
+                && $0.directory.standardizedFileURL == firstParent
+                && $0.id != activeTabID
+        }) {
+            existing.rememberedSelectionURLs = selectInParent
+            selectTab(existing.id)
+            pendingSelectURLs = selectInParent
+            applyPendingSelection(clearIfSelected: false)
+        } else {
+            let tab = BrowserTab(directory: firstParent)
+            tab.rememberedSelectionURLs = selectInParent
+            if let index = tabs.firstIndex(where: { $0.id == activeTabID }) {
+                tabs.insert(tab, at: index + 1)
+            } else {
+                tabs.append(tab)
+            }
+            selectTab(tab.id)
+        }
+        window?.makeKeyAndOrderFront(nil)
     }
 
     @objc func deleteForeverFromTrash(_ sender: Any?) {

@@ -225,6 +225,23 @@ enum ArchiveEngine {
         return total
     }
 
+    /// The total size of what is inside an archive.
+    ///
+    /// This is the size of the files once they are out of the archive, not
+    /// the size of the archive itself, so it is what the progress of an
+    /// extraction is measured against.
+    static func totalSize(ofArchiveContents archive: URL) async -> UInt64 {
+        let ext = archive.pathExtension.lowercased()
+        guard ext == "zip" else { return size(of: archive) }
+
+        let entries = await listZipEntries(archive)
+        let total = entries.reduce(Int64(0)) { sum, entry in
+            guard !entry.isDirectory, let size = entry.size else { return sum }
+            return sum + size
+        }
+        return total > 0 ? UInt64(total) : size(of: archive)
+    }
+
     private static func size(of url: URL) -> UInt64 {
         let fm = FileManager.default
         var isDirectory: ObjCBool = false
@@ -257,6 +274,9 @@ enum ArchiveEngine {
         to directory: URL,
         password: String? = nil,
         protecting otherArchives: [URL] = [],
+        progressDetail: ((ArchiveProgress) -> Void)? = nil,
+        fileProgress: ((ArchiveFileProgress) -> Void)? = nil,
+        processControl: ((Process) -> Void)? = nil,
         progress: @escaping (String) -> Void
     ) async throws {
         try Task.checkCancellation()
@@ -288,7 +308,14 @@ enum ArchiveEngine {
             var keepStaging = false
             defer { if !keepStaging { try? fm.removeItem(at: staging) } }
             do {
-                try await extractDirect(archive: archive, to: staging, password: password)
+                try await extractDirect(
+                    archive: archive,
+                    to: staging,
+                    password: password,
+                    progressDetail: progressDetail,
+                    fileProgress: fileProgress,
+                    processControl: processControl
+                )
             } catch {
                 keepStaging = await isDamagedZipFile(archive)
                 guard keepStaging else { throw error }
@@ -300,7 +327,14 @@ enum ArchiveEngine {
             try mergeExtractedContents(from: staging, into: directory, protecting: protectedPaths)
         } else {
             try fm.createDirectory(at: directory, withIntermediateDirectories: true)
-            try await extractDirect(archive: archive, to: directory, password: password)
+            try await extractDirect(
+                archive: archive,
+                to: directory,
+                password: password,
+                progressDetail: progressDetail,
+                fileProgress: fileProgress,
+                processControl: processControl
+            )
         }
 
         progress("解压完成")
@@ -382,7 +416,10 @@ enum ArchiveEngine {
     private static func extractDirect(
         archive: URL,
         to directory: URL,
-        password: String?
+        password: String?,
+        progressDetail: ((ArchiveProgress) -> Void)? = nil,
+        fileProgress: ((ArchiveFileProgress) -> Void)? = nil,
+        processControl: ((Process) -> Void)? = nil
     ) async throws {
         let name = archive.lastPathComponent.lowercased()
         let ext = archive.pathExtension.lowercased()
@@ -393,7 +430,14 @@ enum ArchiveEngine {
                     "-P", password, "-o", archive.path, "-d", directory.path
                 ])
             } else {
-                try await extractZip(archive: archive, to: directory)
+                try await extractZipWithProgress(
+                    archive: archive,
+                    to: directory,
+                    password: password,
+                    progressDetail: progressDetail,
+                    fileProgress: fileProgress,
+                    processControl: processControl
+                )
             }
         } else if name.hasSuffix(".tar.gz") || name.hasSuffix(".tgz") || ext == "gz" && name.contains(".tar.") {
             try await run("/usr/bin/tar", ["-xzf", archive.path, "-C", directory.path])
@@ -432,6 +476,64 @@ enum ArchiveEngine {
                 "/usr/bin/bsdtar",
                 ["-xf", archive.path, "-C", directory.path],
                 environment: ["LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"]
+            )
+        } catch {
+            // The archive may simply be broken. That is worth saying in
+            // plain words, because the tools only answer “bsdtar: (null)”.
+            if await isDamagedZip(archive) {
+                throw ArchiveError.toolFailed(
+                    damagedZipMessage(archive, recoveredIn: directory)
+                )
+            }
+            throw error
+        }
+    }
+
+    /// Extracts a zip file, saying how far along it is.
+    ///
+    /// The reporter is used when it is there, because it knows how big
+    /// every file in the archive is and can say how far along each one is.
+    /// Without it the archive is still extracted, only the progress is
+    /// missing.
+    ///
+    /// A zip that was cut short is still handled the same way as before:
+    /// the files that could be read are kept, and the failure is reported
+    /// afterwards.
+    private static func extractZipWithProgress(
+        archive: URL,
+        to directory: URL,
+        password: String?,
+        progressDetail: ((ArchiveProgress) -> Void)?,
+        fileProgress: ((ArchiveFileProgress) -> Void)?,
+        processControl: ((Process) -> Void)?
+    ) async throws {
+        guard let script = progressReporterURL(named: "progress_unzip") else {
+            try await extractZip(archive: archive, to: directory)
+            return
+        }
+
+        // The size of the archive is what has to be read, so it is used as
+        // the total of the progress.
+        let total = size(of: archive)
+
+        var arguments = [script.path, archive.path, directory.path]
+        if let password, !password.isEmpty {
+            arguments.append(password)
+        }
+
+        do {
+            try await run(
+                "/usr/bin/python3",
+                arguments,
+                environment: ["LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"],
+                sourceBytes: total,
+                progressDetail: progressDetail,
+                progressParser: Self.reporterBytesHandled(in:),
+                reportsAbsoluteValue: true,
+                fileParser: Self.reporterFileProgress(in:),
+                fileProgress: fileProgress,
+                processControl: processControl,
+                keepsOutputOnFailure: true
             )
         } catch {
             // The archive may simply be broken. That is worth saying in
@@ -860,6 +962,15 @@ enum ArchiveEngine {
         if FileManager.default.fileExists(atPath: beside.path) {
             return beside
         }
+        // The scripts live in the Tools folder of the project, so the tests
+        // and the tools that run from the command line find them there.
+        let source = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // Sources
+            .deletingLastPathComponent()   // the project
+            .appendingPathComponent("Tools/\(name).py")
+        if FileManager.default.fileExists(atPath: source.path) {
+            return source
+        }
         return nil
     }
 
@@ -868,11 +979,16 @@ enum ArchiveEngine {
     /// The reporter prints a line like this:
     ///
     ///     PROGRESS 1048576 1426607415
-    private static func reporterBytesHandled(in line: String) -> UInt64? {
+    ///
+    /// The first number is how much has been handled and the second is how
+    /// much there is in all. Both are returned, because the total is what
+    /// the progress is measured against.
+    private static func reporterBytesHandled(in line: String) -> (done: UInt64, total: UInt64)? {
         guard line.hasPrefix("PROGRESS ") else { return nil }
         let fields = line.split(separator: " ")
         guard fields.count >= 2, let done = UInt64(fields[1]) else { return nil }
-        return done
+        let total = fields.count >= 3 ? (UInt64(fields[2]) ?? 0) : 0
+        return (done, total)
     }
 
     /// Reads the state of one file that the reporter prints.
@@ -880,17 +996,17 @@ enum ArchiveEngine {
     /// The reporter prints two kinds of line:
     ///
     ///     FILE <name> <original-bytes> <compressed-bytes>
-    ///     FILEPROGRESS <name> <bytes-done> <compressed-bytes>
+    ///     FILEPROGRESS <name> <bytes-done> <original-bytes> <compressed-bytes>
     ///
     /// The first says how big the file is and how big it is in the archive.
     /// The second says how far along the file is.
     private static func reporterFileProgress(in line: String) -> ArchiveFileProgress? {
         if line.hasPrefix("FILEPROGRESS ") {
             let rest = String(line.dropFirst("FILEPROGRESS ".count))
-            guard let (name, done, compressed) = splitFileLine(rest) else { return nil }
+            guard let (name, done, original, compressed) = splitProgressLine(rest) else { return nil }
             return ArchiveFileProgress(
                 name: name,
-                originalBytes: 0,
+                originalBytes: original,
                 compressedBytes: compressed,
                 completedBytes: done
             )
@@ -911,8 +1027,9 @@ enum ArchiveEngine {
 
     /// Splits a file line into its name and its numbers.
     ///
-    /// The name is the first part and the numbers are the last two, because
-    /// a name may hold spaces.
+    /// The name is the first part and the numbers are the last ones, because
+    /// a name may hold spaces. The last two numbers are always there; the
+    /// third from the end is there too, but only in the progress lines.
     private static func splitFileLine(_ text: String) -> (String, UInt64, UInt64)? {
         let fields = text.split(separator: " ", omittingEmptySubsequences: true)
         guard fields.count >= 3 else { return nil }
@@ -921,6 +1038,23 @@ enum ArchiveEngine {
         let name = fields[0..<(fields.count - 2)].joined(separator: " ")
         guard !name.isEmpty else { return nil }
         return (name, first, second)
+    }
+
+    /// Splits a progress line into its name and its numbers.
+    ///
+    /// The line holds the name and three numbers: how much has been read,
+    /// how big the file is and how big it is in the archive.
+    private static func splitProgressLine(
+        _ text: String
+    ) -> (String, UInt64, UInt64, UInt64)? {
+        let fields = text.split(separator: " ", omittingEmptySubsequences: true)
+        guard fields.count >= 4 else { return nil }
+        guard let done = UInt64(fields[fields.count - 3]),
+              let original = UInt64(fields[fields.count - 2]),
+              let compressed = UInt64(fields[fields.count - 1]) else { return nil }
+        let name = fields[0..<(fields.count - 3)].joined(separator: " ")
+        guard !name.isEmpty else { return nil }
+        return (name, done, original, compressed)
     }
 
     /// Move the `name.z01`, `name.z02`, … parts of a split archive into the
@@ -1234,13 +1368,14 @@ enum ArchiveEngine {
     ///
     /// The `in=` number is the size of the file before it was compressed, so
     /// it is the amount of source that has been handled.
-    private static func zipBytesHandled(in line: String) -> UInt64? {
+    private static func zipBytesHandled(in line: String) -> (done: UInt64, total: UInt64)? {
         guard let range = line.range(of: "(in=") else { return nil }
         let rest = line[range.upperBound...]
         guard let end = rest.firstIndex(where: { $0 == ")" }) else { return nil }
         let number = rest[..<end]
         guard !number.isEmpty, number.allSatisfy(\.isNumber) else { return nil }
-        return UInt64(number)
+        guard let done = UInt64(number) else { return nil }
+        return (done, 0)
     }
 
     /// Reads the size of a file a `tar -v` line reports.
@@ -1250,7 +1385,7 @@ enum ArchiveEngine {
     ///     -rw-r--r--  0 0  0  20971520 Nov 15 07:55 src/file.bin
     ///
     /// The number before the date is the size of the file.
-    private static func tarBytesHandled(in line: String, staging: URL) -> UInt64? {
+    private static func tarBytesHandled(in line: String, staging: URL) -> (done: UInt64, total: UInt64)? {
         // The path is at the end of the line, after the date.
         let fields = line.split(whereSeparator: { $0 == " " }).map(String.init)
         guard fields.count >= 6 else { return nil }
@@ -1260,7 +1395,7 @@ enum ArchiveEngine {
         let url = staging.appendingPathComponent(name)
         let values = try? url.resourceValues(forKeys: [.fileSizeKey])
         guard let size = values?.fileSize, size >= 0 else { return nil }
-        return UInt64(size)
+        return (UInt64(size), 0)
     }
 
     @discardableResult
@@ -1270,7 +1405,7 @@ enum ArchiveEngine {
         environment: [String: String]? = nil,
         sourceBytes: UInt64 = 0,
         progressDetail: ((ArchiveProgress) -> Void)? = nil,
-        progressParser: ((String) -> UInt64?)? = nil,
+        progressParser: ((String) -> (done: UInt64, total: UInt64)?)? = nil,
         reportsAbsoluteValue: Bool = false,
         fileParser: ((String) -> ArchiveFileProgress?)? = nil,
         fileProgress: ((ArchiveFileProgress) -> Void)? = nil,
@@ -1401,7 +1536,9 @@ private final class OutputReader {
     private let pipes: [Pipe]
     private let sourceBytes: UInt64
     private let progressDetail: ((ArchiveProgress) -> Void)?
-    private let progressParser: ((String) -> UInt64?)?
+    /// Reads the amount that has been handled out of a line, and the total
+    /// there is in all, when the line says so.
+    private let progressParser: ((String) -> (done: UInt64, total: UInt64)?)?
     /// True when the parser reports the total handled so far, rather than
     /// the amount handled by one line.
     private let reportsAbsoluteValue: Bool
@@ -1413,6 +1550,10 @@ private final class OutputReader {
     private let lock = NSLock()
     private var collected = Data()
     private var handledBytes: UInt64 = 0
+    /// The total the tool says there is. It is used when it is known,
+    /// because the size of the archive on disk is not the size of what
+    /// comes out of it.
+    private var reportedTotalBytes: UInt64 = 0
     private var lastPercent = -1
     private var group: DispatchGroup?
 
@@ -1428,7 +1569,7 @@ private final class OutputReader {
         pipes: [Pipe],
         sourceBytes: UInt64,
         progressDetail: ((ArchiveProgress) -> Void)?,
-        progressParser: ((String) -> UInt64?)?,
+        progressParser: ((String) -> (done: UInt64, total: UInt64)?)?,
         reportsAbsoluteValue: Bool = false,
         fileParser: ((String) -> ArchiveFileProgress?)? = nil,
         fileProgress: ((ArchiveFileProgress) -> Void)? = nil
@@ -1539,9 +1680,9 @@ private final class OutputReader {
             }
         }
 
-        guard let progressParser, let progressDetail, sourceBytes > 0 else { return }
-        guard let handled = progressParser(text) else { return }
-        report(handled: handled, detail: progressDetail)
+        guard let progressParser, let progressDetail else { return }
+        guard let (handled, total) = progressParser(text) else { return }
+        report(handled: handled, total: total, detail: progressDetail)
     }
 
     /// Puts together what is known about a file and tells the caller.
@@ -1565,7 +1706,7 @@ private final class OutputReader {
         detail(merged)
     }
 
-    private func report(handled: UInt64, detail: (ArchiveProgress) -> Void) {
+    private func report(handled: UInt64, total: UInt64, detail: (ArchiveProgress) -> Void) {
         lock.lock()
         // The reporter gives the total handled so far; the tools that print
         // per file give the amount handled by that one file.
@@ -1574,8 +1715,17 @@ private final class OutputReader {
         } else {
             handledBytes += handled
         }
+        // The tool may say how much there is in all. That number is used
+        // when it is there, because the size of the archive on disk is not
+        // the size of what comes out of it.
+        if total > 0 { reportedTotalBytes = total }
+        let whole = reportedTotalBytes > 0 ? reportedTotalBytes : sourceBytes
+        guard whole > 0 else {
+            lock.unlock()
+            return
+        }
         let done = handledBytes
-        let fraction = min(1, Double(done) / Double(sourceBytes))
+        let fraction = min(1, Double(done) / Double(whole))
         let percent = Int((fraction * 100).rounded())
         let changed = percent != lastPercent
         lastPercent = percent
@@ -1585,7 +1735,7 @@ private final class OutputReader {
         detail(ArchiveProgress(
             fraction: fraction,
             completedBytes: done,
-            totalBytes: sourceBytes
+            totalBytes: whole
         ))
     }
 }

@@ -34,6 +34,7 @@ cp "$ICON_PNG" "$APP_DIR/Contents/Resources/AppIcon.png"
 # only the Python standard library, so they run on every Mac.
 cp "$ROOT_DIR/Tools/progress_zip.py" "$APP_DIR/Contents/Resources/progress_zip.py"
 cp "$ROOT_DIR/Tools/progress_tar.py" "$APP_DIR/Contents/Resources/progress_tar.py"
+cp "$ROOT_DIR/Tools/progress_unzip.py" "$APP_DIR/Contents/Resources/progress_unzip.py"
 
 SOURCES=(
   "$ROOT_DIR/Sources/main.swift"
@@ -50,6 +51,7 @@ SOURCES=(
   "$ROOT_DIR/Sources/RStudioProject.swift"
   "$ROOT_DIR/Sources/AppSwitcherWindowController.swift"
   "$ROOT_DIR/Sources/FinderActivationIntent.swift"
+  "$ROOT_DIR/Sources/DockTrashClickInterceptor.swift"
   "$ROOT_DIR/Sources/FinderWindowCloser.swift"
   "$ROOT_DIR/Sources/ShowDesktopAction.swift"
   "$ROOT_DIR/Sources/AppStackOrder.swift"

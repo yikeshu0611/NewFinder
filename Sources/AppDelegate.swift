@@ -66,14 +66,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         startFinderRedirectObserver()
         FinderActivationIntent.startMonitoringClicks()
+        // Trash tile left-clicked (mouse-down): get NF's Trash on screen
+        // BEFORE Finder draws its own Trash window. The normal redirect only
+        // runs after Finder's activation notification arrives — by then Finder
+        // has already painted one frame, which is the visible flash. Opening
+        // here wins that race; the later redirect just closes Finder's window
+        // in the background and re-holds the front.
+        FinderActivationIntent.onDockTrashMouseDown = { [weak self] in
+            guard let self else { return }
+            guard AppSettings.shared.redirectFinderClicks else { return }
+            guard !self.isLeavingFinderAloneForVolumes() else { return }
+            self.activateAndHoldFront(holdFor: 0.6)
+            self.openTrash()
+        }
+        // Swallow the Trash-tile click before the Dock ever sees it, so
+        // Finder's own Trash window never opens (no flash at all). Falls back
+        // to the mouse-down pre-raise above when the tap has no permission.
+        DockTrashClickInterceptor.start()
+        DockTrashClickInterceptor.shared.onTrashClick = { [weak self] in
+            guard let self else { return }
+            guard AppSettings.shared.redirectFinderClicks else { return }
+            guard !self.isLeavingFinderAloneForVolumes() else { return }
+            PerfLog.log("[NF-TRASH] Dock 废纸篓点击已拦截 — 直接打开，不经过 Finder")
+            self.activateAndHoldFront(holdFor: 0.6)
+            self.openTrash()
+            self.suppressFinderRedirectUntil = Date().addingTimeInterval(1.0)
+            FinderActivationIntent.clearLastClick()
+        }
+        // Finder tile in the Dock: swallowed by the same tap, so Finder never
+        // activates and never paints its window — repeat clicks stay seamless
+        // instead of each popping a Finder window that then has to be closed.
+        DockTrashClickInterceptor.shared.onFinderIconClick = { [weak self] in
+            guard let self else { return }
+            guard AppSettings.shared.redirectFinderClicks else { return }
+            guard !self.isLeavingFinderAloneForVolumes() else { return }
+            PerfLog.log("[NF-DOCK] Dock Finder 点击已拦截 — 直接显示 NF")
+            self.suppressFinderRedirectUntil = Date().addingTimeInterval(1.0)
+            FinderActivationIntent.clearLastClick()
+            self.showFrontBrowserOrOpenDesktop()
+            self.bringUIToFront()
+        }
         registerExternalShowObservers()
 
         let stealFinder = CommandLine.arguments.contains("--steal-finder")
         let revealFiles = Self.commandLineRevealURLs()
         let revealDir = Self.commandLineRevealDirectory()
         let debugWindow = Self.commandLineDebugWindow()
+        let extractTest = Self.commandLineExtractTest()
 
-        if let debugWindow {
+        if let extractTest {
+            // A test hook: extract an archive with the progress window on
+            // screen, so the window can be looked at on its own.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.runExtractTest(archive: extractTest)
+            }
+        } else if let debugWindow {
             // A test hook: open one of the auxiliary windows on its own, so
             // its layout can be inspected without the gesture.
             switch debugWindow {
@@ -151,6 +198,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if args.contains("--open-installed-apps") { return "installed" }
         if args.contains("--open-running-apps") { return "running" }
         return nil
+    }
+
+    /// The archive to extract for testing — `--extract-test /path/to.zip`.
+    private static func commandLineExtractTest() -> URL? {
+        let args = CommandLine.arguments
+        guard let index = args.firstIndex(of: "--extract-test"),
+              index + 1 < args.count else { return nil }
+        return URL(fileURLWithPath: args[index + 1]).standardizedFileURL
+    }
+
+    /// Extracts an archive with the progress window on screen.
+    ///
+    /// This is a test hook, so the window can be looked at without having
+    /// to go through the menu. It does the same thing the menu does.
+    private func runExtractTest(archive: URL) {
+        let fm = FileManager.default
+        let destination = fm.temporaryDirectory
+            .appendingPathComponent("NF-extract-test-\(UUID().uuidString)", isDirectory: true)
+        try? fm.createDirectory(at: destination, withIntermediateDirectories: true)
+
+        let job = ArchiveJob(destinationURL: archive, totalBytes: 0)
+        let window = ArchiveProgressWindow(job: job, mode: .extract)
+
+        job.onProgress = { progress in
+            DispatchQueue.main.async { window.update(progress: progress) }
+        }
+        job.onFileProgress = { file in
+            DispatchQueue.main.async { window.update(file: file) }
+        }
+        job.onFinish = { result in
+            DispatchQueue.main.async {
+                switch result {
+                case .success:
+                    window.finish()
+                case .failure(let error):
+                    window.cancel()
+                    window.close()
+                    NSLog("NF extract test failed: \(error)")
+                }
+            }
+        }
+
+        window.start()
+        job.startExtract(
+            archives: [archive],
+            destinations: [destination],
+            password: nil
+        )
+
+        // With `--extract-shot` the window is saved as a picture a moment
+        // later, so its layout can be looked at without a screenshot of the
+        // whole screen.
+        guard CommandLine.arguments.contains("--extract-shot") else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            guard let view = window.window?.contentView else { return }
+            guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+            view.cacheDisplay(in: view.bounds, to: rep)
+            guard let data = rep.representation(using: .png, properties: [:]) else { return }
+            let path = "/tmp/nf-extract-panel.png"
+            try? data.write(to: URL(fileURLWithPath: path))
+            NSLog("NF extract test saved \(path)")
+        }
     }
 
     /// The delay before the gesture runs.
@@ -778,15 +887,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
+    /// How long the current redirect suppression still lasts, or 0 when a
+    /// redirect may run now. Volume sessions never suppress.
+    ///
+    /// Redirects that arrive during suppression (e.g. a real "Show in Finder"
+    /// right after a Dock click) must be *delayed*, never dropped — dropping
+    /// them is what made NF appear without navigating to the file.
+    private func suppressRemaining() -> TimeInterval {
+        if isLeavingFinderAloneForVolumes() { return 0 }
+        if let until = suppressFinderRedirectUntil {
+            let rest = until.timeIntervalSinceNow
+            if rest > 0 { return rest }
+        }
+        return 0
+    }
+
     private func handleWorkspaceAppNote(_ note: Notification) {
         guard AppSettings.shared.redirectFinderClicks else { return }
         guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
               app.bundleIdentifier == "com.apple.finder" else { return }
-        if shouldSuppressRedirect() {
-            PerfLog.log("[NF-FINDER] Finder 被激活，但正在抑制重定向")
+        let rest = suppressRemaining()
+        if rest > 0 {
+            PerfLog.log("[NF-FINDER] Finder 激活通知 — 抑制中，延迟 \(String(format: "%.2f", rest))s 后重定向")
+            scheduleFinderRedirect(settle: rest)
             return
         }
         // Immediate redirect for WeChat-style "Show in Finder" operations — no settle delay.
+        PerfLog.log("[NF-FINDER] 收到 Finder 激活通知")
         scheduleFinderRedirect(settle: 0)
     }
     // MARK: - Fast reveal
@@ -898,23 +1025,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func scheduleFinderRedirect(settle: TimeInterval) {
         guard AppSettings.shared.redirectFinderClicks else { return }
-        if shouldSuppressRedirect() { return }
+        // Suppression delays the redirect instead of dropping it — the
+        // Finder activation behind it (e.g. a real "Show in Finder") is
+        // still real and must be honoured once the window expires.
+        let effective = max(settle, suppressRemaining())
         pendingRedirectWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             self?.redirectFinderActivationToNewFinder()
         }
         pendingRedirectWorkItem = work
-        if settle <= 0 {
+        if effective <= 0 {
             DispatchQueue.main.async(execute: work)
         } else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + settle, execute: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + effective, execute: work)
         }
     }
 
     private func pollFinderWindowsIfNeeded() {
         guard AppSettings.shared.redirectFinderClicks else { return }
         guard !isRedirectingFinder else { return }
-        if shouldSuppressRedirect() { return }
+        // Do not drop the poll observation during suppression — the Finder
+        // window behind it may be a real reveal. scheduleFinderRedirect
+        // defers it until the window expires instead of dropping it.
         // Only when Finder is frontmost — a background DMG window must not yank focus from NF.
         guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.finder" else { return }
         guard finderLooksLikeItHasBrowserWindows() else { return }
@@ -959,8 +1091,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard AppSettings.shared.redirectFinderClicks else { return }
         guard !isRedirectingFinder else { return }
         if let last = lastFinderRedirectAt, Date().timeIntervalSince(last) < 0.8 {
+            PerfLog.log("[NF-FINDER] 重定向节流 — 距上次不足 0.8s，丢弃")
             return
         }
+        let redirectStart = Date()
+        PerfLog.log("[NF-FINDER] 重定向开始")
 
         let frontIsFinder = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.finder"
         guard frontIsFinder || finderLooksLikeItHasBrowserWindows() else {
@@ -976,7 +1111,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             // Finder moved to a normal folder — resume interception.
             leaveFinderAloneUntil = nil
-        } else if let until = suppressFinderRedirectUntil, Date() < until {
+        } else if suppressRemaining() > 0 {
+            // Reached the end of a suppression window (or a queued retry):
+            // do not drop a possibly-real reveal — re-queue after the rest
+            // of the window instead of returning.
+            let rest = suppressRemaining()
+            pendingRedirectWorkItem?.cancel()
+            pendingRedirectWorkItem = nil
+            isRedirectingFinder = false
+            PerfLog.log("[NF-FINDER] 仍在抑制窗口 — \(String(format: "%.2f", rest))s 后重试")
+            scheduleFinderRedirect(settle: rest)
             return
         }
 
@@ -992,20 +1136,103 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // leaves nothing at all.
         let intent = FinderActivationIntent.currentClickIntent() ?? .content
         let clickMayBeBlankDesktop = frontIsFinder && intent == .blankDesktop
+        // A click on the Dock's Finder icon asks for Finder itself, and NF
+        // is the Finder replacement. There is nothing to read from Finder
+        // first — a Dock click leaves no selection behind — so NF comes
+        // forward at once instead of waiting for Finder to be asked what
+        // it has open. That wait was the half-second Finder flash.
+        let clickMayBeDock = intent == .dock || intent == .dockTrash
+        let clickIsDockTrash = intent == .dockTrash
 
         isRedirectingFinder = true
         lastFinderRedirectAt = Date()
         // Closing Finder / activating NF can re-fire Finder notifications — pause briefly.
         suppressFinderRedirectUntil = Date().addingTimeInterval(0.5)
 
+        // A click on the Dock's Trash tile goes straight to NF's Trash UI.
+        if clickIsDockTrash {
+            activateAndHoldFront(holdFor: 0.25)
+            PerfLog.log("[NF-FINDER] Dock 废纸篓点击 — 打开废纸篓，耗时 \(String(format: "%.0f", Date().timeIntervalSince(redirectStart) * 1000)) ms")
+            openTrash()
+            FinderActivationIntent.clearLastClick()
+            isRedirectingFinder = false
+            if !isLeavingFinderAloneForVolumes() {
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    _ = self?.readAndCloseFinderContext()
+                }
+            }
+            return
+        }
+
+        // A Dock click wants NF straight away. Bringing it forward now
+        // means the Finder icon is on screen for a moment at most.
+        if clickMayBeDock {
+            activateAndHoldFront(holdFor: 0.25)
+            PerfLog.log("[NF-FINDER] Dock 点击 — 立即显示 NF，耗时 \(String(format: "%.0f", Date().timeIntervalSince(redirectStart) * 1000)) ms")
+            // A Dock click never leaves a selection behind, and NF is already
+            // frontmost here. Everything below this point confirms what Finder
+            // shows via synchronous AppleScript on the main thread — that wait
+            // is the stutter seen when switching from WPS. So the Dock click
+            // is finished without touching Finder first; any Finder window the
+            // Dock click opened is closed off the main thread.
+            if !isLeavingFinderAloneForVolumes() {
+                if hasActiveBrowserWindow() {
+                    FinderActivationIntent.clearLastClick()
+                    isRedirectingFinder = false
+                    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                        _ = self?.readAndCloseFinderContext()
+                    }
+                    return
+                }
+                // No NF window yet — open Desktop at once so the switch feels
+                // instant, then mirror Trash / an existing Finder folder if the
+                // Dock click was actually showing one (read off-main).
+                openNewWindow(
+                    at: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop")
+                )
+                FinderActivationIntent.clearLastClick()
+                isRedirectingFinder = false
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self else { return }
+                    let context = self.readAndCloseFinderContext()
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        if self.finderContextInvolvesMountedVolume(context) {
+                            return
+                        }
+                        if let folder = context.folderURL,
+                           FileOperations.isTrashDirectory(folder) {
+                            self.openTrash(at: folder)
+                        } else if !context.selectURLs.isEmpty,
+                                  context.selectURLs.contains(where: { FileOperations.isURLInTrash($0) }) {
+                            let trash = context.selectURLs
+                                .first(where: { FileOperations.isURLInTrash($0) })
+                                .map { FileOperations.isTrashDirectory($0) ? $0 : $0.deletingLastPathComponent() }
+                                ?? FileOperations.userTrashDirectory
+                            self.openTrash(at: trash)
+                            self.reveal(context.selectURLs)
+                        } else if let folder = context.folderURL, !folder.isDesktopFolder {
+                            self.openDirectory(folder)
+                        }
+                    }
+                }
+                return
+            }
+        }
+
         // Fast path: an app that revealed a file ("Show in Finder") only needs
         // the selection, and that answers right away. The full script also
         // lists every open window, which has to wait for Finder's busy main
         // thread and looked like a two-second hang.
-        if handleRevealFastPath() {
+        //
+        // A Dock click never leaves a selection behind, so this path has
+        // nothing to find for it — it is skipped.
+        if !clickMayBeDock, handleRevealFastPath() {
             isRedirectingFinder = false
+            PerfLog.log("[NF-FINDER] 重定向完成（快速路径），耗时 \(String(format: "%.0f", Date().timeIntervalSince(redirectStart) * 1000)) ms")
             return
         }
+        PerfLog.log("[NF-FINDER] 快速路径用尽，耗时 \(String(format: "%.0f", Date().timeIntervalSince(redirectStart) * 1000)) ms")
 
         // Nothing was revealed. If the click looked like a click on the
         // blank desktop, that is what it was — hand the screen back to
@@ -1062,6 +1289,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                 guard let self else { return }
                 defer { self.isRedirectingFinder = false }
+                PerfLog.log("[NF-FINDER] 延迟分支 — 读取完整上下文")
 
                 let again = self.readAndCloseFinderContext()
                 if self.finderContextInvolvesMountedVolume(again) || self.finderContextHasVolumeWindow(again) {
@@ -1079,7 +1307,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // Finder — NF must not steal the focus back in that case.
                 let shouldFocusNF = self.applyFinderContext(again, intent: intent)
                 if shouldFocusNF {
-                    self.forceActivateNewFinder()
+                    if intent == .dock || intent == .dockTrash {
+                        // The Dock click is what brought Finder forward, so
+                        // the front has to be taken back and kept.
+                        self.activateAndHoldFront(holdFor: 0.25)
+                    } else {
+                        self.forceActivateNewFinder()
+                    }
                 }
                 // The click has been dealt with — a later activation must not
                 // be classified by it.
@@ -1144,6 +1378,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func reactivateFinder() {
+        PerfLog.log("[NF-FINDER] 把前台交回 Finder")
         NSRunningApplication
             .runningApplications(withBundleIdentifier: "com.apple.finder")
             .first?
@@ -1193,14 +1428,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if !context.selectURLs.isEmpty {
             reveal(context.selectURLs)
-        } else if hasActiveBrowserWindow() {
+        } else if hasActiveBrowserWindow(), intent != .dockTrash {
             // NF already open: steal focus only; do not open Desktop / new tab from Finder dock click.
+            PerfLog.log("[NF-FINDER] 已有 NF 窗口 — 只抢焦点")
             keyBrowser()?.window?.makeKeyAndOrderFront(nil)
+        } else if intent == .dockTrash {
+            // Dock Trash tile with no Finder context (or NF has no window yet):
+            // go straight to NF's Trash UI.
+            PerfLog.log("[NF-FINDER] Dock 废纸篓 — 打开废纸篓")
+            openTrash()
         } else if let folder = context.folderURL, !folder.isDesktopFolder {
             openNewWindow(at: folder)
         } else if intent == .dock {
             // A Dock click with no window and no selection — the user asked
             // for Finder, and NF is the Finder replacement, so NF opens.
+            PerfLog.log("[NF-FINDER] Dock 点击 — 打开 Desktop 窗口")
             openNewWindow(
                 at: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop")
             )
@@ -1253,6 +1495,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.unhide(nil)
         NSApp.activate(ignoringOtherApps: true)
         NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+    }
+
+    /// Brings NF forward and keeps it there for a moment.
+    ///
+    /// When the Dock's Finder icon is clicked, macOS activates Finder and
+    /// that activation is still being worked out when NF is first told
+    /// about it. NF's own activation then loses the race, and the screen
+    /// shows Finder for a moment before NF finally appears.
+    ///
+    /// Activating again a couple of times over the next fraction of a
+    /// second wins that race. The extra activations are cheap, and the
+    /// delay they add is far shorter than the Finder flash they remove.
+    private func activateAndHoldFront(holdFor duration: TimeInterval) {
+        bringUIToFront()
+        let deadline = Date().addingTimeInterval(duration)
+        var attempts = 0
+        var timer: Timer?
+        timer = Timer(timeInterval: 0.06, repeats: true) { [weak self] _ in
+            guard let self else {
+                timer?.invalidate()
+                return
+            }
+            attempts += 1
+            // Only fight for the front while another app is still in
+            // front — the moment NF is there, the job is done.
+            if NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+                == "com.zhangjing.NewFinder" {
+                timer?.invalidate()
+                return
+            }
+            if Date() >= deadline || attempts >= 4 {
+                timer?.invalidate()
+                return
+            }
+            self.bringUIToFront()
+        }
+        if let timer {
+            RunLoop.main.add(timer, forMode: .common)
+        }
     }
 
     private func noteFinderAutomationFailureIfNeeded() {

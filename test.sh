@@ -60,3 +60,12 @@ swiftc \
   -o "$BUILD_DIR/AppStackRestoreTests"
 
 "$BUILD_DIR/AppStackRestoreTests"
+
+swiftc \
+  -O \
+  "$ROOT_DIR/Sources/ArchiveEngine.swift" \
+  "$TEST_DIR/ExtractProgress/main.swift" \
+  -framework AppKit \
+  -o "$BUILD_DIR/ExtractProgressTests"
+
+"$BUILD_DIR/ExtractProgressTests"

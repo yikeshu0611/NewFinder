@@ -92,6 +92,64 @@ final class ArchiveJob {
         }
     }
 
+    /// Starts the extraction.
+    ///
+    /// The archives are read into their folders one after another, and the
+    /// window follows along the same way it does for a compression.
+    func startExtract(
+        archives: [URL],
+        destinations: [URL],
+        password: String?,
+        protecting otherArchives: [URL] = []
+    ) {
+        task = Task { [weak self] in
+            guard let self else { return }
+            do {
+                for (index, archive) in archives.enumerated() {
+                    let destination = destinations.indices.contains(index)
+                        ? destinations[index]
+                        : destinations.last ?? archive.deletingLastPathComponent()
+                    try await ArchiveEngine.extract(
+                        archive: archive,
+                        to: destination,
+                        password: password,
+                        protecting: otherArchives,
+                        progressDetail: { [weak self] progress in
+                            self?.onProgress?(progress)
+                        },
+                        fileProgress: { [weak self] file in
+                            self?.onFileProgress?(file)
+                        },
+                        processControl: { [weak self] process in
+                            self?.attach(process: process)
+                        },
+                        progress: { _ in }
+                    )
+                }
+                await MainActor.run { [weak self] in
+                    self?.onFinish?(.success(()))
+                }
+            } catch {
+                // A job that was stopped by the user is not an error.
+                var isCancelled = self.isCancelled
+                if let archiveError = error as? ArchiveError,
+                   case .cancelled = archiveError {
+                    isCancelled = true
+                }
+                if error is CancellationError {
+                    isCancelled = true
+                }
+                await MainActor.run { [weak self] in
+                    if isCancelled {
+                        self?.onFinish?(.failure(ArchiveError.cancelled))
+                    } else {
+                        self?.onFinish?(.failure(error))
+                    }
+                }
+            }
+        }
+    }
+
     /// True once the work has been stopped by the user.
     var isCancelled: Bool {
         lock.lock()

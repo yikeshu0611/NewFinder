@@ -20,7 +20,9 @@ final class ContentViewController: NSViewController {
     /// Reports how many history entries survived the history search filter.
     var onHistoryFilterChanged: ((Int) -> Void)?
     /// Called after compress/extract so the browser can reload the folder.
-    var onDirectoryNeedsReload: (() -> Void)?
+    /// Pass the URLs that should stay selected after the reload (e.g. the
+    /// newly created archive); empty means keep the current selection.
+    var onDirectoryNeedsReload: (([URL]) -> Void)?
     /// Reports the compression progress so the status bar can show it.
     var onCompressProgress: ((ArchiveProgress?) -> Void)?
     /// Open one or more archives in Chrome-style tabs.
@@ -252,7 +254,7 @@ final class ContentViewController: NSViewController {
         table.intercellSpacing = NSSize(width: 0, height: table.intercellSpacing.height)
 
         let dateCol = NSTableColumn(identifier: .init("date"))
-        dateCol.title = "修改日期"
+        dateCol.title = "添加日期"
         dateCol.width = 160
         dateCol.minWidth = 0
         dateCol.headerCell.alignment = .left
@@ -271,6 +273,14 @@ final class ContentViewController: NSViewController {
         kindCol.minWidth = 0
         kindCol.headerCell.alignment = .left
         table.addTableColumn(kindCol)
+
+        let pathCol = NSTableColumn(identifier: .init("path"))
+        pathCol.title = "路径"
+        pathCol.width = 280
+        pathCol.minWidth = 0
+        pathCol.headerCell.alignment = .left
+        pathCol.isHidden = true
+        table.addTableColumn(pathCol)
 
         table.dataSource = self
         table.delegate = self
@@ -310,7 +320,7 @@ final class ContentViewController: NSViewController {
             self?.onPerformFileDrop?(urls, destination, copying)
         }
         columnBrowser.onDirectoryNeedsReload = { [weak self] in
-            self?.onDirectoryNeedsReload?()
+            self?.onDirectoryNeedsReload?([])
         }
         columnBrowser.onRenameCommit = { [weak self] item, newName in
             self?.commitColumnRename(item, to: newName)
@@ -576,6 +586,7 @@ final class ContentViewController: NSViewController {
         if active {
             isShowingTrash = false
         }
+        updatePathColumnVisibility()
         let wasActive = isShowingSearchResults
         isShowingSearchResults = active
         searchQuery = query ?? ""
@@ -624,6 +635,7 @@ final class ContentViewController: NSViewController {
     func setTrashMode(active: Bool, itemCount: Int) {
         let wasActive = isShowingTrash
         isShowingTrash = active
+        updatePathColumnVisibility()
         if active {
             isShowingApplications = false
             isShowingHistory = false
@@ -661,6 +673,7 @@ final class ContentViewController: NSViewController {
     func setApplicationsMode(active: Bool) {
         let wasActive = isShowingApplications
         isShowingApplications = active
+        updatePathColumnVisibility()
         if active {
             isShowingTrash = false
             isShowingSearchResults = false
@@ -722,6 +735,7 @@ final class ContentViewController: NSViewController {
     func setHistoryMode(active: Bool, itemCount: Int) {
         let wasActive = isShowingHistory
         isShowingHistory = active
+        updatePathColumnVisibility()
         if active {
             isShowingTrash = false
             isShowingSearchResults = false
@@ -753,7 +767,7 @@ final class ContentViewController: NSViewController {
             historyFilterQuery = ""
             historyFilterField.stringValue = ""
             if let dateCol = listView?.tableColumn(withIdentifier: .init("date")) {
-                dateCol.title = "修改日期"
+                dateCol.title = "添加日期"
             }
             if !isShowingSearchResults && !isShowingTrash && !isShowingApplications {
                 applyBannerChrome(active: false)
@@ -809,8 +823,7 @@ final class ContentViewController: NSViewController {
         listTopToBanner.isActive = active
     }
 
-    private func updateApplicationsCheckColumn() {
-        guard let listView,
+    private func updateApplicationsCheckColumn() {        guard let listView,
               let col = listView.tableColumn(withIdentifier: .init("check")) else { return }
         if isShowingApplications {
             let side = max(24, round(16 * zoomFactor) + 10)
@@ -825,6 +838,14 @@ final class ContentViewController: NSViewController {
             col.maxWidth = 0
         }
         updateHeaderCheckButton()
+    }
+
+    /// The「路径」column only makes sense in the Trash (original location).
+    /// Keep it hidden in normal folders / search / history / applications.
+    private func updatePathColumnVisibility() {
+        guard let listView,
+              let col = listView.tableColumn(withIdentifier: .init("path")) else { return }
+        col.isHidden = !isShowingTrash
     }
 
     private func visiblePackagesForCheck() -> [FileItem] {
@@ -1265,8 +1286,15 @@ final class ContentViewController: NSViewController {
         let fast = items.count > 5_000
         switch columnID {
         case "date":
-            let l = lhs.modificationDate ?? .distantPast
-            let r = rhs.modificationDate ?? .distantPast
+            let l: Date
+            let r: Date
+            if isShowingHistory {
+                l = lhs.modificationDate ?? .distantPast
+                r = rhs.modificationDate ?? .distantPast
+            } else {
+                l = lhs.addedDate ?? .distantPast
+                r = rhs.addedDate ?? .distantPast
+            }
             if l == r { return .orderedSame }
             return l < r ? .orderedAscending : .orderedDescending
         case "size":
@@ -1277,6 +1305,11 @@ final class ContentViewController: NSViewController {
         case "kind":
             let l = kindString(for: lhs)
             let r = kindString(for: rhs)
+            if fast { return FileOperations.fastNameComparison(l, r) }
+            return l.localizedStandardCompare(r)
+        case "path":
+            let l = pathString(for: lhs)
+            let r = pathString(for: rhs)
             if fast { return FileOperations.fastNameComparison(l, r) }
             return l.localizedStandardCompare(r)
         default:
@@ -1295,9 +1328,10 @@ final class ContentViewController: NSViewController {
         let titles: [String: String] = [
             "name": "名称",
             "expand": "",
-            "date": "修改日期",
+            "date": "添加日期",
             "size": "大小",
-            "kind": "种类"
+            "kind": "种类",
+            "path": "路径"
         ]
         let ascending = NSImage(systemSymbolName: "chevron.up", accessibilityDescription: nil)
         let descending = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: nil)
@@ -1485,7 +1519,7 @@ final class ContentViewController: NSViewController {
             } else {
                 refreshAfterCreate(at: created, parent: directory, beginRename: true)
             }
-            onDirectoryNeedsReload?()
+            onDirectoryNeedsReload?([])
         } catch {
             let alert = NSAlert(error: error)
             alert.runModal()
@@ -2180,7 +2214,7 @@ final class ContentViewController: NSViewController {
         guard !urls.isEmpty else { return }
         do {
             try FileOperations.makeWritable(urls)
-            onDirectoryNeedsReload?()
+            onDirectoryNeedsReload?([])
         } catch {
             let alert = NSAlert()
             alert.messageText = "赋予权限失败"
@@ -2247,11 +2281,13 @@ final class ContentViewController: NSViewController {
                 progressWindow?.update(file: file)
             }
         }
-        job.onFinish = { [weak self] result in
+        job.onFinish = { [weak self, archiveURL = options.archiveURL.standardizedFileURL] result in
             DispatchQueue.main.async {
+                var selectAfterReload: [URL] = []
                 switch result {
                 case .success:
                     progressWindow.finish()
+                    selectAfterReload = [archiveURL]
                 case .failure(let error):
                     progressWindow.cancel()
                     progressWindow.close()
@@ -2262,7 +2298,7 @@ final class ContentViewController: NSViewController {
                     self?.presentArchiveError(title: "压缩失败", error: error)
                 }
                 self?.onCompressProgress?(nil)
-                self?.onDirectoryNeedsReload?()
+                self?.onDirectoryNeedsReload?(selectAfterReload)
             }
         }
 
@@ -2302,22 +2338,117 @@ final class ContentViewController: NSViewController {
         guard !urls.isEmpty else { return }
         let base = urls.first?.deletingLastPathComponent() ?? URL(fileURLWithPath: NSHomeDirectory())
         guard let options = ArchiveDialogs.runExtractDialog(for: urls, relativeTo: base) else { return }
-        ArchiveSupport.extract(urls: urls, options: options) { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .success:
-                if options.deleteSource {
-                    let destPath = options.destinationURL.standardizedFileURL.path
-                    let toTrash = urls.filter { $0.standardizedFileURL.path != destPath }
-                    if !toTrash.isEmpty {
-                        do { try FileOperations.moveToTrash(toTrash) }
-                        catch { self.presentArchiveError(title: "解压成功，但删除压缩包失败", error: error) }
-                    }
-                }
-                self.onDirectoryNeedsReload?()
-            case .failure(let error):
-                self.presentArchiveError(title: "解压失败", error: error)
+        triggerExtract(urls: urls, options: options)
+    }
+
+    /// Extracts the given archives.
+    ///
+    /// The extraction runs in its own window, which shows how far along it
+    /// is and can pause or cancel it — the same window the compression
+    /// uses. When more than one archive is selected they are taken out one
+    /// after another, and the window shows the files of all of them.
+    private func triggerExtract(urls: [URL], options: ArchiveExtractOptions) {
+        guard !urls.isEmpty else { return }
+        let password = options.password.isEmpty ? nil : options.password
+        let baseDir = options.directory.standardizedFileURL
+        let destinations = urls.map { options.destinationURL(for: $0).standardizedFileURL }
+
+        // Snapshot so brand-new top-level names can be told apart afterwards.
+        let fm = FileManager.default
+        let baseSnapshot: Set<String>
+        if let names = try? fm.contentsOfDirectory(atPath: baseDir.path) {
+            baseSnapshot = Set(names)
+        } else {
+            baseSnapshot = Set()
+        }
+
+        // The window is about one archive at a time, because that is what
+        // the list of files belongs to.
+        let first = urls[0].standardizedFileURL
+        // The size of the archive on disk is not the size of what comes out
+        // of it, so the real total is looked up in the background. The
+        // reporter gives the right number as soon as it starts working.
+        let job = ArchiveJob(destinationURL: first, totalBytes: 0)
+        let progressWindow = ArchiveProgressWindow(job: job, mode: .extract)
+
+        job.onProgress = { [weak progressWindow] progress in
+            DispatchQueue.main.async {
+                progressWindow?.update(progress: progress)
             }
+        }
+        job.onFileProgress = { [weak progressWindow] file in
+            DispatchQueue.main.async {
+                progressWindow?.update(file: file)
+            }
+        }
+        job.onFinish = { [weak self, baseSnapshot, baseDir, destinations] result in
+            DispatchQueue.main.async {
+                var selectAfterReload: [URL] = []
+                switch result {
+                case .success:
+                    progressWindow.finish()
+                    self?.deleteSourcesIfNeeded(urls: urls, options: options)
+                    // Select what the extraction produced: brand-new names
+                    // in the target folder, plus any subfolder it was told
+                    // to use (covers merging into an existing folder where
+                    // the top-level name is not new).
+                    let fm = FileManager.default
+                    var seen = Set<String>()
+                    var produced: [URL] = []
+                    if let current = try? fm.contentsOfDirectory(atPath: baseDir.path) {
+                        for name in current where !baseSnapshot.contains(name) {
+                            let url = baseDir.appendingPathComponent(name).standardizedFileURL
+                            if seen.insert(url.path).inserted {
+                                produced.append(url)
+                            }
+                        }
+                    }
+                    for dest in destinations where dest.path != baseDir.path {
+                        if fm.fileExists(atPath: dest.path) {
+                            let url = dest.standardizedFileURL
+                            if seen.insert(url.path).inserted {
+                                produced.append(url)
+                            }
+                        }
+                    }
+                    selectAfterReload = produced
+                case .failure(let error):
+                    progressWindow.cancel()
+                    progressWindow.close()
+                    // A cancelled job is not an error the user needs to read.
+                    if case ArchiveError.cancelled = error {
+                        return
+                    }
+                    self?.presentArchiveError(title: "解压失败", error: error)
+                }
+                self?.onDirectoryNeedsReload?(selectAfterReload)
+            }
+        }
+
+        // The modal dialog has just closed, so the window is shown on the
+        // next turn of the run loop. That way it does not flash while the
+        // dialog is still being put away.
+        DispatchQueue.main.async {
+            progressWindow.start()
+            job.startExtract(
+                archives: urls.map(\.standardizedFileURL),
+                destinations: urls.map { options.destinationURL(for: $0).standardizedFileURL },
+                password: password
+            )
+        }
+    }
+
+    /// Removes the archives that were extracted, when the person asked for
+    /// that.
+    private func deleteSourcesIfNeeded(urls: [URL], options: ArchiveExtractOptions) {
+        guard options.deleteSource else { return }
+        let destinations = Set(urls.map { options.destinationURL(for: $0).standardizedFileURL.path })
+        let toTrash = urls.filter { !destinations.contains($0.standardizedFileURL.path) }
+        guard !toTrash.isEmpty else { return }
+        do {
+            try FileOperations.moveToTrash(toTrash)
+        } catch {
+            presentArchiveError(title: "解压成功，但删除压缩包失败", error: error)
         }
     }
 
@@ -2573,7 +2704,7 @@ extension ContentViewController: NSTableViewDataSource, NSTableViewDelegate {
             cell.textField?.toolTip = nil
             cell.imageView?.toolTip = nil
         case "date":
-            cell.textField?.stringValue = FileOperations.formatDate(item.modificationDate)
+            cell.textField?.stringValue = FileOperations.formatDate(isShowingHistory ? item.modificationDate : item.addedDate)
             cell.imageView?.image = nil
             applyCutAppearance(to: cell, item: item, nameColumn: false)
         case "size":
@@ -2588,6 +2719,13 @@ extension ContentViewController: NSTableViewDataSource, NSTableViewDelegate {
             applyCutAppearance(to: cell, item: item, nameColumn: false)
         case "kind":
             cell.textField?.stringValue = kindString(for: item)
+            cell.imageView?.image = nil
+            applyCutAppearance(to: cell, item: item, nameColumn: false)
+        case "path":
+            cell.textField?.stringValue = pathString(for: item)
+            cell.textField?.lineBreakMode = .byTruncatingMiddle
+            cell.textField?.maximumNumberOfLines = 1
+            cell.textField?.usesSingleLineMode = true
             cell.imageView?.image = nil
             applyCutAppearance(to: cell, item: item, nameColumn: false)
         default:
@@ -2646,7 +2784,7 @@ extension ContentViewController: NSTableViewDataSource, NSTableViewDelegate {
     ) {
         // External move / trash: refresh listing.
         if operation.contains(.move) || operation.contains(.delete) {
-            onDirectoryNeedsReload?()
+            onDirectoryNeedsReload?([])
         }
     }
 
@@ -2940,6 +3078,19 @@ extension ContentViewController: NSTableViewDataSource, NSTableViewDelegate {
         let ext = item.url.pathExtension
         if ext.isEmpty { return "文件" }
         return ext.lowercased()
+    }
+
+    /// Value shown in the「路径」column.
+    ///
+    /// In the Trash this is the location the item was deleted from (when it
+    /// is known — items trashed outside NewFinder have no record, so the
+    /// current Trash path is shown as a fallback). Everywhere else it is the
+    /// item's own path; the column is hidden outside the Trash anyway.
+    private func pathString(for item: FileItem) -> String {
+        if isShowingTrash {
+            return item.originalPath ?? item.url.path
+        }
+        return item.url.path
     }
 }
 

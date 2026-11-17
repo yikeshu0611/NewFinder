@@ -50,11 +50,6 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate,
         content.wantsLayer = true
         content.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
 
-        let commandBar = NSView()
-        commandBar.translatesAutoresizingMaskIntoConstraints = false
-        commandBar.wantsLayer = true
-        commandBar.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
-
         extractAllButton = makeCommandButton(
             title: "解压到",
             symbol: "arrow.down.doc.fill",
@@ -64,12 +59,9 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate,
 
         progressIndicator = NSProgressIndicator()
         progressIndicator.style = .spinning
-        progressIndicator.controlSize = .regular
+        progressIndicator.controlSize = .small
         progressIndicator.isDisplayedWhenStopped = false
         progressIndicator.translatesAutoresizingMaskIntoConstraints = false
-
-        commandBar.addSubview(extractAllButton)
-        commandBar.addSubview(progressIndicator)
 
         // —— Split: folder tree | file list ——
         splitView = NSSplitView()
@@ -82,10 +74,8 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate,
         treeHost.wantsLayer = true
         treeHost.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
 
-        let treeTitle = NSTextField(labelWithString: "目录")
-        treeTitle.font = .systemFont(ofSize: 11, weight: .semibold)
-        treeTitle.textColor = .secondaryLabelColor
-        treeTitle.translatesAutoresizingMaskIntoConstraints = false
+        treeHost.addSubview(extractAllButton)
+        treeHost.addSubview(progressIndicator)
 
         let treeScroll = NSScrollView()
         treeScroll.translatesAutoresizingMaskIntoConstraints = false
@@ -109,7 +99,6 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate,
         outline.outlineTableColumn = treeCol
         treeScroll.documentView = outline
 
-        treeHost.addSubview(treeTitle)
         treeHost.addSubview(treeScroll)
 
         let listScroll = NSScrollView()
@@ -170,29 +159,20 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate,
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusBar.addSubview(statusLabel)
 
-        content.addSubview(commandBar)
         content.addSubview(splitView)
         content.addSubview(statusBar)
 
         NSLayoutConstraint.activate([
-            commandBar.topAnchor.constraint(equalTo: content.topAnchor),
-            commandBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            commandBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            commandBar.heightAnchor.constraint(equalToConstant: 64),
-
-            extractAllButton.leadingAnchor.constraint(equalTo: commandBar.leadingAnchor, constant: 12),
-            extractAllButton.centerYAnchor.constraint(equalTo: commandBar.centerYAnchor),
-            progressIndicator.leadingAnchor.constraint(equalTo: extractAllButton.trailingAnchor, constant: 10),
-            progressIndicator.centerYAnchor.constraint(equalTo: commandBar.centerYAnchor),
-
-            splitView.topAnchor.constraint(equalTo: commandBar.bottomAnchor, constant: 8),
+            splitView.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
             splitView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
             splitView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
             splitView.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
 
-            treeTitle.topAnchor.constraint(equalTo: treeHost.topAnchor, constant: 8),
-            treeTitle.leadingAnchor.constraint(equalTo: treeHost.leadingAnchor, constant: 10),
-            treeScroll.topAnchor.constraint(equalTo: treeTitle.bottomAnchor, constant: 4),
+            extractAllButton.topAnchor.constraint(equalTo: treeHost.topAnchor, constant: 6),
+            extractAllButton.leadingAnchor.constraint(equalTo: treeHost.leadingAnchor, constant: 10),
+            progressIndicator.leadingAnchor.constraint(equalTo: extractAllButton.trailingAnchor, constant: 8),
+            progressIndicator.centerYAnchor.constraint(equalTo: extractAllButton.centerYAnchor),
+            treeScroll.topAnchor.constraint(equalTo: extractAllButton.bottomAnchor, constant: 6),
             treeScroll.leadingAnchor.constraint(equalTo: treeHost.leadingAnchor),
             treeScroll.trailingAnchor.constraint(equalTo: treeHost.trailingAnchor),
             treeScroll.bottomAnchor.constraint(equalTo: treeHost.bottomAnchor),
@@ -224,20 +204,20 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate,
 
     private func makeCommandButton(title: String, symbol: String, tint: NSColor, action: Selector) -> NSButton {
         let button = NSButton(title: title, target: self, action: action)
-        button.bezelStyle = .regularSquare
-        button.isBordered = false
-        button.imagePosition = .imageAbove
-        button.font = .systemFont(ofSize: 11, weight: .medium)
-        let config = NSImage.SymbolConfiguration(pointSize: 20, weight: .medium)
+        button.bezelStyle = .rounded
+        button.isBordered = true
+        button.imagePosition = .imageLeft
+        button.font = .systemFont(ofSize: 13, weight: .medium)
+        let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?
             .withSymbolConfiguration(config)
         image?.isTemplate = true
         button.image = image
+        button.imageHugsTitle = true
         button.contentTintColor = tint
         button.focusRingType = .none
         button.translatesAutoresizingMaskIntoConstraints = false
-        button.widthAnchor.constraint(equalToConstant: 64).isActive = true
-        button.heightAnchor.constraint(equalToConstant: 56).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 28).isActive = true
         button.setContentHuggingPriority(.required, for: .horizontal)
         return button
     }

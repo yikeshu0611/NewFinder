@@ -9,7 +9,7 @@ final class BrowserPaneController: NSViewController, NSSearchFieldDelegate {
     var onCopyRequest: (() -> Void)?
     var onPasteRequest: (() -> Void)?
     var onRenameCommit: ((FileItem, String) -> Void)?
-    var onDirectoryNeedsReload: (() -> Void)?
+    var onDirectoryNeedsReload: (([URL]) -> Void)?
     var onOpenArchives: (([URL]) -> Void)?
     var onPerformFileDrop: (([URL], URL, Bool) -> Void)?
     var onBookmarkDirectory: ((URL) -> Void)?
@@ -79,7 +79,7 @@ final class BrowserPaneController: NSViewController, NSSearchFieldDelegate {
         navigate(to: directory, recordHistory: false)
     }
 
-    func navigate(to url: URL, recordHistory: Bool = true) {
+    func navigate(to url: URL, recordHistory: Bool = true, restoreSelection: [URL] = []) {
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
             NSSound.beep()
@@ -95,26 +95,49 @@ final class BrowserPaneController: NSViewController, NSSearchFieldDelegate {
         contentController.setSearchResultsMode(query: nil, scopeName: "", resultCount: 0)
         updatePathChrome()
         watchDirectory(standardized)
-        reloadContents()
+        reloadContents(select: restoreSelection)
     }
 
-    func reloadContents() {
+    func reloadContents(select: [URL] = []) {
         pendingReload?.cancel()
         pendingReload = nil
         loadGeneration += 1
         let generation = loadGeneration
         let showHidden = AppSettings.shared.showHiddenFiles
         let dir = directory
+        let selectTargets = select.map(\.standardizedFileURL)
+        // The cached listing is keyed by folder mtime — a fast in-place
+        // compress can land inside the same timestamp, so drop it first.
+        if !selectTargets.isEmpty {
+            FileOperations.invalidateListingCache(for: dir)
+        }
         statusLabel.stringValue = "正在加载…"
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let items = FileOperations.listDirectoryCached(dir, showHidden: showHidden)
             DispatchQueue.main.async {
                 guard let self, generation == self.loadGeneration else { return }
-                self.contentController.setItems(items, alreadySortedByName: true)
+                // Same-folder archive (compress in place): apply the
+                // selection once the new listing is in.
+                if selectTargets.isEmpty {
+                    self.contentController.setItems(items, alreadySortedByName: true)
+                } else {
+                    self.contentController.setItems(items, alreadySortedByName: true, select: selectTargets)
+                }
                 self.updateStatus(selection: self.contentController.selectedItems)
             }
         }
+    }
+
+    /// Reload after a mutation, selecting the given URLs. When the URLs
+    /// live in another folder (compress saved elsewhere), jump there first.
+    func reloadAfterMutation(select: [URL] = []) {
+        if let target = select.first?.standardizedFileURL,
+           target.deletingLastPathComponent() != directory.standardizedFileURL {
+            navigate(to: target.deletingLastPathComponent(), restoreSelection: select.map(\.standardizedFileURL))
+            return
+        }
+        reloadContents(select: select)
     }
 
     func applyZoom(_ percent: Int) {
@@ -349,9 +372,9 @@ final class BrowserPaneController: NSViewController, NSSearchFieldDelegate {
         contentController.onCreateNewItemRequest = { [weak self] extensionName in
             self?.createNewItem(extensionName: extensionName)
         }
-        contentController.onDirectoryNeedsReload = { [weak self] in
-            self?.reloadContents()
-            self?.onDirectoryNeedsReload?()
+        contentController.onDirectoryNeedsReload = { [weak self] select in
+            self?.reloadContents(select: select)
+            self?.onDirectoryNeedsReload?(select)
         }
         contentController.onOpenArchives = { [weak self] urls in self?.onOpenArchives?(urls) }
         contentController.directoryForDrop = { [weak self] in
