@@ -1880,34 +1880,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         helpers.append(sliderView)
         menu.addItem(zoomItem)
 
-        let version = UpdateChecker.currentVersion
-        let update = menu.addItem(
-            withTitle: "更新（\(version)）",
-            action: #selector(checkForUpdatesFromMenu(_:)),
-            keyEquivalent: ""
-        )
-        update.target = self
-
-        // Shows the desktop — the same action the three-finger swipe fires.
-        // Useful on a desktop Mac, and it makes the feature reachable when the
-        // gesture is not available (no trackpad, or no Input Monitoring
-        // permission).
-        let showDesktop = menu.addItem(
-            withTitle: "显示桌面",
-            action: #selector(performShowDesktop(_:)),
-            keyEquivalent: ""
-        )
-        showDesktop.target = self
-
-        // Brings back what「显示桌面」hid — the same action the three-finger
-        // swipe up fires.
-        let restoreDesktop = menu.addItem(
-            withTitle: "恢复之前的界面",
-            action: #selector(performRestoreDesktop(_:)),
-            keyEquivalent: ""
-        )
-        restoreDesktop.target = self
-
         let settings = menu.addItem(
             withTitle: "设置",
             action: #selector(showPreferences(_:)),
@@ -1917,24 +1889,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let goToItem = NSMenuItem(title: "转到", action: nil, keyEquivalent: "")
         let goToMenu = NSMenu(title: "转到")
-        let runningApps = goToMenu.addItem(
-            withTitle: "正在运行的程序 (双击 ⌥)",
-            action: #selector(showRunningApps(_:)),
-            keyEquivalent: ""
-        )
-        runningApps.target = self
-        let installedApps = goToMenu.addItem(
-            withTitle: "所有程序 (三击 ⌥)",
-            action: #selector(showInstalledApps(_:)),
-            keyEquivalent: ""
-        )
-        installedApps.target = self
-        let activity = goToMenu.addItem(
-            withTitle: "活动监视器",
-            action: #selector(goToActivityMonitor(_:)),
-            keyEquivalent: ""
-        )
-        activity.target = self
         let temperature = goToMenu.addItem(
             withTitle: "温度",
             action: #selector(goToTemperature(_:)),
@@ -1959,12 +1913,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: ""
         )
         terminal.target = self
-        let clipboard = goToMenu.addItem(
-            withTitle: "剪贴板地址 (⌘P)",
-            action: #selector(goToClipboardPath(_:)),
-            keyEquivalent: ""
-        )
-        clipboard.target = self
         goToItem.submenu = goToMenu
         menu.addItem(goToItem)
 

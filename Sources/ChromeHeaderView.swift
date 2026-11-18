@@ -385,7 +385,7 @@ final class ChromeHeaderView: NSView {
             .withSymbolConfiguration(config)
         button.image?.isTemplate = true
         button.contentTintColor = .labelColor
-        button.toolTip = "菜单（缩放 / 更新 / 设置 / 转到）"
+        button.toolTip = "菜单（缩放 / 设置 / 转到）"
         button.focusRingType = .none
         button.translatesAutoresizingMaskIntoConstraints = false
         button.setContentHuggingPriority(.required, for: .horizontal)
