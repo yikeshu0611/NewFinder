@@ -114,7 +114,7 @@ enum ArchiveDialogs {
             okBtn.bottomAnchor.constraint(equalTo: cancelBtn.bottomAnchor)
         ])
 
-        final class Handler: NSObject {
+        final class Handler: NSObject, NSWindowDelegate {
             var result: ArchiveCompressOptions?
             let panel: NSPanel
             let pathField: NSTextField
@@ -194,6 +194,14 @@ enum ArchiveDialogs {
                 NSApp.stopModal(withCode: .OK)
                 panel.orderOut(nil)
             }
+
+            func windowWillClose(_ notification: Notification) {
+                // 点左上角 ✕ 直接关窗口时也要结束 modal，否则 runModal 一直卡住主线程。
+                if NSApp.modalWindow == panel {
+                    result = nil
+                    NSApp.stopModal(withCode: .cancel)
+                }
+            }
         }
 
         let handler = Handler(
@@ -219,12 +227,15 @@ enum ArchiveDialogs {
 
         // Retain handler for modal session
         objc_setAssociatedObject(panel, "handler", handler, .OBJC_ASSOCIATION_RETAIN)
+        panel.delegate = handler
 
         // Put the focus in the name field, so the Return key starts the
         // compression right away.
         panel.initialFirstResponder = nameField
 
         let code = NSApp.runModal(for: panel)
+        panel.delegate = nil
+        panel.orderOut(nil)
         return code == .OK ? handler.result : nil
     }
 
@@ -318,7 +329,7 @@ enum ArchiveDialogs {
             okBtn.bottomAnchor.constraint(equalTo: cancelBtn.bottomAnchor)
         ])
 
-        final class Handler: NSObject {
+        final class Handler: NSObject, NSWindowDelegate {
             var result: ArchiveExtractOptions?
             let panel: NSPanel
             let pathField: NSTextField
@@ -390,6 +401,14 @@ enum ArchiveDialogs {
                 NSApp.stopModal(withCode: .OK)
                 panel.orderOut(nil)
             }
+
+            func windowWillClose(_ notification: Notification) {
+                // 点左上角 ✕ 直接关窗口时也要结束 modal，否则 runModal 一直卡住主线程。
+                if NSApp.modalWindow == panel {
+                    result = nil
+                    NSApp.stopModal(withCode: .cancel)
+                }
+            }
         }
 
         let handler = Handler(
@@ -410,8 +429,11 @@ enum ArchiveDialogs {
         okBtn.target = handler
         okBtn.action = #selector(Handler.ok)
         objc_setAssociatedObject(panel, "handler", handler, .OBJC_ASSOCIATION_RETAIN)
+        panel.delegate = handler
 
         let code = NSApp.runModal(for: panel)
+        panel.delegate = nil
+        panel.orderOut(nil)
         return code == .OK ? handler.result : nil
     }
 
